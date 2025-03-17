@@ -1,0 +1,22 @@
+{
+  "name": "@repo/sync-test",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node dist/test-sync.js"
+  },
+  "dependencies": {
+    "@repo/sync-types": "workspace:*",
+    "ws": "^8.16.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@repo/eslint-config": "workspace:*",
+    "@repo/typescript-config": "workspace:*",
+    "@types/ws": "^8.5.10",
+    "@types/uuid": "^9.0.8",
+    "typescript": "^5.3.3"
+  }
+} 

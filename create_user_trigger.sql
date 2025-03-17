@@ -1,0 +1,1 @@
+CREATE OR REPLACE TRIGGER update_user_updatedAt BEFORE UPDATE ON "user" FOR EACH ROW EXECUTE FUNCTION update_updated_at();

@@ -1,0 +1,28 @@
+{
+  "name": "@repo/code-quality",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Code quality and type safety checks",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "code-quality": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint src/",
+    "clean": "rm -rf .turbo && rm -rf node_modules && rm -rf dist",
+    "quality": "node dist/cli.js"
+  },
+  "dependencies": {
+    "glob": "^8.1.0",
+    "typescript": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/node": "^18.0.0",
+    "eslint": "^8.0.0"
+  }
+} 

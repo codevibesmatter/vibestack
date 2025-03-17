@@ -1,0 +1,6 @@
+
+
+> @repo/shared-types@0.1.0 build /home/benfreed/dev/tinytest/vibestack/packages/shared-types
+> tsc --noEmit
+
+[41m[30m ELIFECYCLE [39m[49m [31mCommand failed.[39m

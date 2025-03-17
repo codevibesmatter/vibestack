@@ -1,0 +1,71 @@
+{
+  "name": "@repo/typeorm",
+  "version": "0.1.0",
+  "description": "TypeORM integration for VibeStack with dual-database support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./client-entities": {
+      "types": "./dist/generated/client-entities.d.ts",
+      "import": "./dist/generated/client-entities.js",
+      "require": "./dist/generated/client-entities.js"
+    },
+    "./server-entities": {
+      "types": "./dist/generated/server-entities.d.ts",
+      "import": "./dist/generated/server-entities.js",
+      "require": "./dist/generated/server-entities.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "require": "./dist/types.js"
+    },
+    "./entities/*": {
+      "types": "./dist/entities/*.d.ts",
+      "import": "./dist/entities/*.js",
+      "require": "./dist/entities/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "prebuild": "pnpm run generate:entities",
+    "build": "tsc",
+    "generate:entities": "node --loader ts-node/esm src/build/generate-entities.ts",
+    "typeorm": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/server.ts",
+    "typeorm:client": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/client.ts",
+    "migration:generate:server": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/server.ts migration:generate",
+    "migration:generate:client": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/client.ts migration:generate",
+    "migration:run:server": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/server.ts migration:run",
+    "migration:run:client": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/client.ts migration:run",
+    "migration:upload-client": "# Upload client migrations. Optional: pass migration name to force update (e.g. 'pnpm run migration:upload-client UpdateLocalChangesSchema1742056623095')\nnode --loader ts-node/esm src/scripts/upload-client-migrations.ts",
+    "deploy": "pnpm run migration:run:server && pnpm run migration:run:client && pnpm run migration:upload-client",
+    "deploy:client": "pnpm run migration:run:client && pnpm run migration:upload-client",
+    "seed": "node --loader ts-node/esm src/scripts/seed.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.2.17",
+    "class-validator": "^0.14.1",
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.2",
+    "reflect-metadata": "^0.1.14",
+    "typeorm": "^0.3.20",
+    "typeorm-pglite": "^0.3.2"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "^9.6.0",
+    "@types/node": "^18.19.75",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

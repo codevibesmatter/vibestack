@@ -1,0 +1,26 @@
+name = "vibestack-server"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[dev]
+local_protocol = "http"
+port = 8787
+
+[[durable_objects.bindings]]
+name = "SYNC"
+class_name = "SyncDO"
+
+[[durable_objects.bindings]]
+name = "REPLICATION"
+class_name = "ReplicationDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SyncDO", "ReplicationDO"]
+
+# KV Namespaces
+[[kv_namespaces]]
+binding = "CLIENT_REGISTRY"
+id = "client-registry"
+preview_id = "client-registry-preview"

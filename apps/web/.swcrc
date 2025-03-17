@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/swcrc",
+  "jsc": {
+    "parser": {
+      "syntax": "typescript",
+      "tsx": true,
+      "decorators": true,
+      "dynamicImport": true
+    },
+    "transform": {
+      "react": {
+        "runtime": "automatic"
+      },
+      "decoratorVersion": "2021-12"
+    },
+    "target": "es2022"
+  },
+  "module": {
+    "type": "es6"
+  }
+} 

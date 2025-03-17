@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles to override blue backgrounds */
+.performance-metrics {
+  background-color: #242424 !important;
+  border-color: #404040 !important;
+}
+
+.performance-metrics th {
+  background-color: #1a1a1a !important;
+}
+
+.performance-metrics tbody {
+  background-color: #242424 !important;
+}
+
+/* Override any blue text with purple */
+.text-blue-400 {
+  color: rgb(192, 132, 252) !important; /* purple-400 */
+}
+
+/* Override any blue backgrounds with dark gray */
+.bg-blue-500, .bg-blue-600, .bg-blue-700, .bg-indigo-500, .bg-indigo-600, .bg-indigo-700 {
+  background-color: rgb(147, 51, 234) !important; /* purple-600 */
+}
+
+/* Override any blue borders with purple */
+.border-blue-500, .border-indigo-500 {
+  border-color: rgb(147, 51, 234) !important; /* purple-600 */
+}
+
+/* Override focus rings */
+.focus\:ring-blue-500:focus, .focus\:ring-indigo-500:focus {
+  --tw-ring-color: rgb(147, 51, 234) !important; /* purple-600 */
+}
+
+.focus\:border-blue-500:focus, .focus\:border-indigo-500:focus {
+  border-color: rgb(147, 51, 234) !important; /* purple-600 */
+}
