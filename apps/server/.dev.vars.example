@@ -1,8 +1,8 @@
 # Database connection string (Neon PostgreSQL)
-DATABASE_URL=postgresql://neondb_owner:password@ep-project-name-region-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require
+DATABASE_URL=postgresql://neondb_owner:PLACEHOLDER_PASSWORD@ep-project-name-region-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require
 
 # Neon API key for database management
-NEON_API_KEY=your_neon_api_key_here
+NEON_API_KEY=PLACEHOLDER_NEON_API_KEY
 
 # API URL for local development
 API_URL=http://localhost:8787
