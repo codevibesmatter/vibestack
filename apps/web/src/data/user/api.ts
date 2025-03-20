@@ -1,5 +1,5 @@
-import { User } from '@repo/typeorm/client-entities';
-import { validateEntityOrThrow } from '@repo/typeorm';
+import { User } from '@repo/dataforge/client-entities';
+import { validateEntityOrThrow } from '@repo/dataforge';
 import { changesLogger } from '../../utils/logger';
 import { getDatabase } from '../../db/core';
 import { dbMessageBus } from '../../db/message-bus';

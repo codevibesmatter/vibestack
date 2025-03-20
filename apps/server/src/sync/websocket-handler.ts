@@ -1,14 +1,29 @@
-import type { Env } from '../types/env';
-import type { MinimalContext } from '../types/hono';
-import type { 
-  SrvMessageType,
+import { 
+  ServerMessage,
+  ClientMessage,
   CltMessageType,
+  ClientChangesMessage,
+  ClientReceivedMessage,
+  ClientAppliedMessage,
+  ClientHeartbeatMessage,
   TableChange
 } from '@repo/sync-types';
 import { syncLogger } from '../middleware/logger';
-import { processMessage, type MessageContext, type MessageSender } from './message-handler';
+import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
+import type { Env } from '../types/env';
+import type { MinimalContext } from '../types/hono';
 import { SyncStateManager } from './state-manager';
-import type { DurableObjectState } from '@cloudflare/workers-types';
+import type { DurableObjectState, WebSocket } from '../types/cloudflare';
+import { performInitialSync } from './initial-sync';
+import { getDBClient } from '../lib/db';
+
+const MODULE_NAME = 'websocket';
+const WS_READY_STATE = {
+  CONNECTING: 0,
+  OPEN: 1,
+  CLOSING: 2,
+  CLOSED: 3
+} as const;
 
 /**
  * Context for WebSocket handlers
@@ -20,53 +35,113 @@ export interface WebSocketContext {
   init: () => Promise<void>;
 }
 
-/**
- * WebSocket implementation of MessageSender
- */
-export class WebSocketMessageSender implements MessageSender {
-  private ws: WebSocket;
-  private clientId: string;
+type MessageHandlerFn<T extends ClientMessage> = (message: T) => Promise<void>;
 
-  constructor(ws: WebSocket, clientId: string) {
-    this.ws = ws;
-    this.clientId = clientId;
+type MessageHandlers = {
+  'clt_send_changes': MessageHandlerFn<ClientChangesMessage>;
+  'clt_changes_received': MessageHandlerFn<ClientReceivedMessage>;
+  'clt_changes_applied': MessageHandlerFn<ClientAppliedMessage>;
+  'clt_heartbeat': MessageHandlerFn<ClientHeartbeatMessage>;
+  'clt_error': MessageHandlerFn<ClientMessage & { type: 'clt_error' }>;
+  'clt_init_received': MessageHandlerFn<ClientMessage & { type: 'clt_init_received' }>;
+  'clt_init_processed': MessageHandlerFn<ClientMessage & { type: 'clt_init_processed' }>;
+  'clt_sync_request': MessageHandlerFn<ClientMessage & { type: 'clt_sync_request' }>;
+};
+
+/**
+ * Central WebSocket message handler that provides type-safe message routing
+ */
+export class WebSocketMessageHandler {
+  private handlers = new Map<CltMessageType, MessageHandlerFn<ClientMessage>>();
+
+  constructor(
+    private ws: WebSocket,
+    private clientId: string
+  ) {
+    // Set up the message listener
+    this.ws.addEventListener('message', async (event) => {
+      const data = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+      let parsedMessage: ClientMessage | undefined;
+      
+      try {
+        parsedMessage = JSON.parse(data) as ClientMessage;
+        const handler = this.handlers.get(parsedMessage.type);
+        if (handler) {
+          await handler(parsedMessage);
+        } else {
+          syncLogger.warn('No handler for message type:', { 
+            type: parsedMessage.type 
+          }, MODULE_NAME);
+        }
+      } catch (err) {
+        syncLogger.error('Failed to process message:', {
+          error: err instanceof Error ? err.message : String(err),
+          messageType: parsedMessage?.type,
+          rawData: data
+        }, MODULE_NAME);
+      }
+    });
   }
 
-  async send(message: { type: SrvMessageType; messageId: string; timestamp: number }): Promise<void> {
-    const isConnected = this.isConnected();
-    syncLogger.info('Attempting to send message', {
-      messageType: message.type,
-      clientId: this.clientId,
-      isConnected,
-      readyState: this.ws.readyState
-    });
-
-    if (isConnected) {
-      try {
-        this.ws.send(JSON.stringify(message));
-        syncLogger.info('Message sent successfully', {
-          messageType: message.type,
-          clientId: this.clientId
-        });
-      } catch (err) {
-        syncLogger.error('Failed to send message', {
-          messageType: message.type,
-          clientId: this.clientId,
-          error: err instanceof Error ? err.message : String(err)
-        });
-        throw err;
-      }
+  /**
+   * Send a message to the client
+   */
+  async send(message: ServerMessage): Promise<void> {
+    if (this.isConnected()) {
+      syncLogger.debug('Sent message to client:', {
+        type: message.type,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      this.ws.send(JSON.stringify(message));
     } else {
-      syncLogger.warn('Cannot send message - WebSocket not connected', {
-        messageType: message.type,
-        clientId: this.clientId,
-        readyState: this.ws.readyState
-      });
+      syncLogger.warn('Cannot send message, WebSocket not open:', {
+        type: message.type,
+        messageId: message.messageId,
+        connected: this.isConnected()
+      }, MODULE_NAME);
     }
   }
 
+  /**
+   * Register a handler for a specific message type
+   */
+  onMessage<T extends CltMessageType>(
+    type: T,
+    handler: MessageHandlers[T]
+  ): void {
+    this.handlers.set(type, handler as MessageHandlerFn<ClientMessage>);
+    syncLogger.debug('Registered message handler:', { type }, MODULE_NAME);
+  }
+
+  /**
+   * Remove a message handler
+   */
+  removeHandler(type: CltMessageType): void {
+    this.handlers.delete(type);
+    syncLogger.debug('Removed message handler:', { type }, MODULE_NAME);
+  }
+
+  /**
+   * Remove all message handlers
+   */
+  clearHandlers(): void {
+    this.handlers.clear();
+    syncLogger.debug('Cleared all message handlers', undefined, MODULE_NAME);
+  }
+
+  /**
+   * Close the WebSocket connection
+   */
+  close(code?: number, reason?: string): void {
+    this.ws.close(code, reason);
+    this.clearHandlers();
+  }
+
+  /**
+   * Check if WebSocket is connected
+   */
   isConnected(): boolean {
-    return this.ws.readyState === WebSocket.OPEN;
+    return this.ws.readyState === WS_READY_STATE.OPEN;
   }
 }
 
@@ -77,14 +152,20 @@ export async function handleWebSocketUpgrade(
   context: WebSocketContext,
   request: Request,
   state: DurableObjectState
-): Promise<{ response: Response; webSocket: WebSocket | null }> {
+): Promise<{ response: Response; webSocket?: WebSocket }> {
+  syncLogger.info('WebSocket upgrade request received', {
+    url: request.url,
+    headers: Object.fromEntries(request.headers)
+  }, MODULE_NAME);
+
+  // Get client info from URL
   const url = new URL(request.url);
   const clientId = url.searchParams.get('clientId');
   
   if (!clientId) {
+    syncLogger.error('Client ID missing in request', undefined, MODULE_NAME);
     return {
-      response: new Response('Client ID is required', { status: 400 }),
-      webSocket: null
+      response: new Response('Client ID is required', { status: 400 })
     };
   }
   
@@ -93,35 +174,9 @@ export async function handleWebSocketUpgrade(
   // Accept the WebSocket and make it hibernatable
   state.acceptWebSocket(server);
   
-  // Register client in state manager
-  await context.stateManager.registerClient(clientId);
-  
-  // Initialize sync state
-  await context.init();
-
-  // Create message sender for initial sync
-  const sender = new WebSocketMessageSender(server, clientId);
-  
-  // Send initial sync message
-  try {
-    const serverLSN = await context.stateManager.getLSN() || '0/0';
-    const initMessage = {
-      type: 'srv_sync_init' as SrvMessageType,
-      clientId,
-      messageId: `srv_${Date.now()}`,
-      timestamp: Date.now(),
-      serverLSN
-    };
+  // Create message handler
+  const messageHandler = new WebSocketMessageHandler(server, clientId);
     
-    await sender.send(initMessage);
-    syncLogger.info('Sent sync init message', { clientId, serverLSN });
-  } catch (err) {
-    syncLogger.error('Failed to send sync init message:', {
-      clientId,
-      error: err instanceof Error ? err.message : String(err)
-    });
-  }
-  
   return {
     response: new Response(null, {
       status: 101,
@@ -131,88 +186,10 @@ export async function handleWebSocketUpgrade(
   };
 }
 
-/**
- * Handle WebSocket message events
- */
-export async function handleWebSocketMessage(
-  context: WebSocketContext,
-  ws: WebSocket,
-  message: string | ArrayBuffer
-): Promise<void> {
-  try {
-    const data = JSON.parse(message as string) as { type: CltMessageType; messageId: string; timestamp: number };
-    const clientId = await context.stateManager.getClientId();
-    
-    if (!clientId) {
-      syncLogger.error('No client ID in state manager');
-      return;
-    }
-
-    // Create message context
-    const messageContext: MessageContext = {
-      clientId,
-      context: context.context,
-      lastLSN: await context.stateManager.getLSN(),
-      updateLSN: (lsn: string) => context.stateManager.setLSN(lsn)
-    };
-
-    // Process the message
-    await processMessage(
-      data,
-      messageContext,
-      new WebSocketMessageSender(ws, clientId)
-    );
-  } catch (err) {
-    syncLogger.error('Failed to process message:', {
-      error: err instanceof Error ? err.message : String(err)
-    });
-  }
-}
-
-/**
- * Handle WebSocket close events
- */
-export async function handleWebSocketClose(
-  context: WebSocketContext,
-  ws: WebSocket,
-  code: number,
-  reason: string,
-  wasClean: boolean
-): Promise<void> {
-  const clientId = await context.stateManager.getClientId();
-  
-  if (clientId) {
-    syncLogger.info('WebSocket closed:', {
-      clientId,
-      code,
-      reason: reason || 'no reason given',
-      wasClean
-    });
-    
-    // Unregister client when connection closes
-    await context.stateManager.unregisterClient();
-  }
-}
-
-/**
- * Handle WebSocket error events
- */
-export async function handleWebSocketError(
-  context: WebSocketContext,
-  ws: WebSocket,
-  error: Error
-): Promise<void> {
-  syncLogger.error('WebSocket error', error);
-  
-  const clientId = await context.stateManager.getClientId();
-  if (clientId) {
-    syncLogger.info('Client disconnected due to error', { clientId });
-    // Unregister client when connection errors
-    await context.stateManager.unregisterClient();
-  } else {
-    syncLogger.info('WebSocket error for unknown client');
-  }
-  
-  // Track error
-  context.stateManager.trackError(error);
-} 
+// Re-export message types for convenience
+export type { 
+  ServerMessage,
+  ClientMessage,
+  MessageHandlerFn,
+  MessageHandlers
+}; 

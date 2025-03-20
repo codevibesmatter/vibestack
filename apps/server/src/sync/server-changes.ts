@@ -1,26 +1,20 @@
-import type { Client } from '@neondatabase/serverless';
 import type { 
   TableChange,
   SrvMessageType,
-  CltMessageType
+  ServerChangesMessage,
+  ServerStateChangeMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
-import type { MessageContext, MessageSender } from './message-handler';
-import { WebSocketMessageSender } from './websocket-handler';
+import type { WebSocketMessageHandler } from './websocket-handler';
+import { SERVER_TABLE_HIERARCHY } from '@repo/dataforge/server-entities';
 import { getDBClient } from '../lib/db';
-import { ChangeHistory } from '@repo/typeorm/server-entities';
-import { orderChangesByDomain } from './domain-ordering';
+import type { WALChange, ChunkOptions, ChunkResult } from '../types/wal';
 
 // Constants for chunking
-const CHUNK_SIZE = 100; // Maximum changes per chunk
+const DEFAULT_CHUNK_SIZE = 100;
 
-export interface ClientState {
-  ws: WebSocket;
-  connected: boolean;
-  lastLSN?: string;
-  clientId: string;
-}
+type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
 /**
  * Compare two LSNs
@@ -35,54 +29,6 @@ export function compareLSN(lsn1: string, lsn2: string): number {
   if (minor1 < minor2) return -1;
   if (minor1 > minor2) return 1;
   return 0;
-}
-
-/**
- * Fetch changes from the database
- */
-async function fetchChanges(
-  client: Client,
-  fromLSN: string,
-  toLSN?: string,
-  limit: number = CHUNK_SIZE
-): Promise<TableChange[]> {
-  // Build query based on whether we have a toLSN
-  const whereClause = toLSN 
-    ? 'lsn::pg_lsn > $1::pg_lsn AND lsn::pg_lsn <= $2::pg_lsn'
-    : 'lsn::pg_lsn > $1::pg_lsn';
-  
-  const params = toLSN ? [fromLSN, toLSN] : [fromLSN];
-  
-  const result = await client.query<{
-    id: string;
-    lsn: string;
-    table_name: string;
-    operation: string;
-    data: Record<string, unknown>;
-    updated_at: Date;
-    client_id: string | null;
-  }>(`
-    SELECT 
-      id,
-      lsn,
-      table_name,
-      operation,
-      data,
-      updated_at,
-      client_id
-    FROM change_history
-    WHERE ${whereClause}
-    ORDER BY lsn::pg_lsn ASC
-    LIMIT $${params.length + 1}
-  `, [...params, limit]);
-
-  return result.rows.map(row => ({
-    table: row.table_name,
-    operation: row.operation as 'insert' | 'update' | 'delete',
-    data: row.data,
-    lsn: row.lsn,
-    updated_at: row.updated_at.toISOString()
-  }));
 }
 
 /**
@@ -109,96 +55,43 @@ export function deduplicateChanges(changes: TableChange[]): TableChange[] {
 
   // Convert back to array and sort by LSN for consistency
   return Array.from(latestChanges.values())
-    .sort((a, b) => compareLSN(a.lsn, b.lsn));
+    .sort((a, b) => compareLSN(a.lsn!, b.lsn!));
 }
 
 /**
- * Fetch changes for a client starting from a given LSN
- */
-export async function fetchChangesForClient(
-  context: MinimalContext,
-  fromLSN: string,
-  clientId: string
-): Promise<{ changes: TableChange[]; lastLSN: string }> {
-  const client = getDBClient(context);
-  const changes = await fetchChanges(client, fromLSN);
-  
-  if (changes.length === 0) {
-    return { changes: [], lastLSN: fromLSN };
-  }
-
-  const lastLSN = changes[changes.length - 1].lsn;
-  const deduplicatedChanges = deduplicateChanges(changes);
-  
-  syncLogger.info('Fetched changes for client', {
-    clientId,
-    originalCount: changes.length,
-    deduplicatedCount: deduplicatedChanges.length,
-    fromLSN,
-    lastLSN
-  });
-
-  return {
-    changes: deduplicatedChanges,
-    lastLSN
-  };
-}
-
-/**
- * Check and send changes to a client
- */
-export async function checkAndSendChanges(
-  ws: WebSocket,
-  changes: TableChange[],
-  lastLSN: string,
-  currentLSN: string,
-  clientId: string
-): Promise<boolean> {
-  if (!ws.clientData?.clientId) {
-    syncLogger.error('No client data found on WebSocket');
-    return false;
-  }
-
-  const sender = new WebSocketMessageSender(ws, clientId);
-  const orderedChanges = orderChangesByDomain(changes);
-  
-  return sendChanges(orderedChanges, lastLSN, clientId, sender);
-}
-
-/**
- * Send changes to client using the message sender with chunking support
+ * Send changes to client using the message handler with chunking support
  */
 async function sendChanges(
   changes: TableChange[],
   lastLSN: string,
   clientId: string,
-  sender: MessageSender
+  messageHandler: WebSocketMessageHandler
 ): Promise<boolean> {
   if (!changes.length) {
     return false;
   }
 
   // Calculate chunks
-  const chunks = Math.ceil(changes.length / CHUNK_SIZE);
+  const chunks = Math.ceil(changes.length / DEFAULT_CHUNK_SIZE);
   const success: boolean[] = [];
 
   for (let i = 0; i < chunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, changes.length);
+    const start = i * DEFAULT_CHUNK_SIZE;
+    const end = Math.min(start + DEFAULT_CHUNK_SIZE, changes.length);
     const chunkChanges = changes.slice(start, end);
 
-    const message = {
-      type: 'srv_changes' as SrvMessageType,
+    const message: ServerChangesMessage = {
+      type: 'srv_send_changes',
       messageId: `srv_${Date.now()}_${i}`,
       timestamp: Date.now(),
       clientId,
       changes: chunkChanges,
-      lastLSN: i === chunks - 1 ? lastLSN : chunkChanges[chunkChanges.length - 1].lsn,
+      lastLSN: i === chunks - 1 ? lastLSN : chunkChanges[chunkChanges.length - 1].lsn!,
       sequence: { chunk: i + 1, total: chunks }
     };
 
     try {
-      await sender.send(message);
+      await messageHandler.send(message);
       success.push(true);
       
       syncLogger.info('Sent changes chunk to client', {
@@ -225,101 +118,216 @@ async function sendChanges(
 }
 
 /**
+ * Get a chunk of WAL changes with cursor-based pagination
+ */
+async function getWALChunk(
+  context: MinimalContext,
+  startLSN: string,
+  options: ChunkOptions = {}
+): Promise<ChunkResult<WALChange>> {
+  const { chunkSize = DEFAULT_CHUNK_SIZE } = options;
+  const client = getDBClient(context);
+
+  try {
+    // Query WAL changes from start LSN
+    const query = `
+      SELECT *
+      FROM pg_logical_slot_peek_changes(
+        'replication_slot',
+        $1,
+        $2,
+        'include-xids', '1',
+        'include-timestamp', '1'
+      )
+    `;
+
+    const result = await client.query<WALChange>(query, [startLSN, chunkSize + 1]);
+
+    // Check if there are more changes
+    const hasMore = result.rows.length > chunkSize;
+    const items = hasMore ? result.rows.slice(0, chunkSize) : result.rows;
+    const nextCursor = items.length > 0 ? items[items.length - 1].lsn : null;
+
+    syncLogger.debug('Retrieved WAL chunk', {
+      startLSN,
+      chunkSize,
+      changeCount: items.length,
+      hasMore,
+      nextCursor
+    });
+
+    return {
+      items,
+      nextCursor,
+      hasMore
+    };
+  } catch (err) {
+    syncLogger.error('Failed to get WAL chunk', {
+      startLSN,
+      chunkSize,
+      error: err instanceof Error ? err.message : String(err)
+    });
+    throw err;
+  }
+}
+
+/**
+ * Process WAL changes in chunks
+ */
+async function processWALInChunks(
+  context: MinimalContext,
+  startLSN: string,
+  processor: (items: WALChange[]) => Promise<void>,
+  options: ChunkOptions = {}
+): Promise<void> {
+  let currentLSN = startLSN;
+  let totalProcessed = 0;
+
+  while (true) {
+    const chunk = await getWALChunk(context, currentLSN, options);
+    await processor(chunk.items);
+    totalProcessed += chunk.items.length;
+
+    if (!chunk.hasMore) {
+      break;
+    }
+
+    currentLSN = chunk.nextCursor!;
+  }
+
+  syncLogger.info('Finished processing WAL in chunks', {
+    startLSN,
+    endLSN: currentLSN,
+    totalProcessed
+  });
+}
+
+/**
+ * Convert WAL changes to TableChange format
+ */
+function walToTableChanges(changes: WALChange[]): TableChange[] {
+  return changes.map(change => ({
+    table: change.table_name,
+    operation: change.operation,
+    data: change.new_data,
+    lsn: change.lsn,
+    updated_at: change.timestamp?.toISOString() || new Date().toISOString()
+  }));
+}
+
+/**
+ * Perform catchup sync for a client
+ * This uses WAL changes from a specific LSN
+ */
+export async function performCatchupSync(
+  context: MinimalContext,
+  clientId: string,
+  startLSN: string,
+  messageHandler: WebSocketMessageHandler
+): Promise<void> {
+  syncLogger.info('Starting catchup sync', {
+    clientId,
+    startLSN
+  });
+
+  await processWALInChunks(
+    context,
+    startLSN,
+    async (items) => {
+      const changes = walToTableChanges(items);
+      const orderedChanges = orderChangesByDomain(changes);
+      await sendChanges(orderedChanges, items[items.length - 1].lsn, clientId, messageHandler);
+    }
+  );
+
+  // Send state change message
+  const stateChangeMsg: ServerStateChangeMessage = {
+    type: 'srv_state_change',
+    messageId: `srv_${Date.now()}`,
+    timestamp: Date.now(),
+    clientId,
+    state: 'live',
+    lsn: startLSN
+  };
+  await messageHandler.send(stateChangeMsg);
+
+  syncLogger.info('Completed catchup sync', {
+    clientId,
+    startLSN
+  });
+}
+
+/**
  * Handle new changes from replication
  */
 export async function handleNewChanges(
-  context: MinimalContext,
-  firstLSN: string,
+  changes: TableChange[],
   lastLSN: string,
   clientId: string,
-  sender: MessageSender
+  messageHandler: WebSocketMessageHandler
 ): Promise<boolean> {
   try {
-    const client = getDBClient(context);
-    const changes = await fetchChanges(client, firstLSN, lastLSN);
+    // Send changes to client
+    const success = await sendChanges(changes, lastLSN, clientId, messageHandler);
     
-    if (changes.length === 0) {
-      syncLogger.debug('No changes found in range', {
-        firstLSN,
+    if (success) {
+      syncLogger.info('Successfully sent changes to client', {
+        clientId,
+        changeCount: changes.length,
         lastLSN
       });
-      return false;
+    } else {
+      syncLogger.error('Failed to send some changes to client', {
+        clientId,
+        changeCount: changes.length,
+        lastLSN
+      });
     }
-
-    // First deduplicate to get latest state of each record
-    const deduplicatedChanges = deduplicateChanges(changes);
     
-    syncLogger.info('Deduplicating changes', {
-      clientId,
-      originalCount: changes.length,
-      deduplicatedCount: deduplicatedChanges.length,
-      reductionPercent: Math.round((1 - deduplicatedChanges.length / changes.length) * 100),
-      tables: [...new Set(changes.map(c => c.table))].join(',')
-    });
-
-    // Then order by domain hierarchy
-    const orderedChanges = orderChangesByDomain(deduplicatedChanges);
-    
-    syncLogger.info('Ordered changes by domain', {
-      clientId,
-      tableOrder: orderedChanges.map(c => `${c.operation}:${c.table}`).join(',')
-    });
-
-    return await sendChanges(orderedChanges, lastLSN, clientId, sender);
+    return success;
   } catch (err) {
-    syncLogger.error('Error handling new changes', err);
+    syncLogger.error('Error handling new changes', {
+      clientId,
+      error: err instanceof Error ? err.message : String(err)
+    });
     return false;
   }
 }
 
 /**
- * Process a sync request from a client
+ * Order changes based on table hierarchy and operation type
+ * - Creates/Updates: Process parents before children
+ * - Deletes: Process children before parents
  */
-export async function processSyncRequest(
-  message: { type: CltMessageType; clientId: string; lastLSN: string },
-  ctx: MessageContext,
-  sender: MessageSender
-): Promise<void> {
-  try {
-    const client = getDBClient(ctx.context);
-    const changes = await fetchChanges(client, message.lastLSN);
-    
-    if (changes.length === 0) {
-      syncLogger.info('No changes found for sync request', {
-        clientId: message.clientId,
-        lastLSN: message.lastLSN
-      });
-      return;
+export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
+  const ordered = changes.sort((a, b) => {
+    // Add quotes to match SERVER_TABLE_HIERARCHY keys
+    const aLevel = SERVER_TABLE_HIERARCHY[`"${a.table}"` as TableName] ?? 0;
+    const bLevel = SERVER_TABLE_HIERARCHY[`"${b.table}"` as TableName] ?? 0;
+
+    // For deletes, reverse the hierarchy
+    if (a.operation === 'delete' && b.operation === 'delete') {
+      return bLevel - aLevel;
     }
 
-    const lastLSN = changes[changes.length - 1].lsn;
-    const deduplicatedChanges = deduplicateChanges(changes);
-    
-    syncLogger.info('Deduplicating changes for sync request', {
-      clientId: message.clientId,
-      originalCount: changes.length,
-      deduplicatedCount: deduplicatedChanges.length,
-      reductionPercent: Math.round((1 - deduplicatedChanges.length / changes.length) * 100),
-      fromLSN: message.lastLSN,
-      toLSN: lastLSN,
-      tables: [...new Set(changes.map(c => c.table))].join(',')
-    });
+    // For mixed operations, deletes come last
+    if (a.operation === 'delete') return 1;
+    if (b.operation === 'delete') return -1;
 
-    // Order changes by domain hierarchy
-    const orderedChanges = orderChangesByDomain(deduplicatedChanges);
-    
-    syncLogger.info('Ordered changes by domain for sync request', {
-      clientId: message.clientId,
-      tableOrder: orderedChanges.map(c => `${c.operation}:${c.table}`).join(',')
-    });
-    
-    await sendChanges(orderedChanges, lastLSN, message.clientId, sender);
-    
-    if (ctx.updateLSN) {
-      ctx.updateLSN(lastLSN);
-    }
-  } catch (err) {
-    syncLogger.error('Error processing sync request', err);
-    throw err;
-  }
+    // For creates/updates, follow hierarchy
+    return aLevel - bLevel;
+  });
+
+  syncLogger.info('Ordered changes by domain', {
+    changesByTable: ordered.reduce((acc, change) => {
+      acc[change.table] = (acc[change.table] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>),
+    operationCounts: ordered.reduce((acc, change) => {
+      acc[change.operation] = (acc[change.operation] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>)
+  });
+
+  return ordered;
 } 

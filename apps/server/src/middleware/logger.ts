@@ -1,7 +1,6 @@
 import { MiddlewareHandler } from 'hono';
-import type { LogLevel } from '../types/env';
+import type { LogLevel, DeploymentEnv } from '../types/env';
 import type { AppBindings } from '../types/hono';
-import { logger } from '../utils/logger';
 
 // Log level priorities (for comparison)
 const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
@@ -61,19 +60,20 @@ export interface LoggerConfig {
 }
 
 // Default configuration based on environment
-const getDefaultConfig = (): LoggerConfig => {
+const getDefaultConfig = (environment: DeploymentEnv = 'production'): LoggerConfig => {
   // Set timestamp format to 'none' by default
-  const timestampFormat = process.env.LOG_TIMESTAMP_FORMAT as LoggerConfig['timestampFormat'] || 'none';
+  const timestampFormat = 'none';
+  const isProduction = environment === 'production';
   
   return {
-    level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
-    prettyPrint: process.env.NODE_ENV !== 'production',
-    includeRequestBody: process.env.NODE_ENV !== 'production',
+    level: isProduction ? 'info' : 'debug',
+    prettyPrint: !isProduction,
+    includeRequestBody: !isProduction,
     includeResponseBody: false,
-    includeHeaders: process.env.NODE_ENV !== 'production',
+    includeHeaders: !isProduction,
     excludePaths: ['/health', '/api/health'],
     excludeHeaders: ['authorization', 'cookie'],
-    useColors: process.env.NODE_ENV !== 'production',
+    useColors: !isProduction,
     jsonIndent: 2,
     timestampFormat
   };
@@ -181,10 +181,11 @@ const getLevelEmoji = (level: string): string => {
 /**
  * Get color for context
  * @param context Context name
+ * @param module Module name
  * @param config Logger configuration
  * @returns Color code or empty string
  */
-const getContextColor = (context: string | undefined, config: LoggerConfig): string => {
+const getContextColor = (context: string | undefined, module: string | undefined, config: LoggerConfig): string => {
   if (!context || !config.useColors) return '';
   
   // Assign consistent colors to different contexts
@@ -202,6 +203,14 @@ const getContextColor = (context: string | undefined, config: LoggerConfig): str
   return contextColors[context.toLowerCase()] || colors.white;
 };
 
+/**
+ * Format context string with optional module
+ */
+const getContextString = (context?: string, module?: string): string => {
+  if (!context) return '';
+  return module ? `[${context}:${module}] ` : `[${context}] `;
+};
+
 // Helper function to format the timestamp part of the log message
 const getTimestampPrefix = (timestamp: string, config: LoggerConfig): string => {
   if (config.timestampFormat === 'none' || !timestamp) return '';
@@ -213,6 +222,108 @@ const getTimestampPrefix = (timestamp: string, config: LoggerConfig): string => 
 };
 
 /**
+ * Base logger implementation
+ */
+export const logger = {
+  debug(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
+    const config = getDefaultConfig(environment);
+    if (!isLogLevelEnabled(config.level, 'debug')) return;
+    
+    const timestamp = formatTimestamp(new Date(), config.timestampFormat);
+    const contextStr = getContextString(context, module);
+    const levelColor = getLevelColor('debug', config);
+    const contextColor = getContextColor(context, module, config);
+    const emoji = getLevelEmoji('debug');
+    
+    console.debug(
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} DEBUG${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      data ? formatData(data, config) : ''
+    );
+  },
+
+  info(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
+    const config = getDefaultConfig(environment);
+    if (!isLogLevelEnabled(config.level, 'info')) return;
+    
+    const timestamp = formatTimestamp(new Date(), config.timestampFormat);
+    const contextStr = getContextString(context, module);
+    const levelColor = getLevelColor('info', config);
+    const contextColor = getContextColor(context, module, config);
+    const emoji = getLevelEmoji('info');
+    
+    console.info(
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} INFO${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      data ? formatData(data, config) : ''
+    );
+  },
+
+  warn(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
+    const config = getDefaultConfig(environment);
+    if (!isLogLevelEnabled(config.level, 'warn')) return;
+    
+    const timestamp = formatTimestamp(new Date(), config.timestampFormat);
+    const contextStr = getContextString(context, module);
+    const levelColor = getLevelColor('warn', config);
+    const contextColor = getContextColor(context, module, config);
+    const emoji = getLevelEmoji('warn');
+    
+    console.warn(
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} WARN${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      data ? formatData(data, config) : ''
+    );
+  },
+
+  error(message: string, errorOrData?: any, additionalData?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
+    const config = getDefaultConfig(environment);
+    if (!isLogLevelEnabled(config.level, 'error')) return;
+    
+    const timestamp = formatTimestamp(new Date(), config.timestampFormat);
+    const contextStr = getContextString(context, module);
+    const levelColor = getLevelColor('error', config);
+    const contextColor = getContextColor(context, module, config);
+    const emoji = getLevelEmoji('error');
+    
+    // Handle both error objects and data objects
+    let errorObject: any = undefined;
+    let dataObject: any = undefined;
+    
+    if (errorOrData instanceof Error) {
+      errorObject = errorOrData;
+      dataObject = additionalData;
+    } else {
+      dataObject = errorOrData;
+    }
+    
+    console.error(
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} ERROR${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      errorObject,
+      dataObject ? formatData(dataObject, config) : ''
+    );
+  },
+
+  createLogger(context: string, defaultModule?: string) {
+    return {
+      debug: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
+        this.debug(message, data, context, module || defaultModule, environment),
+      info: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
+        this.info(message, data, context, module || defaultModule, environment),
+      warn: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
+        this.warn(message, data, context, module || defaultModule, environment),
+      error: (message: string, errorOrData?: any, additionalData?: any, module?: string, environment?: DeploymentEnv) => 
+        this.error(message, errorOrData, additionalData, context, module || defaultModule, environment)
+    };
+  }
+};
+
+// Create specialized loggers
+export const serverLogger = logger.createLogger('server');
+export const syncLogger = logger.createLogger('sync');
+export const replicationLogger = logger.createLogger('replication');
+export const dbLogger = logger.createLogger('db');
+export const apiLogger = logger.createLogger('api');
+export const workerLogger = logger.createLogger('worker');
+
+/**
  * Create a structured logger middleware
  * Logs request/response information and timing
  */
@@ -221,6 +332,7 @@ export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
     const startTime = Date.now();
     const method = c.req.method;
     const url = new URL(c.req.url);
+    const environment = c.env.ENVIRONMENT;
 
     try {
       await next();
@@ -232,248 +344,18 @@ export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
         url: url.toString(),
         status: c.res.status,
         duration
-      });
+      }, undefined, environment);
     } catch (error) {
       const endTime = Date.now();
       const duration = endTime - startTime;
 
-      logger.error('Request failed', {
+      logger.error('Request failed', error, {
         method,
         url: url.toString(),
-        error,
         duration
-      });
+      }, undefined, environment);
 
       throw error;
     }
   };
-}
-
-// Utility logger for non-request contexts
-export const serverLogger = {
-  debug(message: string, data?: any, context?: string): void {
-    if (getDefaultConfig().level === 'debug') {
-      const config = getDefaultConfig();
-      const timestamp = formatTimestamp(new Date(), config.timestampFormat);
-      const contextStr = context ? `[${context}]` : '';
-      const logData = {
-        level: 'debug',
-        message,
-        context,
-        data,
-        timestamp
-      };
-      
-      if (config.prettyPrint) {
-        const levelColor = getLevelColor('debug', config);
-        const contextColor = getContextColor(context, config);
-        const timeColor = config.useColors ? colors.dim : '';
-        const reset = config.useColors ? colors.reset : '';
-        const emoji = getLevelEmoji('debug');
-        
-        // Print the log header
-        console.debug(
-          `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji}${reset} ${contextColor}${contextStr}${reset} ${message}`
-        );
-        
-        // Print data on a new line if it exists
-        if (data) {
-          console.debug(formatData(data, config));
-        }
-      } else {
-        console.debug(JSON.stringify(logData));
-      }
-    }
-  },
-  
-  info(message: string, data?: any, context?: string): void {
-    const config = getDefaultConfig();
-    if (config.level === 'debug' || config.level === 'info') {
-      const timestamp = formatTimestamp(new Date(), config.timestampFormat);
-      const contextStr = context ? `[${context}]` : '';
-      const logData = {
-        level: 'info',
-        message,
-        context,
-        data,
-        timestamp
-      };
-      
-      if (config.prettyPrint) {
-        const levelColor = getLevelColor('info', config);
-        const contextColor = getContextColor(context, config);
-        const timeColor = config.useColors ? colors.dim : '';
-        const reset = config.useColors ? colors.reset : '';
-        const emoji = getLevelEmoji('info');
-        
-        // Print the log header
-        console.log(
-          `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji}${reset} ${contextColor}${contextStr}${reset} ${message}`
-        );
-        
-        // Print data on a new line if it exists
-        if (data) {
-          console.log(formatData(data, config));
-        }
-      } else {
-        console.log(JSON.stringify(logData));
-      }
-    }
-  },
-  
-  warn(message: string, data?: any, context?: string): void {
-    if (getDefaultConfig().level === 'warn') {
-      const config = getDefaultConfig();
-      const timestamp = formatTimestamp(new Date(), config.timestampFormat);
-      const contextStr = context ? `[${context}]` : '';
-      const logData = {
-        level: 'warn',
-        message,
-        context,
-        data,
-        timestamp
-      };
-      
-      if (config.prettyPrint) {
-        const levelColor = getLevelColor('warn', config);
-        const contextColor = getContextColor(context, config);
-        const timeColor = config.useColors ? colors.dim : '';
-        const reset = config.useColors ? colors.reset : '';
-        const emoji = getLevelEmoji('warn');
-        
-        // Print the log header
-        console.warn(
-          `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji}${reset} ${contextColor}${contextStr}${reset} ${message}`
-        );
-        
-        // Print data on a new line if it exists
-        if (data) {
-          console.warn(formatData(data, config));
-        }
-      } else {
-        console.warn(JSON.stringify(logData));
-      }
-    }
-  },
-  
-  error(message: string, error?: any, data?: any, context?: string): void {
-    if (getDefaultConfig().level === 'error') {
-      const config = getDefaultConfig();
-      const timestamp = formatTimestamp(new Date(), config.timestampFormat);
-      const contextStr = context ? `[${context}]` : '';
-      const logData = {
-        level: 'error',
-        message,
-        context,
-        error: error instanceof Error ? {
-          name: error.name,
-          message: error.message,
-          stack: error.stack
-        } : error,
-        data,
-        timestamp
-      };
-      
-      if (config.prettyPrint) {
-        const levelColor = getLevelColor('error', config);
-        const contextColor = getContextColor(context, config);
-        const timeColor = config.useColors ? colors.dim : '';
-        const reset = config.useColors ? colors.reset : '';
-        const emoji = getLevelEmoji('error');
-        
-        // Print the log header
-        console.error(
-          `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji}${reset} ${contextColor}${contextStr}${reset} ${message}`
-        );
-        
-        // Print error if it exists
-        if (error) {
-          if (error instanceof Error) {
-            console.error(`${levelColor}${error.message}${reset}`);
-            if (error.stack) {
-              console.error(`${levelColor}${error.stack.split('\n').slice(1).join('\n')}${reset}`);
-            }
-          } else {
-            console.error(formatData(error, config));
-          }
-        }
-        
-        // Print data on a new line if it exists
-        if (data) {
-          console.error(formatData(data, config));
-        }
-      } else {
-        console.error(JSON.stringify(logData));
-      }
-    }
-  },
-  
-  /**
-   * Create a context-specific logger (backward compatibility)
-   * @param context The context name
-   * @returns A logger instance with the specified context
-   * @deprecated Use createLogger instead
-   */
-  withContext(context: string) {
-    return this.createLogger(context);
-  },
-  
-  /**
-   * Create a context-specific logger
-   * @param context The context name
-   * @param config Optional configuration overrides
-   * @returns A logger instance with the specified context
-   */
-  createLogger(context: string, config?: Partial<LoggerConfig>) {
-    const mergedConfig = { ...getDefaultConfig(), ...config };
-    
-    return {
-      debug: (message: string, data?: any) => 
-        serverLogger.debug(message, data, context),
-      
-      info: (message: string, data?: any) => 
-        serverLogger.info(message, data, context),
-      
-      warn: (message: string, data?: any) => 
-        serverLogger.warn(message, data, context),
-      
-      error: (message: string, error?: any, data?: any) => 
-        serverLogger.error(message, error, data, context),
-      
-      // Configure timestamp format for this logger instance
-      withTimestampFormat(format: LoggerConfig['timestampFormat']) {
-        return serverLogger.createLogger(context, { ...mergedConfig, timestampFormat: format });
-      },
-      
-      // Create a logger with no timestamps
-      withoutTimestamps() {
-        return this.withTimestampFormat('none');
-      },
-      
-      // Create a logger with short timestamps (HH:MM:SS)
-      withShortTimestamps() {
-        return this.withTimestampFormat('short');
-      },
-      
-      // Create a logger with time-only timestamps (HH:MM:SS.mmm)
-      withTimeTimestamps() {
-        return this.withTimestampFormat('time');
-      },
-      
-      // Create a logger with full timestamps (YYYY-MM-DD HH:MM:SS.mmm)
-      withFullTimestamps() {
-        return this.withTimestampFormat('full');
-      }
-    };
-  }
-};
-
-// Create context-specific loggers
-export const syncLogger = serverLogger.createLogger('sync');
-export const connectionLogger = serverLogger.createLogger('connection');
-export const replicationLogger = serverLogger.createLogger('replication');
-export const apiLogger = serverLogger.createLogger('api');
-export const dbLogger = serverLogger.createLogger('db');
-export const authLogger = serverLogger.createLogger('auth');
-export const storageLogger = serverLogger.createLogger('storage');
-export const workerLogger = serverLogger.createLogger('worker'); 
+} 

@@ -3,7 +3,7 @@ import { loadServerData, clearAllData, dropAllTables, fetchMigrationsFromServer,
 import { resetLSN, disconnectFromSyncServer, connectToSyncServer, isSyncConnected, onSyncEvent, offSyncEvent } from '../sync';
 import { config } from '../config';
 import type { PGlite } from '@electric-sql/pglite';
-import type { ClientMigration } from '@repo/typeorm/server-entities';
+import type { ClientMigration } from '@repo/dataforge/server-entities';
 import { createColumnHelper } from '@tanstack/react-table';
 import type { Table, Row, CellContext } from '@tanstack/react-table';
 import { MigrationsTable, type Migration } from './data-table/MigrationsTable';

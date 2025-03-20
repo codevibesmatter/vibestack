@@ -1,5 +1,5 @@
 import { Client } from '@neondatabase/serverless';
-import { Task, TaskStatus, TaskPriority } from "@repo/typeorm/server-entities";
+import { Task, TaskStatus, TaskPriority } from "@repo/dataforge/server-entities";
 import { validate } from "class-validator";
 
 // Re-export enums for convenience

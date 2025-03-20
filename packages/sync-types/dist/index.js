@@ -20,14 +20,19 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/index.ts
 var index_exports = {};
 __export(index_exports, {
+  isClientMessageType: () => isClientMessageType,
   isTableChange: () => isTableChange
 });
 module.exports = __toCommonJS(index_exports);
 function isTableChange(payload) {
   const p = payload;
-  return p && typeof p.table === "string" && ["insert", "update", "delete"].includes(p.operation) && typeof p.data === "object" && p.data !== null && typeof p.lsn === "string" && typeof p.updated_at === "string";
+  return p && typeof p.table === "string" && ["insert", "update", "delete"].includes(p.operation) && typeof p.data === "object" && p.data !== null && (!p.lsn || typeof p.lsn === "string") && typeof p.updated_at === "string";
+}
+function isClientMessageType(type) {
+  return type.startsWith("clt_");
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  isClientMessageType,
   isTableChange
 });

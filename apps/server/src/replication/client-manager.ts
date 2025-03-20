@@ -1,5 +1,5 @@
 import type { Env } from '../types/env';
-import type { DurableObjectState } from '@cloudflare/workers-types';
+import type { DurableObjectState } from '../types/cloudflare';
 import type { TableChange } from '@repo/sync-types';
 import { replicationLogger } from '../middleware/logger';
 
@@ -29,6 +29,7 @@ export interface ClientState {
  */
 export class ClientManager {
   private env: Env;
+  private static readonly CLIENT_TIMEOUT = 30000; // 30 seconds timeout
 
   constructor(env: Env) {
     this.env = env;
@@ -39,25 +40,56 @@ export class ClientManager {
    */
   public async getClients(): Promise<ClientState[]> {
     try {
+      replicationLogger.info('Fetching all clients from registry');
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
+      replicationLogger.info('Client keys found in registry', { count: keys.length, keys: keys.map(k => k.name) });
+      
       const clients: ClientState[] = [];
       
       for (const key of keys) {
+        replicationLogger.debug('Retrieving client data', { key: key.name });
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
-        if (!value) continue;
+        
+        if (!value) {
+          replicationLogger.warn('Client key exists but no value found', { key: key.name });
+          continue;
+        }
 
-        const state = JSON.parse(value);
-        clients.push({
-          id: key.name.replace('client:', ''),
-          active: state.active,
-          lastSeen: state.lastSeen,
-          lastLSN: state.lastLSN
-        });
+        try {
+          const state = JSON.parse(value);
+          clients.push({
+            id: key.name.replace('client:', ''),
+            active: state.active,
+            lastSeen: state.lastSeen,
+            lastLSN: state.lastLSN
+          });
+          
+          replicationLogger.debug('Client data retrieved', { 
+            id: key.name.replace('client:', ''),
+            active: state.active,
+            lastSeen: state.lastSeen,
+            lastLSN: state.lastLSN
+          });
+        } catch (parseErr) {
+          replicationLogger.error('Failed to parse client state', { 
+            key: key.name, 
+            value, 
+            error: parseErr instanceof Error ? parseErr.message : String(parseErr)
+          });
+        }
       }
 
+      replicationLogger.info('Clients retrieved from registry', { 
+        totalFound: clients.length,
+        activeCount: clients.filter(c => c.active).length
+      });
+      
       return clients;
     } catch (error) {
-      replicationLogger.error('Failed to get clients:', error);
+      replicationLogger.error('Failed to get clients:', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
       return [];
     }
   }
@@ -67,22 +99,79 @@ export class ClientManager {
    */
   public async hasActiveClients(): Promise<boolean> {
     try {
+      replicationLogger.info('Checking for active clients');
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
+      replicationLogger.info('Client keys found in registry', { count: keys.length });
       
-      // Check each client's state until we find an active one
+      if (keys.length === 0) {
+        replicationLogger.warn('No client keys found in registry');
+        return false;
+      }
+      
+      let hasActive = false;
+      const now = Date.now();
+      
+      // Check each client's state and clean up stale ones
       for (const key of keys) {
+        replicationLogger.debug('Checking client state', { key: key.name });
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
-        if (!value) continue;
+        
+        if (!value) {
+          replicationLogger.warn('Client key exists but no value found', { key: key.name });
+          // Clean up empty key
+          await this.env.CLIENT_REGISTRY.delete(key.name);
+          continue;
+        }
 
-        const state = JSON.parse(value);
-        if (state.active) {
-          return true;
+        try {
+          const state = JSON.parse(value);
+          const lastSeen = state.lastSeen || 0;
+          const isStale = now - lastSeen > ClientManager.CLIENT_TIMEOUT;
+          
+          replicationLogger.debug('Client state parsed', { 
+            key: key.name,
+            active: state.active,
+            lastSeen,
+            isStale,
+            timeSinceLastSeen: now - lastSeen
+          });
+          
+          if (state.active && !isStale) {
+            replicationLogger.info('Found active client', { 
+              clientId: key.name.replace('client:', ''),
+              lastSeen: state.lastSeen
+            });
+            hasActive = true;
+          } else if (isStale) {
+            // Remove stale client
+            replicationLogger.info('Removing stale client', {
+              clientId: key.name.replace('client:', ''),
+              lastSeen: state.lastSeen,
+              timeSinceLastSeen: now - lastSeen
+            });
+            await this.env.CLIENT_REGISTRY.delete(key.name);
+          }
+        } catch (parseErr) {
+          replicationLogger.error('Failed to parse client state', { 
+            key: key.name, 
+            value, 
+            error: parseErr instanceof Error ? parseErr.message : String(parseErr) 
+          });
+          // Clean up invalid state
+          await this.env.CLIENT_REGISTRY.delete(key.name);
         }
       }
 
-      return false;
+      if (!hasActive) {
+        replicationLogger.info('No active clients found after cleanup');
+      }
+      
+      return hasActive;
     } catch (error) {
-      replicationLogger.error('Failed to check for active clients:', error);
+      replicationLogger.error('Failed to check for active clients:', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      });
       return false;
     }
   }
@@ -116,21 +205,23 @@ export class ClientManager {
         }
       }
 
-      // Notify each relevant client
-      const firstLSN = changes[0].lsn;
-      const lastLSN = changes[changes.length - 1].lsn;
-
-      for (const clientId of clientsToNotify) {
-        await this.wakeUpClient(clientId, changes, firstLSN, lastLSN);
+      // Only proceed with notifications if we have clients to notify
+      if (clientsToNotify.length > 0) {
+        // Notify each relevant client
+        let notifiedCount = 0;
+        for (const clientId of clientsToNotify) {
+          const success = await this.wakeUpClient(clientId, changes);
+          if (success) notifiedCount++;
+        }
+        
+        if (notifiedCount > 0) {
+          replicationLogger.info('Successfully notified clients:', {
+            event: 'replication.notify.success',
+            notifiedCount,
+            totalClients: clientsToNotify.length
+          });
+        }
       }
-      
-      replicationLogger.info('Notified clients about changes:', {
-        event: 'replication.notify',
-        clientCount: clientsToNotify.length,
-        changeCount: changes.length,
-        firstLSN,
-        lastLSN
-      });
     } catch (error) {
       replicationLogger.error('Failed to handle changes:', error);
       throw error;
@@ -142,56 +233,84 @@ export class ClientManager {
    */
   private async wakeUpClient(
     clientId: string,
-    changes: TableChange[],
-    firstLSN?: string,
-    lastLSN?: string
+    changes: TableChange[]
   ): Promise<boolean> {
     try {
+      replicationLogger.info('Attempting to wake up client', { clientId });
+      
       // Get the client state from KV
-      const value = await this.env.CLIENT_REGISTRY.get(`client:${clientId}`);
+      const clientKey = `client:${clientId}`;
+      replicationLogger.debug('Looking up client in registry', { clientKey });
+      
+      const value = await this.env.CLIENT_REGISTRY.get(clientKey);
       if (!value) {
-        replicationLogger.warn('Client not found in KV:', { clientId });
-        return false;
-      }
-
-      const state = JSON.parse(value);
-      if (!state.active) {
-        replicationLogger.debug('Client is inactive:', { clientId });
-        return false;
-      }
-
-      // Get the SyncDO instance
-      const id = this.env.SYNC.idFromName(`client:${clientId}`);
-      const syncDO = this.env.SYNC.get(id);
-      
-      // If we don't have LSN values or changes, just check if client is connected
-      if (!firstLSN || !lastLSN || !changes) {
-        const response = await syncDO.fetch('http://internal/metrics');
-        return response.ok;
-      }
-      
-      // Send changes to the client
-      const url = new URL('http://internal/new-changes');
-      url.searchParams.set('firstLSN', firstLSN);
-      url.searchParams.set('lastLSN', lastLSN);
-      
-      const response = await syncDO.fetch(url.toString(), {
-        method: 'POST',
-        body: JSON.stringify({ changes })
-      });
-      
-      if (!response.ok) {
-        replicationLogger.warn('Failed to notify client:', { 
-          clientId, 
-          status: response.status
+        replicationLogger.warn('Client not found in KV registry', { 
+          clientId,
+          clientKey
         });
+        return false;
       }
-      
-      return response.ok;
+
+      try {
+        const state = JSON.parse(value);
+        replicationLogger.debug('Client state retrieved', { 
+          clientId, 
+          active: state.active,
+          lastSeen: state.lastSeen
+        });
+        
+        if (!state.active) {
+          replicationLogger.debug('Client is inactive, skipping notification', { clientId });
+          return false;
+        }
+        
+        // Get the SyncDO instance
+        const id = this.env.SYNC.idFromName(`client:${clientId}`);
+        replicationLogger.debug('Created SyncDO ID for client', { 
+          clientId, 
+          syncDoId: id.toString() 
+        });
+        
+        const syncDO = this.env.SYNC.get(id);
+        
+        // Send changes to the client
+        replicationLogger.info('Sending changes to client', { 
+          clientId, 
+          changeCount: changes.length 
+        });
+        
+        const response = await syncDO.fetch('http://internal/new-changes', {
+          method: 'POST',
+          body: JSON.stringify({ changes })
+        });
+        
+        if (!response.ok) {
+          replicationLogger.warn('Failed to notify client:', { 
+            clientId, 
+            status: response.status,
+            statusText: response.statusText
+          });
+          return false;
+        }
+        
+        replicationLogger.info('Client successfully notified of changes', { 
+          clientId, 
+          changeCount: changes.length 
+        });
+        return true;
+      } catch (parseErr) {
+        replicationLogger.error('Failed to parse client state', { 
+          clientId, 
+          value, 
+          error: parseErr instanceof Error ? parseErr.message : String(parseErr) 
+        });
+        return false;
+      }
     } catch (err) {
       replicationLogger.error('Error notifying client:', {
         clientId,
-        error: err instanceof Error ? err.message : String(err)
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined
       });
       return false;
     }

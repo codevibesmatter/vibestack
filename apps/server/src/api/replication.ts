@@ -1,14 +1,7 @@
 import { Hono } from 'hono';
-import { replicationLogger } from '../middleware/logger';
 import type { ApiEnv } from '../types/api';
 
 const replication = new Hono<ApiEnv>();
-
-// Simple middleware to log requests
-replication.use('*', async (c, next) => {
-  replicationLogger.info(`Replication API: ${c.req.method} ${c.req.url}`);
-  await next();
-});
 
 // Forward all requests to the Durable Object
 replication.all('*', async (c) => {

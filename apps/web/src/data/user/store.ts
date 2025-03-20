@@ -2,7 +2,7 @@ import { atom } from 'jotai';
 import { useAtom } from 'jotai';
 import { atomWithReset } from 'jotai/utils';
 import { atomFamily } from 'jotai/utils';
-import { User } from '@repo/typeorm/client-entities';
+import { User } from '@repo/dataforge/client-entities';
 import { getAllUsers, createUser, updateUser, deleteUser, getUserById } from './api';
 import { DataResult, PerformanceMetrics } from '../common/base/DataAccess';
 import { dbMessageBus, DbEventType } from '../../db/message-bus';

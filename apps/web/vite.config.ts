@@ -48,10 +48,10 @@ export default defineConfig({
       '@repo/db': resolve(__dirname, '../../packages/db/dist/client.js'),
       '@repo/db-migrations': resolve(__dirname, '../../packages/db/src/migrations'),
       '@repo/db-migrations-client': resolve(__dirname, '../../packages/db/src/migrations/client'),
-      '@repo/typeorm': resolve(__dirname, '../../packages/typeorm/dist'),
-      '@repo/typeorm/client-entities': resolve(__dirname, '../../packages/typeorm/dist/client-entities.js'),
-      '@repo/typeorm/dist/entities/Task': resolve(__dirname, '../../packages/typeorm/dist/entities/Task.js'),
-      '@repo/typeorm/dist/entities/Project': resolve(__dirname, '../../packages/typeorm/dist/entities/Project.js')
+      '@repo/dataforge': resolve(__dirname, '../../packages/typeorm/dist'),
+      '@repo/dataforge/client-entities': resolve(__dirname, '../../packages/typeorm/dist/client-entities.js'),
+      '@repo/dataforge/dist/entities/Task': resolve(__dirname, '../../packages/typeorm/dist/entities/Task.js'),
+      '@repo/dataforge/dist/entities/Project': resolve(__dirname, '../../packages/typeorm/dist/entities/Project.js')
     }
   },
   server: {

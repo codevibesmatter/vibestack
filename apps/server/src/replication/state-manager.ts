@@ -1,110 +1,171 @@
-import type { DurableObjectState } from '@cloudflare/workers-types';
-import type { Context } from 'hono';
-import type { ReplicationState } from './types';
-import type { Env } from '../types/env';
-import { replicationLogger } from '../middleware/logger';
-import type { ReplicationConfig } from './types';
-import { PollingManager } from './polling';
-import { getAllClients } from '../sync/client-registry';
-import { Client } from '@neondatabase/serverless';
-import { getSlotStatus } from './slot';
-import { getDBClient } from '../lib/db';
+import type { DurableObjectState } from '../types/cloudflare';
 import type { MinimalContext } from '../types/hono';
+import { replicationLogger } from '../middleware/logger';
+import { getDBClient } from '../lib/db';
+import type { ReplicationConfig } from './types';
+import { getDomainTables } from './types';
 
-// Add connect_timeout to URL if not present
-function addConnectTimeout(url: string): string {
-  const dbUrl = new URL(url);
-  if (!dbUrl.searchParams.has('connect_timeout')) {
-    dbUrl.searchParams.set('connect_timeout', '10');
-  }
-  if (!dbUrl.searchParams.has('sslmode')) {
-    dbUrl.searchParams.set('sslmode', 'require');
-  }
-  return dbUrl.toString();
-}
-
-// Create a database client for DurableObjects
-function createDBClient(databaseURL: string): Client {
-  const urlWithTimeout = addConnectTimeout(databaseURL);
-  return new Client({
-    connectionString: urlWithTimeout,
-    ssl: true
-  });
-}
-
-/**
- * Manages the state persistence for the replication system
- */
 export class StateManager {
-  private state: DurableObjectState;
-  private stateKey = 'replication_state';
+  private static readonly LSN_KEY = 'current_lsn';
 
-  constructor(state: DurableObjectState) {
-    this.state = state;
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly config: ReplicationConfig
+  ) {}
+
+  /**
+   * Get current LSN from storage
+   */
+  public async getLSN(): Promise<string> {
+    const lsn = await this.state.storage.get<string>(StateManager.LSN_KEY);
+    return lsn || '0/0';
   }
 
   /**
-   * Loads the current replication state from storage
-   * @returns The current replication state
+   * Set current LSN in storage
    */
-  public async loadState(): Promise<ReplicationState> {
-    try {
-      const state = await this.state.storage.get<ReplicationState>(this.stateKey);
-      return state || {
-        confirmedLSN: '0/0'
-      };
-    } catch (err) {
-      replicationLogger.error('Failed to load replication state:', err);
-      // Return default state on error
-      return {
-        confirmedLSN: '0/0'
-      };
+  public async setLSN(lsn: string): Promise<void> {
+    if (!lsn) return;
+    await this.state.storage.put(StateManager.LSN_KEY, lsn);
+  }
+
+  /**
+   * Compare two LSNs
+   * @returns -1 if lsn1 < lsn2, 0 if equal, 1 if lsn1 > lsn2
+   */
+  public compareLSN(lsn1: string, lsn2: string): number {
+    if (lsn1 === lsn2) return 0;
+    if (lsn1 === '0/0') return -1;
+    if (lsn2 === '0/0') return 1;
+    
+    // Parse LSNs (format: "X/Y")
+    const [major1, minor1] = lsn1.split('/').map(Number);
+    const [major2, minor2] = lsn2.split('/').map(Number);
+    
+    // Compare major parts
+    if (major1 !== major2) {
+      return major1 > major2 ? 1 : -1;
     }
+    
+    // Compare minor parts
+    return minor1 > minor2 ? 1 : -1;
   }
 
   /**
-   * Updates the replication state with the provided values
-   * @param updates Partial state updates to apply
+   * Check status of replication slot and create if needed
    */
-  public async updateState(updates: Partial<ReplicationState>): Promise<void> {
+  public async checkSlotStatus(c: MinimalContext): Promise<{ exists: boolean; lsn?: string; isAdvancing: boolean }> {
     try {
-      const currentState = await this.loadState();
-      const newState = {
-        ...currentState,
-        ...updates
-      };
-      
-      replicationLogger.debug('Updating state', {
-        event: 'replication.state.update',
-        changes: updates,
-        currentLSN: updates.confirmedLSN || currentState.confirmedLSN
-      });
-      
-      await this.state.storage.put(this.stateKey, newState);
+      const client = getDBClient(c);
+      await client.connect();
+      try {
+        // Get current WAL position
+        const walResult = await client.query('SELECT pg_current_wal_lsn();');
+        const currentWAL = walResult.rows[0].pg_current_wal_lsn;
+
+        // Get slot status
+        const slotResult = await client.query(`
+          SELECT confirmed_flush_lsn 
+          FROM pg_replication_slots 
+          WHERE slot_name = $1;
+        `, [this.config.slot]);
+
+        let exists = slotResult.rows.length > 0;
+        let slotLSN = exists ? slotResult.rows[0].confirmed_flush_lsn : undefined;
+        
+        // If slot doesn't exist, create it
+        if (!exists) {
+          // Create slot with wal2json plugin
+          await client.query(`
+            SELECT pg_create_logical_replication_slot(
+              $1,
+              'wal2json',
+              false
+            );
+          `, [this.config.slot]);
+
+          // Create publication if it doesn't exist
+          const pubResult = await client.query(`
+            SELECT pubname 
+            FROM pg_publication 
+            WHERE pubname = $1;
+          `, [this.config.publication]);
+
+          if (pubResult.rows.length === 0) {
+            const domainTables = getDomainTables().join(', ');
+            await client.query(`
+              CREATE PUBLICATION $1 FOR TABLE ${domainTables};
+            `, [this.config.publication]);
+          }
+
+          replicationLogger.info('Created replication slot and publication', {
+            event: 'replication.slot.create',
+            slot: this.config.slot,
+            publication: this.config.publication,
+            tables: getDomainTables()
+          });
+
+          // Get the new slot status after creation
+          const newSlotResult = await client.query(`
+            SELECT confirmed_flush_lsn 
+            FROM pg_replication_slots 
+            WHERE slot_name = $1;
+          `, [this.config.slot]);
+
+          exists = newSlotResult.rows.length > 0;
+          slotLSN = exists ? newSlotResult.rows[0].confirmed_flush_lsn : undefined;
+        }
+        
+        // Check if slot is advancing by looking for changes
+        const changesResult = await client.query(`
+          SELECT lsn 
+          FROM pg_logical_slot_peek_changes($1, $2, NULL, 'include-xids', '1', 'include-timestamp', 'true') 
+          LIMIT 1;
+        `, [this.config.slot, slotLSN || '0/0']);
+
+        const isAdvancing = changesResult.rows.length > 0;
+
+        replicationLogger.info('Replication slot status', {
+          event: 'replication.slot.status',
+          slot: this.config.slot,
+          exists,
+          slotLSN,
+          currentWAL,
+          isAdvancing
+        });
+
+        return { exists, lsn: slotLSN, isAdvancing };
+      } finally {
+        await client.end();
+      }
     } catch (err) {
-      replicationLogger.error('Failed to update state', {
-        event: 'replication.state.error',
-        error: err instanceof Error ? err.message : String(err)
-      });
+      replicationLogger.error('Failed to check replication slot:', err);
       throw err;
     }
   }
 
   /**
-   * Resets the replication state to default values
+   * Drop replication slot if it exists
    */
-  public async resetState(): Promise<void> {
+  public async dropSlot(c: MinimalContext): Promise<void> {
     try {
-      const defaultState: ReplicationState = {
-        confirmedLSN: '0/0'
-      };
-      
-      replicationLogger.warn('Resetting replication state to defaults');
-      await this.state.storage.put(this.stateKey, defaultState);
+      const client = getDBClient(c);
+      await client.connect();
+      try {
+        await client.query(`
+          SELECT pg_drop_replication_slot($1);
+        `, [this.config.slot]);
+
+        replicationLogger.info('Dropped replication slot', {
+          event: 'replication.slot.drop',
+          slot: this.config.slot
+        });
+      } finally {
+        await client.end();
+      }
     } catch (err) {
-      replicationLogger.error('Failed to reset replication state:', err);
+      replicationLogger.error('Failed to drop replication slot:', err);
       throw err;
     }
   }
-}
-
+} 

@@ -1,14 +1,21 @@
 import { Client } from '@neondatabase/serverless';
-import { TableChange, SrvMessageType, CltMessageType } from '@repo/sync-types';
-import { syncLogger } from '../middleware/logger';
-import { ChangeHistory } from '@repo/typeorm/server-entities';
 import { 
-  CltChanges,
-  SrvChangesReceived,
-  SrvChangesApplied
+  TableChange, 
+  SrvMessageType,
+  CltMessageType,
+  ServerReceivedMessage,
+  ServerAppliedMessage,
+  ClientChangesMessage,
+  ServerChangesMessage,
+  ServerMessage
 } from '@repo/sync-types';
-import type { MessageContext, MessageSender } from './message-handler';
+import { syncLogger } from '../middleware/logger';
 import { getDBClient } from '../lib/db';
+import type { MinimalContext } from '../types/hono';
+import type { WebSocketMessageHandler } from './websocket-handler';
+import type { StateManager } from './state-manager';
+
+const MODULE_NAME = 'client-changes';
 
 /**
  * Result of executing a client change
@@ -39,10 +46,11 @@ export class ClientChangeHandler {
     const { table, operation, data } = change;
     
     syncLogger.info('Processing client change', {
+      clientId: data.client_id,
       table,
       operation,
-      dataFields: Object.keys(data || {})
-    });
+      id: data.id
+    }, MODULE_NAME);
     
     try {
       // Execute the change
@@ -52,26 +60,32 @@ export class ClientChangeHandler {
       // Log execution result
       if (result.success) {
         syncLogger.info('Client change executed successfully', {
+          clientId: data.client_id,
           table,
           operation,
+          id: data.id,
           duration,
           affectedFields: result.data ? Object.keys(result.data) : []
-        });
+        }, MODULE_NAME);
       } else if (result.isConflict && result.error?.code === 'CRDT_CONFLICT') {
         syncLogger.info('CRDT conflict detected (normal behavior)', {
+          clientId: data.client_id,
           table,
           operation,
+          id: data.id,
           duration,
           conflictDetails: result.error.details
-        });
+        }, MODULE_NAME);
       } else {
         syncLogger.warn('Client change execution failed', {
+          clientId: data.client_id,
           table,
           operation,
+          id: data.id,
           duration,
           error: result.error,
           isConflict: result.isConflict
-        });
+        }, MODULE_NAME);
       }
 
       return result;
@@ -79,12 +93,14 @@ export class ClientChangeHandler {
       const duration = Date.now() - startTime;
       
       syncLogger.error('Unexpected error processing client change', {
+        clientId: data.client_id,
         table,
         operation,
+        id: data.id,
         duration,
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined
-      });
+      }, MODULE_NAME);
 
       // Write to changes_history for failed changes
       await this.recordFailedChange(change, error);
@@ -95,8 +111,9 @@ export class ClientChangeHandler {
           code: 'EXECUTION_FAILED',
           message: error instanceof Error ? error.message : 'Unknown error',
           details: {
-            table: change.table,
-            operation: change.operation
+            table,
+            operation,
+            id: data.id
           }
         }
       };
@@ -127,22 +144,28 @@ export class ClientChangeHandler {
 
       const duration = Date.now() - startTime;
       syncLogger.info('Failed change recorded to history', {
+        clientId: change.data.client_id,
         table: change.table,
         operation: change.operation,
+        id: change.data.id,
         duration,
         error: error instanceof Error ? error.message : String(error)
-      });
+      }, MODULE_NAME);
     } catch (recordError) {
       const duration = Date.now() - startTime;
       syncLogger.error('Failed to record failed change', {
-        error: recordError,
+        clientId: change.data.client_id,
+        table: change.table,
+        operation: change.operation,
+        id: change.data.id,
         duration,
+        error: recordError instanceof Error ? recordError.message : String(recordError),
         originalError: error,
         change: {
           table: change.table,
           operation: change.operation
         }
-      });
+      }, MODULE_NAME);
     }
   }
 
@@ -174,12 +197,12 @@ export class ClientChangeHandler {
 
       const duration = Date.now() - startTime;
       syncLogger.debug('SQL execution completed', {
+        clientId: data.client_id,
         table,
         operation,
-        duration,
-        success: result.success,
-        isConflict: result.isConflict
-      });
+        id: data.id,
+        result: result.success
+      }, MODULE_NAME);
 
       return result;
     } catch (error) {
@@ -188,11 +211,13 @@ export class ClientChangeHandler {
       // Check if this is a CRDT conflict (updatedAt changed)
       if (error instanceof Error && error.message.includes('concurrent update')) {
         syncLogger.info('CRDT conflict detected in SQL execution', {
+          clientId: data.client_id,
           table,
           operation,
+          id: data.id,
           duration,
           errorMessage: error.message
-        });
+        }, MODULE_NAME);
 
         return {
           success: false,
@@ -206,12 +231,14 @@ export class ClientChangeHandler {
       }
 
       syncLogger.error('SQL execution failed', {
+        clientId: data.client_id,
         table,
         operation,
+        id: data.id,
         duration,
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined
-      });
+      }, MODULE_NAME);
 
       return {
         success: false,
@@ -248,87 +275,28 @@ export class ClientChangeHandler {
   }
 
   private async executeUpdate(table: string, data: any): Promise<ExecutionResult> {
-    // First check if entity exists and get current updatedAt
-    const exists = await this.client.query(
-      `SELECT "updatedAt" FROM "${table}" WHERE "id" = $1`,
-      [data.id]
-    );
-
-    if (exists.rows.length === 0) {
-      return {
-        success: false,
-        error: {
-          code: 'ENTITY_NOT_FOUND',
-          message: 'Entity not found',
-          details: { table, id: data.id }
-        }
-      };
+    if (!('id' in data) || typeof data.id !== 'string') {
+      throw new Error('Missing or invalid id in update operation');
     }
 
-    syncLogger.info('CRDT update check', {
-      table,
-      id: data.id,
-      dbUpdatedAt: exists.rows[0].updatedAt,
-      clientData: {
-        updatedAt: data.updatedAt,
-        old_data: data.old_data
-      }
-    });
-
-    // Extract just the fields we want to update, excluding metadata fields
-    const { id, createdAt, updatedAt, metadata, ...updateData } = data;
+    // Extract metadata fields but preserve client_id in the data
+    const { metadata, id, ...updateData } = data;
     
     // Set client_id directly in the data for WAL
     updateData.client_id = data.client_id;
     
     const fields = Object.keys(updateData);
     const values = Object.values(updateData);
-    const setClause = fields.map((field, i) => `"${field}" = $${i + 1}`).join(', ');
-
-    // Add updatedAt condition to detect concurrent updates
+    const setClause = fields.map((f, i) => `"${f}" = $${i + 1}`).join(', ');
+    
     const query = `
       UPDATE "${table}"
-      SET 
-        ${setClause}${setClause ? ',' : ''} 
-        "updatedAt" = CURRENT_TIMESTAMP
-      WHERE "id" = $${values.length + 1}
-      AND (
-        "updatedAt" < $${values.length + 2}
-        OR "updatedAt" IS NULL
-      )
+      SET ${setClause}
+      WHERE id = $${values.length + 1}
       RETURNING *
     `;
 
-    const result = await this.client.query(query, [...values, id, data.updatedAt]);
-    
-    // If no rows updated, it might be a concurrent update
-    if (result.rowCount === 0) {
-      // Query current state to see what changed
-      const current = await this.client.query(
-        `SELECT "updatedAt" FROM "${table}" WHERE "id" = $1`,
-        [id]
-      );
-
-      return {
-        success: false,
-        isConflict: true,
-        error: {
-          code: 'CRDT_CONFLICT',
-          message: 'Concurrent update detected - database has newer changes',
-          details: { 
-            table, 
-            id,
-            expectedUpdatedAt: exists.rows[0].updatedAt,
-            actualUpdatedAt: current.rows[0]?.updatedAt,
-            clientData: {
-              updatedAt: data.updatedAt,
-              old_data: data.old_data
-            }
-          }
-        }
-      };
-    }
-
+    const result = await this.client.query(query, [...values, id]);
     return {
       success: true,
       data: result.rows[0]
@@ -336,26 +304,9 @@ export class ClientChangeHandler {
   }
 
   private async executeDelete(table: string, id: string): Promise<ExecutionResult> {
-    // First check if entity exists
-    const exists = await this.client.query(
-      `SELECT 1 FROM "${table}" WHERE "id" = $1`,
-      [id]
-    );
-
-    if (exists.rows.length === 0) {
-      return {
-        success: false,
-        error: {
-          code: 'ENTITY_NOT_FOUND',
-          message: 'Entity not found',
-          details: { table, id }
-        }
-      };
-    }
-
     const query = `
       DELETE FROM "${table}"
-      WHERE "id" = $1
+      WHERE id = $1
       RETURNING *
     `;
 
@@ -365,41 +316,90 @@ export class ClientChangeHandler {
       data: result.rows[0]
     };
   }
+
+  /**
+   * Send acknowledgment that we received client changes
+   */
+  async sendChangesReceived(
+    clientId: string,
+    changeIds: string[],
+    messageHandler: WebSocketMessageHandler
+  ): Promise<void> {
+    const message: ServerReceivedMessage = {
+      type: 'srv_changes_received',
+      messageId: `srv_${Date.now()}`,
+      timestamp: Date.now(),
+      clientId,
+      changeIds
+    };
+
+    try {
+      await messageHandler.send(message);
+      syncLogger.info('Sent changes received acknowledgment', {
+        clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+    } catch (err) {
+      syncLogger.error('Failed to send changes received acknowledgment', {
+        clientId,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
+      throw err;
+    }
+  }
+
+  /**
+   * Send acknowledgment that we applied client changes
+   */
+  async sendChangesApplied(
+    clientId: string,
+    changeIds: string[],
+    messageHandler: WebSocketMessageHandler,
+    success: boolean,
+    error?: Error
+  ): Promise<void> {
+    const message: ServerAppliedMessage = {
+      type: 'srv_changes_applied',
+      messageId: `srv_${Date.now()}`,
+      timestamp: Date.now(),
+      clientId,
+      appliedChanges: changeIds,
+      success,
+      error: error?.message
+    };
+
+    try {
+      await messageHandler.send(message);
+      syncLogger.info('Sent changes applied acknowledgment', {
+        clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+    } catch (err) {
+      syncLogger.error('Failed to send changes applied acknowledgment', {
+        clientId,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
+      throw err;
+    }
+  }
 }
 
 /**
- * Process changes from a client
+ * Process client changes
  */
 export async function processClientChanges(
-  message: { type: CltMessageType; clientId: string; changes: TableChange[] },
-  ctx: MessageContext,
-  sender: MessageSender
+  message: ClientChangesMessage,
+  context: MinimalContext,
+  messageHandler: WebSocketMessageHandler
 ): Promise<void> {
   syncLogger.info('Handling client changes', {
     clientId: message.clientId,
+    messageId: message.messageId,
     changeCount: message.changes.length
-  });
+  }, MODULE_NAME);
 
-  // Collect LSNs once
-  const changeLSNs: string[] = [];
-  for (const change of message.changes) {
-    changeLSNs.push(change.lsn);
-  }
-
-  // Send received acknowledgment
-  const receivedAck = {
-    type: 'srv_changes_received' as SrvMessageType,
-    messageId: `srv_${Date.now()}`,
-    timestamp: Date.now(),
-    clientId: message.clientId,
-    changeIds: changeLSNs
-  };
-
-  await sender.send(receivedAck);
-
-  // Process the changes
   try {
-    const dbClient = getDBClient(ctx.context);
+    const dbClient = getDBClient(context);
     const handler = new ClientChangeHandler(dbClient);
     
     // Process changes sequentially
@@ -410,33 +410,26 @@ export async function processClientChanges(
       }
     }
 
-    // Send applied acknowledgment
-    const appliedAck = {
-      type: 'srv_changes_applied' as SrvMessageType,
+    // Send success response
+    const response: ServerChangesMessage = {
+      type: 'srv_send_changes',
       messageId: `srv_${Date.now()}`,
       timestamp: Date.now(),
       clientId: message.clientId,
-      success: true,
-      appliedChanges: changeLSNs
+      changes: [],
+      lastLSN: '0/0'
     };
-
-    await sender.send(appliedAck);
+    await messageHandler.send(response);
   } catch (error) {
-    syncLogger.error('Error handling client changes:', error);
+    syncLogger.error('Error handling client changes:', error, MODULE_NAME);
     
-    const errorAck = {
-      type: 'srv_changes_applied' as SrvMessageType,
+    // Send error response
+    const errorResponse: ServerMessage = {
+      type: 'srv_error',
       messageId: `srv_${Date.now()}`,
       timestamp: Date.now(),
-      clientId: message.clientId,
-      success: false,
-      error: {
-        code: 'CHANGE_PROCESSING_ERROR',
-        message: error instanceof Error ? error.message : 'Unknown error'
-      },
-      appliedChanges: []
+      clientId: message.clientId
     };
-
-    await sender.send(errorAck);
+    await messageHandler.send(errorResponse);
   }
 } 

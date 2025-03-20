@@ -92,7 +92,7 @@ The data layer uses TypeORM's integration with class-validator to provide robust
 
 ### Validation in Entity Definitions
 
-Entity classes in `@repo/typeorm/src/entities` use class-validator decorators to define validation rules:
+Entity classes in `@repo/dataforge/src/entities` use class-validator decorators to define validation rules:
 
 ```typescript
 @Column({ type: "varchar" })
@@ -119,7 +119,7 @@ export class UserDataAccess extends ValidatingDataAccess<User> {
 The API layer can also explicitly validate entities:
 
 ```typescript
-import { validateEntityOrThrow } from '@repo/typeorm';
+import { validateEntityOrThrow } from '@repo/dataforge';
 
 export async function createUser(userData: Partial<User>): Promise<string> {
   // Validate user data using class-validator

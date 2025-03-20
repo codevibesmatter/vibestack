@@ -1,20 +1,25 @@
 import type { Client } from '@neondatabase/serverless';
-import type { Context } from 'hono';
 import type { Env } from '../types/env';
-import type { ReplicationConfig, ReplicationMetrics, ReplicationState } from './types';
-import { getSlotStatus } from './slot';
-import { processWALChanges } from './changes';
-import { ClientManager } from './client-manager';
+import type { ReplicationConfig } from './types';
 import { replicationLogger } from '../middleware/logger';
-import { StateManager } from './state-manager';
 import { getDBClient } from '../lib/db';
 import type { MinimalContext } from '../types/hono';
-import { handleNewChanges } from '../sync/server-changes';
-import { SyncStateManager } from '../sync/state-manager';
+import type { TableChange } from '@repo/sync-types';
+import { processWALChanges } from './changes';
+import { ClientManager } from './client-manager';
+import { StateManager } from './state-manager';
+import type { DurableObjectState } from '../types/cloudflare';
+
+interface WALData {
+  data: string;
+  lsn: string;
+  xid: string;
+}
 
 // Polling intervals
 const ACTIVE_POLL_INTERVAL = 1000; // 1 second
-const HIBERNATION_CHECK_INTERVAL = 60000; // 1 minute
+export const HIBERNATION_CHECK_INTERVAL = 60000; // 1 minute
+const CLIENT_CHECK_INTERVAL = 10000; // Check for active clients every 10 seconds
 
 /**
  * Compare two LSNs
@@ -34,13 +39,14 @@ function compareLSNs(lsn1: string, lsn2: string): boolean {
 
 export class PollingManager {
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
+  private clientCheckInterval: ReturnType<typeof setInterval> | null = null;
   public hasCompletedFirstPoll = false;
   private initialPollPromise: Promise<void> | null = null;
   private initialPollResolve: (() => void) | null = null;
 
   constructor(
-    private readonly stateManager: StateManager,
     private readonly clientManager: ClientManager,
+    private readonly stateManager: StateManager,
     private readonly config: ReplicationConfig,
     private readonly c: MinimalContext,
     private readonly state: DurableObjectState
@@ -67,38 +73,95 @@ export class PollingManager {
   public async startPolling(): Promise<void> {
     try {
       // Do initial poll to catch up on changes
-      const initialPeek = await this.pollForChanges();
+      await this.pollForChanges();
       
-      // Log initial peek results if we found any changes
-      if (initialPeek) {
-        replicationLogger.info('Initial WAL peek results:', {
-          event: 'replication.init.success',
-          ...initialPeek,
-          message: initialPeek.hasTableChanges 
-            ? 'Found table changes to process'
-            : 'No table changes to process, but LSN may advance'
-        });
-      } else {
-        const state = await this.stateManager.loadState();
-        replicationLogger.info('Initial WAL peek - no changes found', {
-          event: 'replication.init.success',
-          message: 'Replication slot is up to date',
-          currentLSN: state.confirmedLSN,
-          currentLSNHex: state.confirmedLSN.split('/').map(n => parseInt(n, 16).toString(16)).join('/')
-        });
-      }
-      
-      // Mark first poll complete and resolve promise - init is done once we've checked for changes
+      // Mark first poll complete and resolve promise
       this.hasCompletedFirstPoll = true;
       if (this.initialPollResolve) {
         this.initialPollResolve();
       }
 
-      // Check if we should start active polling
-      await this.checkPollingMode();
+      // Check for active clients after initial poll
+      const hasActiveClients = await this.clientManager.hasActiveClients();
+      
+      if (!hasActiveClients) {
+        replicationLogger.info('No active clients after initial poll, entering hibernation', {
+          event: 'replication.hibernation.enter',
+          reason: 'no_active_clients'
+        });
+        
+        // Stop polling and set hibernation check
+        this.stopPolling();
+        const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
+        await this.state.storage.setAlarm(nextCheck);
+        replicationLogger.info('Set hibernation wake-up alarm', {
+          event: 'replication.hibernation.alarm_set',
+          nextCheck: new Date(nextCheck).toISOString(),
+          intervalMs: HIBERNATION_CHECK_INTERVAL
+        });
+        return;
+      }
+
+      // Start active polling and client checking if we have clients
+      if (!this.pollingInterval) {
+        replicationLogger.info('Starting regular polling and client checks', {
+          event: 'replication.polling.start',
+          pollInterval: `${ACTIVE_POLL_INTERVAL}ms`,
+          clientCheckInterval: `${CLIENT_CHECK_INTERVAL}ms`
+        });
+        
+        // Start polling interval
+        this.pollingInterval = setInterval(() => this.checkClientsAndPoll(), ACTIVE_POLL_INTERVAL);
+        
+        // Start periodic client check interval
+        this.clientCheckInterval = setInterval(async () => {
+          const hasClients = await this.checkForActiveClients();
+          if (!hasClients) {
+            // Stop both intervals and enter hibernation
+            this.stopPolling();
+            const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
+            await this.state.storage.setAlarm(nextCheck);
+          }
+        }, CLIENT_CHECK_INTERVAL);
+      }
     } catch (err) {
       replicationLogger.error('Error starting polling:', err);
       throw err;
+    }
+  }
+
+  /**
+   * Check for active clients and handle hibernation if none found
+   */
+  private async checkForActiveClients(): Promise<boolean> {
+    const hasActiveClients = await this.clientManager.hasActiveClients();
+    
+    if (!hasActiveClients) {
+      replicationLogger.info('No active clients found during periodic check, entering hibernation', {
+        event: 'replication.hibernation.enter',
+        reason: 'periodic_check'
+      });
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Check for changes and notify active clients if needed
+   */
+  private async checkClientsAndPoll(): Promise<void> {
+    try {
+      // Poll for changes first - this is fast since it just checks LSN
+      const changes = await this.pollForChanges();
+      
+      // Process changes if any were found
+      if (changes && changes.length > 0) {
+        // Process and send changes to clients
+        await processWALChanges(changes, this.clientManager);
+      }
+    } catch (err) {
+      replicationLogger.error('Error in client check and poll:', err);
     }
   }
 
@@ -111,64 +174,26 @@ export class PollingManager {
       this.pollingInterval = null;
       replicationLogger.info('Active polling stopped');
     }
-  }
-
-  /**
-   * Check if we should be actively polling based on client state
-   */
-  private async checkPollingMode(): Promise<void> {
-    try {
-      const hasActiveClients = await this.clientManager.hasActiveClients();
-      
-      if (hasActiveClients) {
-        // Start active polling if not already running
-        if (!this.pollingInterval) {
-          replicationLogger.info('Starting regular polling', {
-            event: 'replication.polling.start',
-            interval: `${ACTIVE_POLL_INTERVAL}ms`
-          });
-          this.pollingInterval = setInterval(() => this.pollForChanges(), ACTIVE_POLL_INTERVAL);
-        }
-        // Clear any existing alarm since we're actively polling
-        await this.state.storage.deleteAlarm();
-      } else {
-        // No clients - stop active polling and set hibernation check alarm
-        this.stopPolling();
-        replicationLogger.info('No active clients, setting hibernation check', {
-          event: 'replication.hibernation.prepare',
-          nextCheck: `${HIBERNATION_CHECK_INTERVAL}ms`
-        });
-        await this.state.storage.setAlarm(Date.now() + HIBERNATION_CHECK_INTERVAL);
-        
-        replicationLogger.info('DO entering hibernation state', {
-          event: 'replication.hibernation.enter',
-          timestamp: new Date().toISOString()
-        });
-      }
-    } catch (err) {
-      replicationLogger.error('Error checking polling mode:', {
-        event: 'replication.polling.error',
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined
-      });
-      throw err;
+    
+    if (this.clientCheckInterval) {
+      clearInterval(this.clientCheckInterval);
+      this.clientCheckInterval = null;
+      replicationLogger.info('Client check interval stopped');
     }
   }
 
   /**
    * Poll for new changes
-   * @returns Peek results if any changes were found
    */
-  private async pollForChanges(): Promise<{ count: number, hasTableChanges: boolean, lsns: string[] } | undefined> {
+  private async pollForChanges(): Promise<WALData[] | null> {
     try {
-      const state = await this.stateManager.loadState();
-      
-      // Get WAL changes
       const client = getDBClient(this.c);
       await client.connect();
       try {
-        // Peek at changes without consuming
-        const peekResult = await client.query(`
+        // Get current LSN from state manager
+        const currentLSN = await this.stateManager.getLSN();
+
+        const result = await client.query(`
           SELECT data, lsn, xid 
           FROM pg_logical_slot_peek_changes(
             $1,
@@ -176,83 +201,45 @@ export class PollingManager {
             NULL,
             'include-xids', '1',
             'include-timestamp', 'true'
-          );
-        `, [this.config.slot]);
+          )
+          WHERE lsn > $2::pg_lsn
+          LIMIT 100;
+        `, [this.config.slot, currentLSN]);
+        
+        // Map changes to our format
+        const newChanges = result.rows.map(row => ({
+          data: row.data,
+          lsn: row.lsn,
+          xid: row.xid
+        }));
 
-        // Only proceed if we have changes
-        if (peekResult.rows.length > 0) {
-          // Check if we have actual table changes or just LSN advances
-          const hasTableChanges = peekResult.rows.some(row => {
-            try {
-              const data = JSON.parse(row.data);
-              return data.change && Array.isArray(data.change) && data.change.length > 0;
-            } catch {
-              return false;
-            }
+        // If we have changes, update LSN and return them
+        if (newChanges.length > 0) {
+          const lastLSN = newChanges[newChanges.length - 1].lsn;
+          await this.stateManager.setLSN(lastLSN);
+          
+          replicationLogger.info('Found new WAL changes', {
+            event: 'replication.changes.found',
+            changeCount: newChanges.length,
+            currentLSN: lastLSN,
+            previousLSN: currentLSN
           });
-
-          const peekResults = {
-            count: peekResult.rows.length,
-            hasTableChanges,
-            lsns: peekResult.rows.map(r => r.lsn)
-          };
-
-          // Log what we found
-          replicationLogger.debug('WAL data analysis:', {
-            event: 'replication.wal.peek',
-            ...peekResults
+          
+          return newChanges;
+        } else if (!this.hasCompletedFirstPoll) {
+          // Only log no changes during initial poll
+          replicationLogger.info('No new changes found during initial poll', {
+            event: 'replication.changes.none',
+            currentLSN
           });
-
-          if (hasTableChanges) {
-            // Process changes directly from peek results
-            const walData = peekResult.rows.map(row => ({
-              data: row.data,
-              lsn: row.lsn,
-              xid: row.xid
-            }));
-
-            await processWALChanges(this.c, walData, state, this.clientManager, this.stateManager);
-            replicationLogger.info('Successfully processed table changes', {
-              event: 'replication.changes.success',
-              count: walData.length,
-              firstLSN: walData[0].lsn,
-              lastLSN: walData[walData.length - 1].lsn,
-              tables: [...new Set(walData.map(w => {
-                try {
-                  const data = JSON.parse(w.data);
-                  return data.change?.[0]?.table;
-                } catch {
-                  return null;
-                }
-              }).filter(Boolean))]
-            });
-            
-            // Return peek results so polling flow continues
-            return peekResults;
-          }
-
-          // Just update the LSN without consuming changes
-          const lastLSN = peekResult.rows[peekResult.rows.length - 1].lsn;
-          if (compareLSNs(lastLSN, state.confirmedLSN)) {
-            await this.stateManager.updateState({ confirmedLSN: lastLSN });
-            replicationLogger.debug('LSN advanced without table changes', {
-              event: 'replication.lsn.advance',
-              from: state.confirmedLSN,
-              to: lastLSN
-            });
-          }
-
-          return peekResults;
         }
+        
+        return null;
       } finally {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Error polling for changes', {
-        event: 'replication.poll.error',
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined
-      });
+      replicationLogger.error('Error polling for changes:', err);
       throw err;
     }
   }
@@ -262,11 +249,30 @@ export class PollingManager {
    */
   public async handleAlarm(): Promise<void> {
     try {
-      await this.checkPollingMode();
+      replicationLogger.info('Handling hibernation wake-up alarm', {
+        event: 'replication.hibernation.wake',
+        timestamp: new Date().toISOString()
+      });
+
+      // Reset first poll state since we're waking up
+      this.hasCompletedFirstPoll = false;
+      this.initialPollPromise = new Promise((resolve) => {
+        this.initialPollResolve = resolve;
+      });
+
+      // Start polling again - this will check for clients and re-hibernate if none
+      await this.startPolling();
+      await this.waitForInitialPoll();
     } catch (err) {
       replicationLogger.error('Error handling alarm:', err);
       // Ensure next alarm is set even if this one failed
-      await this.state.storage.setAlarm(Date.now() + HIBERNATION_CHECK_INTERVAL);
+      const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
+      await this.state.storage.setAlarm(nextCheck);
+      replicationLogger.info('Reset hibernation alarm after error', {
+        event: 'replication.hibernation.alarm_reset',
+        nextCheck: new Date(nextCheck).toISOString(),
+        error: err instanceof Error ? err.message : String(err)
+      });
     }
   }
 } 

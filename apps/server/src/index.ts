@@ -1,7 +1,7 @@
-/// <reference types="@cloudflare/workers-types" />
+/// <reference path="../worker-configuration.d.ts" />
 
-// Import reflect-metadata first
-import "reflect-metadata";
+// Set up node polyfills first
+import 'reflect-metadata';
 
 // Import other dependencies
 import { Hono } from 'hono';
@@ -10,7 +10,7 @@ import api from './api';
 import { serverLogger } from './middleware/logger';
 import { createStructuredLogger } from './middleware/logger';
 import type { AppBindings } from './types/hono';
-import type { Env } from './types/env';
+import type { Env, ExecutionContext } from './types/env';
 import { SyncDO } from './sync/SyncDO';
 import { ReplicationDO } from './replication/ReplicationDO';
 
@@ -44,13 +44,13 @@ const worker = {
    * @returns Response to the request
    */
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    serverLogger.debug('Incoming request', {
-      method: request.method,
-      url: url.toString(),
-      pathname: url.pathname,
-      search: url.search
+    console.log('Environment check:', {
+      environment: env.ENVIRONMENT,
+      isDevelopment: env.ENVIRONMENT === 'development',
+      isProduction: env.ENVIRONMENT === 'production'
     });
+    
+    const url = new URL(request.url);
 
     /**
      * WebSocket handling for sync
@@ -72,16 +72,12 @@ const worker = {
       if (!clientId) {
         return new Response('Client ID is required', { status: 400 });
       }
-
-      serverLogger.info('Creating SyncDO instance for client', { clientId });
       
       // Create unique SyncDO instance for this client
-      // Each client gets its own Durable Object to manage its WebSocket connection
       const id = env.SYNC.idFromName(`client:${clientId}`);
       const obj = env.SYNC.get(id);
       
       // Forward the request to the Durable Object
-      // The DO will handle creating the WebSocket pair and returning the 101 response
       return obj.fetch(request);
     }
 

@@ -1,11 +1,7 @@
-import type { 
-  TableChange,
-  MessageFields,
-  SyncMessageType
-} from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
 import type { SyncStateManager } from './state-manager';
+import type { SrvMessageType } from '@repo/sync-types';
 
 /**
  * Extend WebSocket to include client data
@@ -14,6 +10,18 @@ declare global {
   interface WebSocket {
     clientData?: WebSocketClientData;
   }
+}
+
+/**
+ * Initial sync state tracking
+ */
+export interface InitialSyncState {
+  table: string;
+  lastChunk: number;
+  totalChunks: number;
+  completedTables: string[];
+  status: 'in_progress' | 'processing' | 'complete';
+  startLSN: string;  // LSN at start of sync process
 }
 
 /**
@@ -42,7 +50,7 @@ export interface WebSocketClientData {
  * Message sender interface
  */
 export interface MessageSender {
-  send(message: MessageFields & { type: SyncMessageType }): Promise<void>;
+  send(message: { type: SrvMessageType; [key: string]: any }): Promise<void>;
   isConnected(): boolean;
 }
 

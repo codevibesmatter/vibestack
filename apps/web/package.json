@@ -16,7 +16,7 @@
     "@preact/signals-react": "^3.0.1",
     "@repo/shared-types": "workspace:*",
     "@repo/sync-types": "workspace:*",
-    "@repo/typeorm": "workspace:*",
+    "@repo/dataforge": "workspace:*",
     "@tanstack/react-router": "^1.109.2",
     "@tanstack/react-table": "^8.20.6",
     "@tanstack/router-devtools": "^1.109.2",

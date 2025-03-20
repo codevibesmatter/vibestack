@@ -1,7 +1,7 @@
 {
-  "name": "@repo/typeorm",
+  "name": "@repo/typeorm-deprecated",
   "version": "0.1.0",
-  "description": "TypeORM integration for VibeStack with dual-database support",
+  "description": "DEPRECATED - Use @repo/dataforge instead",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -48,7 +48,8 @@
     "migration:upload-client": "# Upload client migrations. Optional: pass migration name to force update (e.g. 'pnpm run migration:upload-client UpdateLocalChangesSchema1742056623095')\nnode --loader ts-node/esm src/scripts/upload-client-migrations.ts",
     "deploy": "pnpm run migration:run:server && pnpm run migration:run:client && pnpm run migration:upload-client",
     "deploy:client": "pnpm run migration:run:client && pnpm run migration:upload-client",
-    "seed": "node --loader ts-node/esm src/scripts/seed.ts"
+    "seed": "node --loader ts-node/esm src/scripts/seed.ts",
+    "debug:changes": "node --loader ts-node/esm src/scripts/debug-changes.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.2.17",

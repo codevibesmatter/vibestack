@@ -1,64 +1,54 @@
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
-import type { CltMessageType, SrvMessageType, TableChange } from '@repo/sync-types';
+import type { 
+  SrvMessageType, 
+  CltMessageType, 
+  TableChange,
+  ServerMessage,
+  ServerChangesMessage,
+  ServerInitChangesMessage,
+  ServerStateChangeMessage,
+  ServerReceivedMessage,
+  ServerAppliedMessage,
+  ClientMessage,
+  ClientChangesMessage,
+  ClientHeartbeatMessage,
+  ClientReceivedMessage,
+  ClientAppliedMessage,
+  Message
+} from '@repo/sync-types';
+import inquirer from 'inquirer';
+import { serverDataSource } from '@repo/dataforge';
+import { 
+  Task, TaskStatus, TaskPriority,
+  Project, ProjectStatus,
+  User,
+  Comment,
+  SERVER_DOMAIN_TABLES
+} from '@repo/dataforge/server-entities';
+import type { EntityTarget } from 'typeorm';
+import { generateSingleChange, generateBulkChanges } from './changes/client-changes.js';
+import { createServerChange, createServerBulkChanges } from './changes/server-changes.js';
+import type { Config } from './types.js';
+import { DEFAULT_CONFIG } from './config.js';
+import fs from 'fs';
+import path from 'path';
 
-interface Config {
-  wsUrl: string;
-  connectTimeout: number;
-  syncWaitTime: number;
-  changeWaitTime: number;
-  chunkTimeout?: number;  // Make optional with default in DEFAULT_CONFIG
-}
-
-const DEFAULT_CONFIG: Config = {
-  wsUrl: 'ws://localhost:8787',
-  connectTimeout: 10000,
-  syncWaitTime: 1000,
-  changeWaitTime: 2000,
-  chunkTimeout: 30000  // 30 seconds timeout for chunks
+type EntityMap = {
+  users: typeof User;
+  projects: typeof Project;
+  tasks: typeof Task;
+  comments: typeof Comment;
 };
 
-interface ServerMessage {
-  type: SrvMessageType;
-  messageId: string;
-  timestamp: number;
-}
+const ENTITY_MAP = {
+  tasks: Task,
+  projects: Project,
+  users: User,
+  comments: Comment
+} as const;
 
-interface ClientMessage {
-  type: CltMessageType;
-  messageId: string;
-  timestamp: number;
-}
-
-interface SyncInitMessage extends ServerMessage {
-  type: 'srv_sync_init';
-  serverLSN: string;
-}
-
-interface ServerChangesMessage extends ServerMessage {
-  type: 'srv_changes';
-  changes: TableChange[];
-  lastLSN: string;
-  sequence?: {
-    chunk: number;
-    total: number;
-  };
-}
-
-interface ServerReceivedMessage extends ServerMessage {
-  type: 'srv_changes_received';
-  changeIds: string[];
-}
-
-interface ServerAppliedMessage extends ServerMessage {
-  type: 'srv_changes_applied';
-  success: boolean;
-  appliedChanges: string[];
-  error?: {
-    code: string;
-    message: string;
-  };
-}
+type TableName = typeof SERVER_DOMAIN_TABLES[number];
 
 interface PendingChunkSet {
   chunks: TableChange[][];
@@ -68,357 +58,172 @@ interface PendingChunkSet {
   totalSize: number;
 }
 
-class SyncTester {
-  private config: Config;
-  private clientId: string;
-  private lastLSN: string;
+export class SyncTester {
+  protected config: Config;
+  protected clientId: string;
   private connected: boolean;
-  private messageLog: (ServerMessage | ClientMessage)[];
+  private messageLog: Message[];
   private messageId: number;
-  private pendingChunks: Map<string, PendingChunkSet>;
   private ws: WebSocket | null;
+  private currentState: 'initial' | 'catchup' | 'live';
 
   constructor(config: Partial<Config> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.clientId = '123e4567-e89b-12d3-a456-426614174000';
-    this.lastLSN = '0/0';
+    this.clientId = uuidv4();
     this.connected = false;
     this.messageLog = [];
     this.messageId = 0;
-    this.pendingChunks = new Map();
     this.ws = null;
+    this.currentState = 'initial';
+  }
+
+  public async connect(): Promise<void> {
+    if (this.connected) {
+      throw new Error('Already connected');
+    }
     
-    // Add timestamp to all console logs
-    const originalLog = console.log;
-    console.log = (...args) => {
-      originalLog(`[${new Date().toISOString()}]`, ...args);
-    };
-  }
-
-  private nextMessageId(): string {
-    return `msg_${++this.messageId}`;
-  }
-
-  connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      console.log(`Connecting to ${this.config.wsUrl} with clientId ${this.clientId}`);
-      
-      const url = new URL('/api/sync', this.config.wsUrl);
-      url.searchParams.set('clientId', this.clientId);
-      
-      console.log('WebSocket URL:', url.toString());
-      this.ws = new WebSocket(url.toString());
+      this.ws = new WebSocket(this.config.wsUrl);
       
       this.ws.on('open', () => {
-        console.log('Connected to sync server');
         this.connected = true;
         resolve();
       });
 
       this.ws.on('message', (data: Buffer) => {
         try {
-          console.log('Raw message received:', data.toString());
-          const message = JSON.parse(data.toString());
-          console.log('Parsed message:', JSON.stringify(message, null, 2));
-          this.handleMessage(message as ServerMessage);
-        } catch (error) {
-          console.error('Error handling message:', error);
-          console.error('Raw message data:', data.toString());
+          const message = JSON.parse(data.toString()) as Message;
+          this.handleMessage(message);
+        } catch (err) {
+          console.error('Error parsing message:', err);
         }
       });
 
       this.ws.on('error', (error: Error) => {
-        console.error('WebSocket error:', error.message);
-        if ('cause' in error) {
-          console.error('Error cause:', (error as Error & { cause: unknown }).cause);
-        }
+        console.error('WebSocket error:', error);
         reject(error);
       });
 
-      this.ws.on('close', (code: number, reason: Buffer) => {
-        console.log('Disconnected from sync server', { code, reason: reason.toString() });
+      this.ws.on('close', () => {
         this.connected = false;
+        this.ws = null;
       });
 
       // Connection timeout
       setTimeout(() => {
         if (!this.connected) {
-          const error = new Error('Connection timeout');
-          console.error(error);
-          reject(error);
+          reject(new Error('Connection timeout'));
         }
       }, this.config.connectTimeout);
     });
   }
 
-  private handleMessage(message: ServerMessage): void {
-    console.log('Processing message:', JSON.stringify(message, null, 2));
-    this.messageLog.push(message);
-
-    switch (message.type) {
-      case 'srv_sync_init':
-        console.log('Handling sync init');
-        this.handleSyncInit(message as SyncInitMessage);
-        break;
-
-      case 'srv_changes':
-        console.log('Handling server changes');
-        this.handleServerChanges(message as ServerChangesMessage);
-        break;
-      
-      case 'srv_changes_received':
-        console.log('Server received our changes');
-        this.handleServerReceived(message as ServerReceivedMessage);
-        break;
-      
-      case 'srv_changes_applied':
-        console.log('Server applied our changes');
-        this.handleServerApplied(message as ServerAppliedMessage);
-        break;
-      
-      case 'srv_error':
-        console.log('Received error:', message);
-        break;
-        
-      case 'srv_heartbeat':
-        // Ignore heartbeat messages in logs
-        break;
-        
-      default:
-        console.log('Unknown message type:', message.type);
-    }
-  }
-
-  private handleSyncInit(message: SyncInitMessage): void {
-    console.log('Received sync init:', message);
-    if (message.serverLSN) {
-      this.lastLSN = message.serverLSN;
-      console.log('Updated lastLSN to:', this.lastLSN);
-    }
-  }
-
-  private handleServerChanges(message: ServerChangesMessage): void {
-    const changeCount = message.changes?.length || 0;
-    console.log('Received server changes:', {
-      count: changeCount,
-      chunk: message.sequence?.chunk,
-      total: message.sequence?.total,
-      lastLSN: message.lastLSN
-    });
-
-    // Handle chunked changes
-    if (message.sequence && message.sequence.total > 1) {
-      // Validate chunk number
-      if (message.sequence.chunk < 1 || message.sequence.chunk > message.sequence.total) {
-        console.error('Invalid chunk number:', message.sequence);
-        return;
-      }
-
-      const key = message.messageId.split('_')[1]; // Extract timestamp part
-      let chunkSet = this.pendingChunks.get(key);
-
-      // Initialize new chunk set if this is the first chunk
-      if (!chunkSet) {
-        const timer = setTimeout(() => {
-          console.error(`Chunk set ${key} timed out after ${this.config.chunkTimeout}ms`);
-          this.pendingChunks.delete(key);
-        }, this.config.chunkTimeout);
-
-        chunkSet = {
-          chunks: new Array(message.sequence.total),
-          timer,
-          startTime: Date.now(),
-          receivedCount: 0,
-          totalSize: 0
-        };
-        this.pendingChunks.set(key, chunkSet);
-      }
-
-      // Store the chunk
-      const index = message.sequence.chunk - 1;
-      if (chunkSet.chunks[index]) {
-        console.warn(`Duplicate chunk received for index ${index}`);
-        return;
-      }
-
-      chunkSet.chunks[index] = message.changes;
-      chunkSet.receivedCount++;
-      chunkSet.totalSize += changeCount;
-
-      console.log('Chunk processing metrics:', {
-        messageId: key,
-        receivedChunks: chunkSet.receivedCount,
-        totalChunks: message.sequence.total,
-        totalChanges: chunkSet.totalSize,
-        timeElapsed: Date.now() - chunkSet.startTime
-      });
-
-      // Check if we have all chunks
-      if (chunkSet.receivedCount === message.sequence.total) {
-        console.log('All chunks received, processing complete change set');
-        clearTimeout(chunkSet.timer);
-        
-        // Validate no missing chunks
-        const allChanges = chunkSet.chunks.flat();
-        if (allChanges.length !== chunkSet.totalSize) {
-          console.error('Chunk size mismatch:', {
-            expected: chunkSet.totalSize,
-            actual: allChanges.length
-          });
-          this.pendingChunks.delete(key);
-          return;
-        }
-
-        this.processChanges(allChanges, message.lastLSN);
-        this.pendingChunks.delete(key);
-        
-        console.log('Chunk processing complete:', {
-          messageId: key,
-          totalChanges: allChanges.length,
-          processingTime: Date.now() - chunkSet.startTime
-        });
-      } else {
-        console.log(`Waiting for more chunks (${chunkSet.receivedCount}/${message.sequence.total})`);
-      }
-    } else {
-      // Handle single chunk
-      this.processChanges(message.changes, message.lastLSN);
-    }
-  }
-
-  private processChanges(changes: TableChange[], lastLSN: string): void {
-    if (lastLSN) {
-      this.lastLSN = lastLSN;
-    }
-    
-    // First send received acknowledgment
-    const receivedAck: ClientMessage & { lastLSN: string } = {
-      type: 'clt_changes_received',
-      messageId: this.nextMessageId(),
-      timestamp: Date.now(),
-      lastLSN: this.lastLSN
-    };
-    
-    this.sendMessage(receivedAck);
-
-    // Then send applied acknowledgment
-    const appliedAck: ClientMessage & { lastLSN: string; appliedChanges: string[] } = {
-      type: 'clt_changes_applied',
-      messageId: this.nextMessageId(),
-      timestamp: Date.now(),
-      lastLSN: this.lastLSN,
-      appliedChanges: changes.map(c => c.lsn)
-    };
-    
-    this.sendMessage(appliedAck);
-  }
-
-  private handleServerReceived(message: ServerReceivedMessage): void {
-    console.log('Server received changes:', message.changeIds);
-  }
-
-  private handleServerApplied(message: ServerAppliedMessage): void {
-    console.log('Server applied changes:', message.appliedChanges);
-    if (!message.success) {
-      console.error('Failed to apply changes:', message.error);
-    }
-  }
-
-  private sendMessage(message: ClientMessage): void {
-    if (!this.connected || !this.ws) {
-      console.warn('Not connected - cannot send message');
-      return;
-    }
-    
-    const messageStr = JSON.stringify(message, null, 2);
-    console.log('Sending message:', messageStr);
-    this.ws.send(JSON.stringify(message));
-    // Log outgoing messages too
-    this.messageLog.push(message);
-  }
-
-  requestSync(): void {
-    const syncRequest: ClientMessage & { lastLSN: string } = {
-      type: 'clt_sync_request',
-      messageId: this.nextMessageId(),
-      timestamp: Date.now(),
-      lastLSN: this.lastLSN
-    };
-    
-    this.sendMessage(syncRequest);
-  }
-
-  disconnect(code = 1000, reason = 'Test completed'): Promise<void> {
-    return new Promise((resolve) => {
-      if (!this.ws) {
-        resolve();
-        return;
-      }
-
-      console.log('Disconnecting...', { code, reason });
-      
-      // Listen for close before initiating close
-      this.ws.once('close', (code: number, reason: Buffer) => {
-        console.log('WebSocket closed:', { code, reason: reason.toString() });
-        resolve();
-      });
-
-      // Use code 4000 for test failures, 1000 for normal closure
+  public async disconnect(code?: number, reason?: string): Promise<void> {
+    if (this.ws) {
       this.ws.close(code, reason);
+    }
+    this.connected = false;
+    this.ws = null;
+  }
+
+  public async sendMessage(message: Message): Promise<void> {
+    if (!this.connected || !this.ws) {
+      throw new Error('Not connected');
+    }
+    await new Promise<void>((resolve, reject) => {
+      this.ws!.send(JSON.stringify(message), (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
     });
   }
 
-  getMessageLog(): (ServerMessage | ClientMessage)[] {
-    return this.messageLog;
+  private handleMessage(message: Message): void {
+    // Only log the message and track basic state
+    this.messageLog.push(message);
+    if ('type' in message && message.type === 'srv_state_change') {
+      this.currentState = (message as ServerStateChangeMessage).state;
+    }
   }
-}
 
-async function runSyncTest(): Promise<void> {
-  // Get environment configuration
-  const config: Config = {
-    wsUrl: process.env.SYNC_WS_URL || DEFAULT_CONFIG.wsUrl,
-    connectTimeout: parseInt(process.env.SYNC_CONNECT_TIMEOUT || '') || DEFAULT_CONFIG.connectTimeout,
-    syncWaitTime: parseInt(process.env.SYNC_WAIT_TIME || '') || DEFAULT_CONFIG.syncWaitTime,
-    changeWaitTime: parseInt(process.env.SYNC_CHANGE_WAIT_TIME || '') || DEFAULT_CONFIG.changeWaitTime
-  };
-
-  console.log('Starting sync test with configuration:', config);
-  const tester = new SyncTester(config);
-  
-  try {
-    // Connect and wait for sync init
-    await tester.connect();
-    console.log('Connected successfully');
-    
-    // Wait a bit to ensure we receive the sync init message
-    await new Promise(resolve => setTimeout(resolve, config.syncWaitTime));
-    
-    // Request initial sync to receive chunked updates
-    console.log('Requesting initial sync');
-    tester.requestSync();
-    
-    // Wait for sync response and chunk processing
-    await new Promise(resolve => setTimeout(resolve, config.syncWaitTime * 2));
-    
-    // Disconnect
-    await tester.disconnect();
-    console.log('Test completed successfully');
-    
-    // Print message log
-    console.log('\nMessage Log:');
-    console.log(JSON.stringify(tester.getMessageLog(), null, 2));
-    
-  } catch (error) {
-    console.error('Test failed:', error);
-    await tester.disconnect(4000, 'Test failed');
-    process.exit(1);
+  // Helper methods for tests
+  public getMessagesByType<T extends Message>(type: string): T[] {
+    return this.messageLog.filter(msg => msg.type === type) as T[];
   }
-}
 
-// Run the test if this is the main module
-if (process.argv[1] === new URL(import.meta.url).pathname) {
-  runSyncTest().catch(error => {
-    console.error('Unhandled error:', error);
-    process.exit(1);
-  });
+  public getLastMessage<T extends Message>(type: string): T | undefined {
+    const messages = this.messageLog.filter((msg: Message) => msg.type === type);
+    return messages[messages.length - 1] as T | undefined;
+  }
+
+  public getCurrentState(): 'initial' | 'catchup' | 'live' {
+    return this.currentState;
+  }
+
+  public clearMessageLog(): void {
+    this.messageLog = [];
+  }
+
+  protected nextMessageId(): string {
+    return `clt_${Date.now()}_${this.messageId++}`;
+  }
+
+  /**
+   * Run the test scenario
+   */
+  public async runTest(): Promise<void> {
+    // Wait for initial sync to complete
+    await this.waitForState('live');
+    
+    // Run basic validation
+    await this.validateSync();
+    
+    // Disconnect cleanly
+    await this.disconnect(1000, 'Test complete');
+  }
+
+  /**
+   * Wait for a specific sync state
+   */
+  private async waitForState(targetState: 'initial' | 'catchup' | 'live', timeout = 30000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const checkState = () => {
+        if (this.currentState === targetState) {
+        resolve();
+        } else if (Date.now() - start > timeout) {
+          reject(new Error(`Timeout waiting for state ${targetState}`));
+        } else {
+          setTimeout(checkState, 100);
+        }
+      };
+      checkState();
+    });
+  }
+
+  /**
+   * Validate the sync process
+   */
+  private async validateSync(): Promise<void> {
+    // Basic validation that we received messages in order
+    const initStart = this.messageLog.find(m => m.type === 'srv_init_start');
+    const initComplete = this.messageLog.find(m => m.type === 'srv_init_complete');
+    const stateChange = this.messageLog.find(m => m.type === 'srv_state_change');
+
+    if (!initStart) throw new Error('Missing srv_init_start message');
+    if (!initComplete) throw new Error('Missing srv_init_complete message');
+    if (!stateChange) throw new Error('Missing srv_state_change message');
+
+    // Validate message order
+    const initStartIndex = this.messageLog.indexOf(initStart);
+    const initCompleteIndex = this.messageLog.indexOf(initComplete);
+    const stateChangeIndex = this.messageLog.indexOf(stateChange);
+
+    if (initStartIndex > initCompleteIndex) {
+      throw new Error('srv_init_start received after srv_init_complete');
+    }
+    if (initCompleteIndex > stateChangeIndex) {
+      throw new Error('srv_init_complete received after srv_state_change');
+    }
+  }
 } 

@@ -1,28 +1,29 @@
-import type { Env } from '../types/env';
+import type { Env, ExecutionContext } from '../types/env';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
-import type { ExecutionContext } from '@cloudflare/workers-types';
+import type { 
+  DurableObjectState, 
+  DurableObjectId,
+  DurableObjectStorage,
+  DurableObjectTransaction,
+  WebSocket 
+} from '../types/cloudflare';
 import type { ReplicationConfig, ReplicationMetrics } from './types';
-import { 
-  getSlotStatus, 
-  DEFAULT_REPLICATION_CONFIG,
-  peekSlotHistory
-} from './index';
-import { performHealthCheck, performInitialCleanup, verifyChanges } from './health-check';
+import { DEFAULT_REPLICATION_CONFIG } from './types';
 import { ClientManager } from './client-manager';
 import { replicationLogger } from '../middleware/logger';
-import { StateManager } from './state-manager';
-import { PollingManager } from './polling';
+import { PollingManager, HIBERNATION_CHECK_INTERVAL } from './polling';
 import { getDBClient } from '../lib/db';
-import { SERVER_DOMAIN_TABLES } from '@repo/typeorm/server-entities';
+import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 import { AppBindings, createMinimalContext, MinimalContext } from '../types/hono';
+import { StateManager } from './state-manager';
 
 export class ReplicationDO implements DurableObject {
   private durableObjectState: DurableObjectState;
   private env: Env;
-  private stateManager: StateManager;
   private clientManager: ClientManager;
   private pollingManager: PollingManager;
+  private stateManager: StateManager;
   private metrics: ReplicationMetrics;
   private config: ReplicationConfig = DEFAULT_REPLICATION_CONFIG;
   private static readonly LAST_ACTIVE_KEY = 'last_active_timestamp';
@@ -32,8 +33,8 @@ export class ReplicationDO implements DurableObject {
     this.env = env;
     
     // Initialize managers
-    this.stateManager = new StateManager(state);
     this.clientManager = new ClientManager(env);
+    this.stateManager = new StateManager(state, this.config);
     
     // Log wake-up - constructor is called when DO wakes from hibernation
     this.durableObjectState.blockConcurrencyWhile(async () => {
@@ -74,12 +75,15 @@ export class ReplicationDO implements DurableObject {
       props: undefined
     };
     
+    // Create initial context
+    const ctx = createMinimalContext(env, executionCtx);
+    
     this.pollingManager = new PollingManager(
-      this.stateManager,
       this.clientManager,
+      this.stateManager,
       this.config,
-      createMinimalContext(env, executionCtx),
-      state
+      ctx,
+      this.durableObjectState
     );
   }
 
@@ -122,33 +126,10 @@ export class ReplicationDO implements DurableObject {
       switch (endpoint) {
         case '/init':
           return this.handleInit();
-        case '/health':
-          return this.handleHealthCheck(request);
-        case '/cleanup':
-          return this.handleInitialCleanup(request);
-        case '/verify':
-          return this.handleVerifyChanges(request);
         case '/status':
           return this.handleStatus();
         case '/clients':
           return this.handleClients();
-        case '/clients/cleanup':
-          return this.handleClientsCleanup();
-        case '/peek': {
-          const fromLSN = url.searchParams.get('from_lsn') || '0/0';
-          const limit = parseInt(url.searchParams.get('limit') || '100', 10);
-          
-          try {
-            const history = await peekSlotHistory(ctx, this.config.slot, fromLSN, limit);
-            return Response.json(history);
-          } catch (error) {
-            replicationLogger.error('Peek history failed:', error);
-            return Response.json({
-              success: false,
-              error: error instanceof Error ? error.message : String(error)
-            }, { status: 500 });
-          }
-        }
       }
     }
 
@@ -159,13 +140,13 @@ export class ReplicationDO implements DurableObject {
   /**
    * Core initialization logic for the replication system
    */
-  private async initializeReplication(): Promise<{success: boolean, error?: string, slotStatus?: any}> {
+  private async initializeReplication(forceInit: boolean = false): Promise<{success: boolean, error?: string, slotStatus?: any}> {
     try {
-      // Check if we're already initialized
-      if (this.pollingManager?.hasCompletedFirstPoll) {
+      // Check if we're already initialized, unless forcing init
+      if (!forceInit && this.pollingManager?.hasCompletedFirstPoll) {
         replicationLogger.info('Replication system already initialized');
         const c = this.getContext();
-        const slotStatus = await getSlotStatus(c, this.config.slot);
+        const slotStatus = await this.stateManager.checkSlotStatus(c);
         return {
           success: true,
           slotStatus
@@ -177,13 +158,13 @@ export class ReplicationDO implements DurableObject {
       
       // Let the modules handle their own logging
       const c = this.getContext();
-      const slotStatus = await getSlotStatus(c, this.config.slot);
+      const slotStatus = await this.stateManager.checkSlotStatus(c);
       
       // Initialize polling manager if not already done
       if (!this.pollingManager) {
         this.pollingManager = new PollingManager(
-          this.stateManager,
           this.clientManager,
+          this.stateManager,
           this.config,
           c,
           this.durableObjectState
@@ -193,7 +174,8 @@ export class ReplicationDO implements DurableObject {
       // Start polling and wait for initial poll to complete
       await this.pollingManager.startPolling();
       await this.pollingManager.waitForInitialPoll();
-      
+
+      // Even if we entered hibernation, initialization was successful
       return {
         success: true,
         slotStatus
@@ -225,13 +207,9 @@ export class ReplicationDO implements DurableObject {
         });
       }
 
-      // Get final state
-      const state = await this.stateManager.loadState();
-      
       return new Response(JSON.stringify({
         success: true,
-        slotStatus: result.slotStatus,
-        state
+        slotStatus: result.slotStatus
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
@@ -255,15 +233,13 @@ export class ReplicationDO implements DurableObject {
   private async handleStatus(): Promise<Response> {
     try {
       const c = this.getContext();
-      const slotStatus = await getSlotStatus(c, this.config.slot);
+      const slotStatus = await this.stateManager.checkSlotStatus(c);
       
       return new Response(JSON.stringify({
-        slot: {
-          name: this.config.slot,
-          status: slotStatus
-        },
-        metrics: this.metrics
+        success: true,
+        slotStatus
       }), {
+        status: 200,
         headers: { 'Content-Type': 'application/json' }
       });
     } catch (error) {
@@ -283,66 +259,12 @@ export class ReplicationDO implements DurableObject {
    * Handle health check request
    */
   private async handleHealthCheck(request: Request): Promise<Response> {
-    try {
-      const result = await performHealthCheck(this.getContext());
-      return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Error performing health check:', { error: errorMessage });
-      return new Response(JSON.stringify({
-        success: false,
-        error: errorMessage
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-
-  /**
-   * Handle verify changes request
-   */
-  private async handleVerifyChanges(request: Request): Promise<Response> {
-    try {
-      const result = await verifyChanges(this.getContext());
-      return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Error verifying changes:', { error: errorMessage });
-      return new Response(JSON.stringify({
-        success: false,
-        error: errorMessage
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-
-  /**
-   * Handle initial cleanup request
-   */
-  private async handleInitialCleanup(request: Request): Promise<Response> {
-    try {
-      const result = await performInitialCleanup(this.getContext());
-      return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Error performing initial cleanup:', { error: errorMessage });
-      return new Response(JSON.stringify({
-        success: false,
-        error: errorMessage
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
+    return new Response(JSON.stringify({
+      success: true,
+      message: 'Health check functionality removed'
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 
   /**
@@ -374,40 +296,27 @@ export class ReplicationDO implements DurableObject {
   }
 
   /**
-   * Handle DO alarm - called when waking from hibernation
+   * Handle DO alarm - required for hibernation
    */
   async alarm(): Promise<void> {
     try {
-      // Log wake-up from alarm - this is a DO lifecycle event
-      const lastActive = await this.durableObjectState.storage.get<number>(ReplicationDO.LAST_ACTIVE_KEY);
-      const now = Date.now();
-      
-      if (lastActive) {
-        const hibernationDuration = now - lastActive;
-        replicationLogger.info('DO waking from hibernation', {
-          event: 'do.wake',
-          lastActiveAt: new Date(lastActive).toISOString(),
-          hibernationDuration,
-          hibernationDurationSeconds: (hibernationDuration / 1000).toFixed(1),
-          trigger: 'alarm'
-        });
-      }
-      
-      // Update last active timestamp
-      await this.durableObjectState.storage.put(ReplicationDO.LAST_ACTIVE_KEY, now);
-      
-      // Let the initialization process handle its own logging
-      const initResult = await this.initializeReplication();
-      
-      if (!initResult.success) {
-        replicationLogger.error('Failed to initialize DO after wake-up:', { error: initResult.error });
-      }
+      replicationLogger.info('Handling hibernation wake-up alarm', {
+        event: 'replication.hibernation.wake',
+        timestamp: new Date().toISOString(),
+        trigger: 'alarm'
+      });
+
+      // Force initialization on wake-up
+      await this.initializeReplication(true);
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      replicationLogger.error('Error in DO alarm handler', {
-        event: 'do.alarm.error',
-        error: error.message,
-        stack: error.stack
+      replicationLogger.error('Error handling alarm:', err);
+      // Ensure next alarm is set even if this one failed
+      const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
+      await this.durableObjectState.storage.setAlarm(nextCheck);
+      replicationLogger.info('Reset hibernation alarm after error', {
+        event: 'replication.hibernation.alarm_reset',
+        nextCheck: new Date(nextCheck).toISOString(),
+        error: err instanceof Error ? err.message : String(err)
       });
     }
   }
@@ -480,25 +389,6 @@ export class ReplicationDO implements DurableObject {
       return Response.json(clients);
     } catch (error) {
       replicationLogger.error('Error getting clients:', error);
-      return Response.json({
-        success: false,
-        error: error instanceof Error ? error.message : String(error)
-      }, { status: 500 });
-    }
-  }
-
-  /**
-   * Clean up all clients by marking them as inactive
-   */
-  private async handleClientsCleanup(): Promise<Response> {
-    try {
-      const result = await this.clientManager.cleanupClients();
-      return Response.json({
-        success: true,
-        ...result
-      });
-    } catch (error) {
-      replicationLogger.error('Error cleaning up clients:', error);
       return Response.json({
         success: false,
         error: error instanceof Error ? error.message : String(error)

@@ -2,7 +2,7 @@ import { atom } from 'jotai';
 import { useAtom } from 'jotai';
 import { atomWithReset } from 'jotai/utils';
 import { atomFamily } from 'jotai/utils';
-import { Project } from '@repo/typeorm/client-entities';
+import { Project } from '@repo/dataforge/client-entities';
 import { 
   getAllProjects, 
   createProject, 

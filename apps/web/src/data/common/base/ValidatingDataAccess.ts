@@ -1,4 +1,4 @@
-import { validateEntityOrThrow } from '@repo/typeorm';
+import { validateEntityOrThrow } from '@repo/dataforge';
 import { DataAccess, DataResult } from './DataAccess';
 
 /**

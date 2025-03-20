@@ -1,94 +1,74 @@
 # Replication System
 
-A modular, robust database replication system for tracking and propagating database changes to clients. The system uses PostgreSQL's logical replication capabilities combined with a clean, modular architecture for maximum maintainability and reliability.
+The replication system provides real-time database change notifications to keep all clients in sync with the latest data. Instead of clients having to poll the database directly, we use an efficient polling system that only retrieves changes newer than our last processed position, ensuring minimal database load while maintaining real-time updates.
 
-## Architecture Overview
+## What it Does
 
-The replication system is built with a modular architecture where each component has a single responsibility:
+- Watches for any changes in our PostgreSQL database (inserts, updates, deletes)
+- Captures these changes using PostgreSQL's Write-Ahead Log (WAL)
+- Transforms the changes into a format our clients can understand
+- Immediately notifies all connected clients about the changes
+
+## Why it's Useful
+
+- **Real-time Updates**: Clients get notified instantly when data changes
+- **Efficient Polling**: Only retrieves changes newer than our last position, minimizing database load
+- **Consistent**: All clients stay in sync with the latest database state
+- **Scalable**: Works with any number of connected clients
+
+## Architecture
+
+The system consists of several key components:
 
 ### Core Components
 
-- **ReplicationDO** (`ReplicationDO.ts`): A thin wrapper that orchestrates the interaction between modules
-- **State Manager** (`state-manager.ts`): Manages replication state persistence and recovery
-- **Client Manager** (`client-manager.ts`): Handles client registration and connection management
-- **Polling Manager** (`polling.ts`): Manages WAL polling and slot advancement
-- **Changes Processor** (`changes.ts`): Transforms WAL data into table changes
+- **Replication DO** (`ReplicationDO.ts`): Main Durable Object that coordinates the replication system
+- **State Manager** (`state-manager.ts`): Manages replication slot operations, LSN tracking, and state persistence
+- **Client Manager** (`client-manager.ts`): Manages client registry and notifications
+- **Polling Manager** (`polling.ts`): Manages the polling cycle for WAL changes
+- **Changes** (`changes.ts`): Handles WAL change validation, transformation, and processing
 
-### Supporting Modules
+### Flow
 
-- **Slot Management** (`slot.ts`): Handles replication slot operations and status
-- **Health Check** (`health-check.ts`): Provides verification and data consistency tools
-- **Types** (`types.ts`): Centralizes type definitions and interfaces
+1. The Replication DO initializes the state, client, and polling managers
+2. Clients register with the Client Manager through the client registry
+3. The Polling Manager checks for changes in the WAL:
+   - Uses `pg_logical_slot_peek_changes` with a WHERE clause to filter changes after the current LSN
+   - This ensures we only get changes newer than our last processed position
+   - The WHERE clause is more efficient than using the `upto_lsn` parameter
+   - If there are active clients, it polls regularly
+   - If no clients are connected, it enters hibernation
+4. When changes are found:
+   - Changes are validated and transformed into our universal TableChange format
+   - Active clients are notified via the client registry
+   - The LSN is updated to the most recent change's position
+   - Changes are logged for monitoring and debugging
 
-## Module Details
+### Hibernation
 
-### ReplicationDO
+The system supports hibernation to conserve resources:
+- When no clients are connected, polling stops
+- A hibernation alarm is set
+- When the alarm fires, the system checks for clients and restarts if needed
 
-The ReplicationDO serves as a thin coordination layer that:
-- Initializes and coordinates other modules
-- Handles high-level error management
-- Provides the HTTP API interface
-- Manages module lifecycle
+### Types and Configuration
 
-### State Manager
+- **Types** (`types.ts`): Contains shared type definitions
+- **Configuration**: Set via the ReplicationConfig interface
 
-Responsible for:
-- Loading and persisting replication state
-- Managing state transitions
-- Handling recovery scenarios
-- Maintaining replication metrics
+## Usage
 
-### Client Manager
+The system is built on Cloudflare Durable Objects to provide:
+- **Stateful Coordination**: The ReplicationDO maintains consistent state across all requests
+- **Automatic Hibernation**: Durable Objects automatically hibernate when inactive, conserving resources
+- **Global Distribution**: Changes can be distributed to clients across any Cloudflare edge location
+- **Consistent Processing**: All change processing happens in one place, preventing race conditions
 
-Handles:
-- Client registration and deregistration
-- Connection state tracking
-- Client notification routing
-- Connection cleanup
-
-### Polling Manager
-
-Manages:
-- WAL polling configuration
-- Slot advancement logic
-- Change detection
-- Polling frequency optimization
-
-### Changes Processor
-
-Processes:
-- WAL data transformation
-- Change record creation
-- Data consistency validation
-- Change history management
-
-## Health Check System
-
-The health check system provides comprehensive monitoring and verification:
-
-### Features
-
-- Regular health checks with configurable frequency
-- Initial data cleanup for pre-replication records
-- Change verification against current table state
-- Synthetic change creation for consistency
-
-### Verification Capabilities
-
-- Table record count validation
-- Change history completeness checks
-- Per-record operation history
-- Detailed discrepancy reporting
-
-### Metrics
-
-The system tracks detailed metrics including:
-- Tables checked
-- Records scanned
-- Missing changes detected
-- Synthetic changes created
-- Operation duration
-- Error counts
+The ReplicationDO acts as the central coordinator, ensuring that:
+- Only one instance processes changes at a time
+- State (like LSN tracking) remains consistent
+- Clients receive notifications reliably
+- Resources are used efficiently through automatic hibernation
 
 ## Configuration
 
@@ -104,19 +84,11 @@ interface ReplicationConfig {
 
 ## API Endpoints
 
-The system exposes several HTTP endpoints:
+The system exposes the following HTTP endpoints:
 
-### Core Operations
-- `GET /status`: Current replication status
-- `POST /check-changes`: Manual change check
-- `POST /client-connected`: Register new client
-- `POST /client-disconnected`: Remove client
-- `POST /client-ping`: Update client activity
-
-### Health & Verification
-- `POST /verify-changes`: Run change verification
-- `POST /run-initial-cleanup`: Perform initial cleanup
-- `POST /run-health-check`: Execute manual health check
+- `POST /init`: Initialize the replication system
+- `GET /status`: Get current replication status
+- `GET /clients`: Get list of active clients
 
 ## Error Handling
 
@@ -125,54 +97,6 @@ The system implements comprehensive error handling:
 - Error categorization
 - Metric tracking per error type
 - Recovery procedures
-
-## Monitoring
-
-### Available Metrics
-
-\`\`\`typescript
-interface ReplicationMetrics {
-  changes: {
-    processed: number;
-    failed: number;
-  };
-  errors: Map<string, {
-    count: number;
-    lastError: string;
-    timestamp: number;
-  }>;
-  notifications: {
-    totalNotificationsSent: number;
-  };
-}
-\`\`\`
-
-### Lag Monitoring
-
-\`\`\`typescript
-interface ReplicationLagStatus {
-  replayLag: number;  // Seconds behind
-  writeLag: number;   // Bytes behind in WAL
-  flushLag: number;   // Bytes not yet flushed
-}
-\`\`\`
-
-## Best Practices
-
-1. **Health Checks**
-   - Run regular health checks during low-traffic periods
-   - Monitor the `health_check_state` table
-   - Review synthetic changes periodically
-
-2. **Performance**
-   - Keep the `change_history` table properly indexed
-   - Monitor replication lag metrics
-   - Adjust polling frequency based on load
-
-3. **Maintenance**
-   - Regularly verify change consistency
-   - Monitor error metrics
-   - Keep client registry clean
 
 ## Development Guidelines
 
@@ -201,9 +125,9 @@ Common issues and their solutions:
    - Review polling configuration
 
 2. **Missing Changes**
-   - Run verification
-   - Check health check logs
-   - Review synthetic change creation
+   - Verify LSN tracking
+   - Check client connections
+   - Review polling logs
 
 3. **Client Issues**
    - Verify client registration

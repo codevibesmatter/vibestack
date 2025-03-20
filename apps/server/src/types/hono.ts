@@ -1,6 +1,5 @@
 import type { Context as HonoContext } from 'hono';
-import type { Env } from './env';
-import type { ExecutionContext } from '@cloudflare/workers-types';
+import type { Env, ExecutionContext } from './env';
 
 /**
  * Type for Hono bindings that includes our environment

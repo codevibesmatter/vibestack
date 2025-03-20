@@ -1,4 +1,15 @@
-import type { DurableObjectNamespace, KVNamespace } from '@cloudflare/workers-types';
+import type { DurableObjectNamespace, KVNamespace } from './cloudflare';
+
+/**
+ * Environment types for Cloudflare Workers
+ */
+
+// ExecutionContext for waitUntil operations
+export interface ExecutionContext {
+  waitUntil(promise: Promise<any>): void;
+  passThroughOnException(): void;
+  props: any;
+}
 
 export type DeploymentEnv = 'development' | 'staging' | 'production';
 export type LogLevel = 'error' | 'debug' | 'info' | 'warn';
@@ -13,14 +24,17 @@ export interface Env {
   // Deployment environment (set by Cloudflare Workers)
   ENVIRONMENT: DeploymentEnv;
 
-  // Environment variables
+  // Database connection info
   DATABASE_URL: string;
   API_URL: string;
-
+  NEON_API_KEY: string;
+  TYPEORM_LOGGING: boolean;
+  NODE_ENV: string;
+  
   // Durable Object bindings (from wrangler.toml)
-  SYNC: DurableObjectNamespace;
+  SYNC: DurableObjectNamespace; 
   REPLICATION: DurableObjectNamespace;
-
+  
   // KV namespace bindings (from wrangler.toml)
   CLIENT_REGISTRY: KVNamespace;
 

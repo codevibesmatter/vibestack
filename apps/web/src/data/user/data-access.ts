@@ -1,4 +1,4 @@
-import { User } from '@repo/typeorm/client-entities';
+import { User } from '@repo/dataforge/client-entities';
 import { ValidatingDataAccess } from '../common/base/ValidatingDataAccess';
 import { changesLogger } from '../../utils/logger';
 import { DataResult, executeWithTimeout } from '../common/base/DataAccess';

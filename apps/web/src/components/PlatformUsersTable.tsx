@@ -11,7 +11,7 @@ import {
   getPaginationRowModel,
   TableMeta
 } from '@tanstack/react-table';
-import { User } from '@repo/typeorm/client-entities';
+import { User } from '@repo/dataforge/client-entities';
 // Import from the new data layer structure
 import { PerformanceMetrics } from '../data/common/base/DataAccess';
 // Import from our Jotai store

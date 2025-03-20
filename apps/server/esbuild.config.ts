@@ -17,7 +17,6 @@ async function build() {
         '@repo/schema'
       ],
       define: {
-        'process.env.NODE_ENV': '"production"',
         'global': 'globalThis',
       },
       alias: {

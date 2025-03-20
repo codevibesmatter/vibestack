@@ -7,7 +7,7 @@ import {
   type SortingState,
   type ColumnDef
 } from '@tanstack/react-table'
-import type { ClientMigration } from '@repo/typeorm/server-entities'
+import type { ClientMigration } from '@repo/dataforge/server-entities'
 
 export type Migration = ClientMigration & { id: string }
 

@@ -1,5 +1,5 @@
 import { Client } from '@neondatabase/serverless';
-import { ClientMigration } from "@repo/typeorm/server-entities";
+import { ClientMigration } from "@repo/dataforge/server-entities";
 
 // Type definitions
 type ClientMigrationType = typeof ClientMigration;

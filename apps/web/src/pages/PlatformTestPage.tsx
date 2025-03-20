@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { User } from '@repo/typeorm/client-entities';
+import { User } from '@repo/dataforge/client-entities';
 import { ensureDB } from '../db/types';
 import { getDatabase } from '../db/core';
 import { PlatformUsersTable, PlatformUsersTableRef, UserRow } from '../components/PlatformUsersTable';

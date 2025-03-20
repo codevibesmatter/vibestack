@@ -1,32 +1,40 @@
-import type { Env } from '../types/env';
+import type { DurableObjectState } from '../types/cloudflare';
+import type { Context } from 'hono';
+import type { AppBindings } from '../types/hono';
+import type { TableChange } from '@repo/sync-types';
 // Import domain tables from the typeorm package
-import { SERVER_DOMAIN_TABLES } from '@repo/typeorm/server-entities';
+import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 
+/**
+ * Configuration for the replication system
+ */
 export interface ReplicationConfig {
   slot: string;
   publication: string;
   hibernationDelay: number;
 }
 
-export interface ReplicationState {
-  confirmedLSN: string;
-  hibernatedAt?: number;
-}
+export const DEFAULT_REPLICATION_CONFIG: ReplicationConfig = {
+  slot: 'vibestack',
+  publication: 'vibestack_pub',
+  hibernationDelay: 60000 // 1 minute
+};
 
+/**
+ * Metrics for monitoring replication performance
+ */
 export interface ReplicationMetrics {
   changes: {
     processed: number;
     failed: number;
   };
-  errors: Map<string, {
-    count: number;
-    lastError: string;
-    timestamp: number;
-  }>;
+  errors: Map<string, number>;
   notifications: {
     totalNotificationsSent: number;
   };
 }
+
+export type MinimalContext = Context<AppBindings>;
 
 export interface ReplicationLagStatus {
   replayLag: number;  // Seconds behind

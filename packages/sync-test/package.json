@@ -1,22 +1,37 @@
 {
   "name": "@repo/sync-test",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node dist/test-sync.js"
+    "clean": "rm -rf dist",
+    "prebuild": "pnpm clean",
+    "pretest": "pnpm build",
+    "test": "node dist/scenarios/initial-sync.js",
+    "test:initial": "node dist/scenarios/initial-sync.js",
+    "test:catchup": "node dist/scenarios/catchup-sync.js",
+    "test:changes": "node dist/scenarios/client-changes.js",
+    "test:all": "pnpm test:initial && pnpm test:catchup && pnpm test:changes",
+    "dev": "ts-node src/index.ts",
+    "watch": "tsc --watch"
   },
   "dependencies": {
+    "@faker-js/faker": "^8.4.1",
     "@repo/sync-types": "workspace:*",
+    "@repo/dataforge": "workspace:*",
+    "inquirer": "^9.2.14",
+    "typeorm": "^0.3.20",
     "ws": "^8.16.0",
     "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@repo/eslint-config": "workspace:*",
     "@repo/typescript-config": "workspace:*",
+    "@types/inquirer": "^9.0.7",
     "@types/ws": "^8.5.10",
     "@types/uuid": "^9.0.8",
+    "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   }
 } 
