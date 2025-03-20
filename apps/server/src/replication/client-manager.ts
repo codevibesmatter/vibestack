@@ -1,7 +1,9 @@
+import { replicationLogger } from '../middleware/logger';
 import type { Env } from '../types/env';
 import type { DurableObjectState } from '../types/cloudflare';
 import type { TableChange } from '@repo/sync-types';
-import { replicationLogger } from '../middleware/logger';
+
+const MODULE_NAME = 'client-manager';
 
 /**
  * Interface for notification results
@@ -15,13 +17,12 @@ export interface NotificationResult {
 }
 
 /**
- * Client state interface
+ * Client state persisted in KV storage
  */
 export interface ClientState {
-  id: string;
+  clientId: string;
   active: boolean;
-  lastSeen?: string;
-  lastLSN?: string;
+  lastSeen: number;
 }
 
 /**
@@ -29,67 +30,64 @@ export interface ClientState {
  */
 export class ClientManager {
   private env: Env;
-  private static readonly CLIENT_TIMEOUT = 30000; // 30 seconds timeout
+  private static readonly CLIENT_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
   constructor(env: Env) {
     this.env = env;
   }
 
   /**
-   * Get all clients and their states
+   * Get all clients from KV registry
    */
   public async getClients(): Promise<ClientState[]> {
     try {
-      replicationLogger.info('Fetching all clients from registry');
+      replicationLogger.info('Fetching all clients from registry', undefined, MODULE_NAME);
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
-      replicationLogger.info('Client keys found in registry', { count: keys.length, keys: keys.map(k => k.name) });
+      replicationLogger.info('Client keys found in registry', { count: keys.length, keys: keys.map((k: any) => k.name) }, MODULE_NAME);
       
       const clients: ClientState[] = [];
       
       for (const key of keys) {
-        replicationLogger.debug('Retrieving client data', { key: key.name });
+        replicationLogger.debug('Retrieving client data', { key: key.name }, MODULE_NAME);
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
         
         if (!value) {
-          replicationLogger.warn('Client key exists but no value found', { key: key.name });
+          replicationLogger.warn('Client key exists but no value found', { key: key.name }, MODULE_NAME);
           continue;
         }
-
+        
         try {
           const state = JSON.parse(value);
-          clients.push({
-            id: key.name.replace('client:', ''),
+          replicationLogger.debug('Client data retrieved', {
+            clientId: key.name.replace('client:', ''),
             active: state.active,
-            lastSeen: state.lastSeen,
-            lastLSN: state.lastLSN
-          });
+            lastSeen: state.lastSeen
+          }, MODULE_NAME);
           
-          replicationLogger.debug('Client data retrieved', { 
-            id: key.name.replace('client:', ''),
-            active: state.active,
-            lastSeen: state.lastSeen,
-            lastLSN: state.lastLSN
+          clients.push({
+            clientId: key.name.replace('client:', ''),
+            active: !!state.active,
+            lastSeen: state.lastSeen || 0
           });
-        } catch (parseErr) {
-          replicationLogger.error('Failed to parse client state', { 
-            key: key.name, 
-            value, 
-            error: parseErr instanceof Error ? parseErr.message : String(parseErr)
-          });
+        } catch (err) {
+          replicationLogger.error('Failed to parse client state', {
+            key: key.name,
+            value,
+            error: err instanceof Error ? err.message : String(err)
+          }, MODULE_NAME);
         }
       }
-
-      replicationLogger.info('Clients retrieved from registry', { 
+      
+      replicationLogger.info('Clients retrieved from registry', {
         totalFound: clients.length,
         activeCount: clients.filter(c => c.active).length
-      });
+      }, MODULE_NAME);
       
       return clients;
     } catch (error) {
       replicationLogger.error('Failed to get clients:', {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
-      });
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
       return [];
     }
   }
@@ -99,12 +97,12 @@ export class ClientManager {
    */
   public async hasActiveClients(): Promise<boolean> {
     try {
-      replicationLogger.info('Checking for active clients');
+      replicationLogger.info('Checking for active clients', undefined, MODULE_NAME);
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
-      replicationLogger.info('Client keys found in registry', { count: keys.length });
+      replicationLogger.info('Client keys found in registry', { count: keys.length }, MODULE_NAME);
       
       if (keys.length === 0) {
-        replicationLogger.warn('No client keys found in registry');
+        replicationLogger.warn('No client keys found in registry', undefined, MODULE_NAME);
         return false;
       }
       
@@ -113,11 +111,11 @@ export class ClientManager {
       
       // Check each client's state and clean up stale ones
       for (const key of keys) {
-        replicationLogger.debug('Checking client state', { key: key.name });
+        replicationLogger.debug('Checking client state', { key: key.name }, MODULE_NAME);
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
         
         if (!value) {
-          replicationLogger.warn('Client key exists but no value found', { key: key.name });
+          replicationLogger.warn('Client key exists but no value found', { key: key.name }, MODULE_NAME);
           // Clean up empty key
           await this.env.CLIENT_REGISTRY.delete(key.name);
           continue;
@@ -134,13 +132,13 @@ export class ClientManager {
             lastSeen,
             isStale,
             timeSinceLastSeen: now - lastSeen
-          });
+          }, MODULE_NAME);
           
           if (state.active && !isStale) {
             replicationLogger.info('Found active client', { 
               clientId: key.name.replace('client:', ''),
               lastSeen: state.lastSeen
-            });
+            }, MODULE_NAME);
             hasActive = true;
           } else if (isStale) {
             // Remove stale client
@@ -148,30 +146,26 @@ export class ClientManager {
               clientId: key.name.replace('client:', ''),
               lastSeen: state.lastSeen,
               timeSinceLastSeen: now - lastSeen
-            });
+            }, MODULE_NAME);
             await this.env.CLIENT_REGISTRY.delete(key.name);
           }
-        } catch (parseErr) {
-          replicationLogger.error('Failed to parse client state', { 
-            key: key.name, 
-            value, 
-            error: parseErr instanceof Error ? parseErr.message : String(parseErr) 
-          });
-          // Clean up invalid state
-          await this.env.CLIENT_REGISTRY.delete(key.name);
+        } catch (err) {
+          replicationLogger.error('Failed to parse client state', {
+            key: key.name,
+            error: err instanceof Error ? err.message : String(err)
+          }, MODULE_NAME);
         }
       }
-
+      
       if (!hasActive) {
-        replicationLogger.info('No active clients found after cleanup');
+        replicationLogger.info('No active clients found after cleanup', undefined, MODULE_NAME);
       }
       
       return hasActive;
     } catch (error) {
       replicationLogger.error('Failed to check for active clients:', {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
-      });
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
       return false;
     }
   }

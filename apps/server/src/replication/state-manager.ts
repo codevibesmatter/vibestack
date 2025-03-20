@@ -5,6 +5,8 @@ import { getDBClient } from '../lib/db';
 import type { ReplicationConfig } from './types';
 import { getDomainTables } from './types';
 
+const MODULE_NAME = 'state-manager';
+
 export class StateManager {
   private static readonly LSN_KEY = 'current_lsn';
 
@@ -54,7 +56,7 @@ export class StateManager {
   /**
    * Check status of replication slot and create if needed
    */
-  public async checkSlotStatus(c: MinimalContext): Promise<{ exists: boolean; lsn?: string; isAdvancing: boolean }> {
+  public async checkSlotStatus(c: MinimalContext): Promise<{ exists: boolean; lsn?: string }> {
     try {
       const client = getDBClient(c);
       await client.connect();
@@ -103,7 +105,7 @@ export class StateManager {
             slot: this.config.slot,
             publication: this.config.publication,
             tables: getDomainTables()
-          });
+          }, MODULE_NAME);
 
           // Get the new slot status after creation
           const newSlotResult = await client.query(`
@@ -115,31 +117,21 @@ export class StateManager {
           exists = newSlotResult.rows.length > 0;
           slotLSN = exists ? newSlotResult.rows[0].confirmed_flush_lsn : undefined;
         }
-        
-        // Check if slot is advancing by looking for changes
-        const changesResult = await client.query(`
-          SELECT lsn 
-          FROM pg_logical_slot_peek_changes($1, $2, NULL, 'include-xids', '1', 'include-timestamp', 'true') 
-          LIMIT 1;
-        `, [this.config.slot, slotLSN || '0/0']);
-
-        const isAdvancing = changesResult.rows.length > 0;
 
         replicationLogger.info('Replication slot status', {
           event: 'replication.slot.status',
           slot: this.config.slot,
           exists,
           slotLSN,
-          currentWAL,
-          isAdvancing
-        });
+          currentWAL
+        }, MODULE_NAME);
 
-        return { exists, lsn: slotLSN, isAdvancing };
+        return { exists, lsn: slotLSN };
       } finally {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Failed to check replication slot:', err);
+      replicationLogger.error('Failed to check replication slot:', err, MODULE_NAME);
       throw err;
     }
   }
@@ -159,12 +151,12 @@ export class StateManager {
         replicationLogger.info('Dropped replication slot', {
           event: 'replication.slot.drop',
           slot: this.config.slot
-        });
+        }, MODULE_NAME);
       } finally {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Failed to drop replication slot:', err);
+      replicationLogger.error('Failed to drop replication slot:', err, MODULE_NAME);
       throw err;
     }
   }

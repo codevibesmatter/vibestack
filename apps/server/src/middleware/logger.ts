@@ -60,20 +60,41 @@ export interface LoggerConfig {
 }
 
 // Default configuration based on environment
-const getDefaultConfig = (environment: DeploymentEnv = 'production'): LoggerConfig => {
-  // Set timestamp format to 'none' by default
-  const timestampFormat = 'none';
+const getDefaultConfig = (): LoggerConfig => {
+  // Detect environment from global context
+  let environment: DeploymentEnv = 'development';
+  if (typeof self !== 'undefined' && 'ENVIRONMENT' in self) {
+    const envValue = (self as any).ENVIRONMENT;
+    if (envValue === 'production' || envValue === 'staging' || envValue === 'development') {
+      environment = envValue;
+    }
+  }
+
+  // Get timestamp format from env or use 'full' for development, 'none' for production
+  let timestampFormat: LoggerConfig['timestampFormat'] = 'none';
+  if (typeof self !== 'undefined' && 'LOG_TIMESTAMP_FORMAT' in self) {
+    const envFormat = (self as any).LOG_TIMESTAMP_FORMAT;
+    if (envFormat === 'iso' || envFormat === 'full') {
+      timestampFormat = 'full';
+    } else if (['short', 'time', 'none'].includes(envFormat)) {
+      timestampFormat = envFormat as LoggerConfig['timestampFormat'];
+    }
+  } else if (environment === 'development') {
+    timestampFormat = 'full';
+  }
+  
   const isProduction = environment === 'production';
+  const isDevelopment = environment === 'development';
   
   return {
     level: isProduction ? 'info' : 'debug',
-    prettyPrint: !isProduction,
+    prettyPrint: isDevelopment || !isProduction,
     includeRequestBody: !isProduction,
     includeResponseBody: false,
     includeHeaders: !isProduction,
     excludePaths: ['/health', '/api/health'],
     excludeHeaders: ['authorization', 'cookie'],
-    useColors: !isProduction,
+    useColors: isDevelopment || !isProduction,
     jsonIndent: 2,
     timestampFormat
   };
@@ -131,7 +152,7 @@ const formatData = (data: any, config: LoggerConfig): string => {
       
       if (!config.useColors) return '\n' + formatted;
       
-      // Add colors to JSON keys and values
+      // Add colors to JSON keys and values with proper spacing and alignment
       return '\n' + formatted
         .replace(/^(\s*)(".*?"):/gm, `$1${colors.cyan}$2${colors.reset}:`) // Color keys
         .replace(/: (".*?")([,\n]|$)/g, `: ${colors.green}$1${colors.reset}$2`) // Color string values
@@ -139,7 +160,9 @@ const formatData = (data: any, config: LoggerConfig): string => {
         .replace(/: (\d+)([,\n]|$)/g, `: ${colors.magenta}$1${colors.reset}$2`); // Color number values
     }
     
-    return JSON.stringify(data);
+    // If not pretty printing, still make the data structure visible 
+    // by adding a newline and using compact JSON format
+    return '\n' + JSON.stringify(data);
   } catch (err) {
     return String(data);
   }
@@ -155,11 +178,11 @@ const getLevelColor = (level: string, config: LoggerConfig): string => {
   if (!config.useColors) return '';
   
   switch (level.toLowerCase()) {
-    case 'debug': return colors.gray;
-    case 'info': return colors.green;
-    case 'warn': return colors.yellow;
-    case 'error': return colors.red;
-    default: return '';
+    case 'debug': return colors.gray + colors.bright;
+    case 'info': return colors.green + colors.bright;
+    case 'warn': return colors.yellow + colors.bright;
+    case 'error': return colors.red + colors.bright;
+    default: return colors.white;
   }
 };
 
@@ -190,14 +213,14 @@ const getContextColor = (context: string | undefined, module: string | undefined
   
   // Assign consistent colors to different contexts
   const contextColors: Record<string, string> = {
-    'sync': colors.cyan,
-    'connection': colors.blue,
-    'replication': colors.magenta,
-    'api': colors.green,
-    'db': colors.yellow,
-    'auth': colors.red,
-    'storage': colors.blue,
-    'worker': colors.magenta
+    'sync': colors.cyan + colors.bright,
+    'connection': colors.blue + colors.bright,
+    'replication': colors.magenta + colors.bright,
+    'api': colors.green + colors.bright,
+    'db': colors.yellow + colors.bright,
+    'auth': colors.red + colors.bright,
+    'storage': colors.blue + colors.bright,
+    'worker': colors.magenta + colors.bright
   };
   
   return contextColors[context.toLowerCase()] || colors.white;
@@ -208,7 +231,7 @@ const getContextColor = (context: string | undefined, module: string | undefined
  */
 const getContextString = (context?: string, module?: string): string => {
   if (!context) return '';
-  return module ? `[${context}:${module}] ` : `[${context}] `;
+  return module ? `[${context}:${module}]  ` : `[${context}]  `;
 };
 
 // Helper function to format the timestamp part of the log message
@@ -225,8 +248,8 @@ const getTimestampPrefix = (timestamp: string, config: LoggerConfig): string => 
  * Base logger implementation
  */
 export const logger = {
-  debug(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
-    const config = getDefaultConfig(environment);
+  debug(message: string, data?: any, context?: string, module?: string): void {
+    const config = getDefaultConfig();
     if (!isLogLevelEnabled(config.level, 'debug')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
@@ -236,13 +259,13 @@ export const logger = {
     const emoji = getLevelEmoji('debug');
     
     console.debug(
-      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} DEBUG${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} DEBUG${colors.reset} ${contextColor}${contextStr}${colors.reset}  ${message}`,
       data ? formatData(data, config) : ''
     );
   },
 
-  info(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
-    const config = getDefaultConfig(environment);
+  info(message: string, data?: any, context?: string, module?: string): void {
+    const config = getDefaultConfig();
     if (!isLogLevelEnabled(config.level, 'info')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
@@ -252,13 +275,13 @@ export const logger = {
     const emoji = getLevelEmoji('info');
     
     console.info(
-      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} INFO${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} INFO${colors.reset} ${contextColor}${contextStr}${colors.reset}  ${message}`,
       data ? formatData(data, config) : ''
     );
   },
 
-  warn(message: string, data?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
-    const config = getDefaultConfig(environment);
+  warn(message: string, data?: any, context?: string, module?: string): void {
+    const config = getDefaultConfig();
     if (!isLogLevelEnabled(config.level, 'warn')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
@@ -268,13 +291,13 @@ export const logger = {
     const emoji = getLevelEmoji('warn');
     
     console.warn(
-      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} WARN${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} WARN${colors.reset} ${contextColor}${contextStr}${colors.reset}  ${message}`,
       data ? formatData(data, config) : ''
     );
   },
 
-  error(message: string, errorOrData?: any, additionalData?: any, context?: string, module?: string, environment?: DeploymentEnv): void {
-    const config = getDefaultConfig(environment);
+  error(message: string, errorOrData?: any, additionalData?: any, context?: string, module?: string): void {
+    const config = getDefaultConfig();
     if (!isLogLevelEnabled(config.level, 'error')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
@@ -295,7 +318,7 @@ export const logger = {
     }
     
     console.error(
-      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} ERROR${colors.reset} ${contextColor}${contextStr}${colors.reset}${message}`,
+      `${getTimestampPrefix(timestamp, config)}${levelColor}${emoji} ERROR${colors.reset} ${contextColor}${contextStr}${colors.reset}  ${message}`,
       errorObject,
       dataObject ? formatData(dataObject, config) : ''
     );
@@ -303,14 +326,14 @@ export const logger = {
 
   createLogger(context: string, defaultModule?: string) {
     return {
-      debug: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
-        this.debug(message, data, context, module || defaultModule, environment),
-      info: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
-        this.info(message, data, context, module || defaultModule, environment),
-      warn: (message: string, data?: any, module?: string, environment?: DeploymentEnv) => 
-        this.warn(message, data, context, module || defaultModule, environment),
-      error: (message: string, errorOrData?: any, additionalData?: any, module?: string, environment?: DeploymentEnv) => 
-        this.error(message, errorOrData, additionalData, context, module || defaultModule, environment)
+      debug: (message: string, data?: any, module?: string) => 
+        this.debug(message, data, context, module || defaultModule),
+      info: (message: string, data?: any, module?: string) => 
+        this.info(message, data, context, module || defaultModule),
+      warn: (message: string, data?: any, module?: string) => 
+        this.warn(message, data, context, module || defaultModule),
+      error: (message: string, errorOrData?: any, additionalData?: any, module?: string) => 
+        this.error(message, errorOrData, additionalData, context, module || defaultModule)
     };
   }
 };
@@ -332,7 +355,6 @@ export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
     const startTime = Date.now();
     const method = c.req.method;
     const url = new URL(c.req.url);
-    const environment = c.env.ENVIRONMENT;
 
     try {
       await next();
@@ -344,7 +366,7 @@ export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
         url: url.toString(),
         status: c.res.status,
         duration
-      }, undefined, environment);
+      }, 'server');
     } catch (error) {
       const endTime = Date.now();
       const duration = endTime - startTime;
@@ -353,7 +375,7 @@ export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
         method,
         url: url.toString(),
         duration
-      }, undefined, environment);
+      }, 'server');
 
       throw error;
     }

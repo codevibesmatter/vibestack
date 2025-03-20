@@ -9,17 +9,14 @@ import { processWALChanges } from './changes';
 import { ClientManager } from './client-manager';
 import { StateManager } from './state-manager';
 import type { DurableObjectState } from '../types/cloudflare';
+import type { WALData } from '../types/wal';
 
-interface WALData {
-  data: string;
-  lsn: string;
-  xid: string;
-}
+const MODULE_NAME = 'polling';
 
 // Polling intervals
-const ACTIVE_POLL_INTERVAL = 1000; // 1 second
-export const HIBERNATION_CHECK_INTERVAL = 60000; // 1 minute
-const CLIENT_CHECK_INTERVAL = 10000; // Check for active clients every 10 seconds
+export const ACTIVE_POLL_INTERVAL = 1000; // 1 second
+export const CLIENT_CHECK_INTERVAL = 5000; // 5 seconds
+export const HIBERNATION_CHECK_INTERVAL = 30000; // 30 seconds
 
 /**
  * Compare two LSNs
@@ -51,8 +48,8 @@ export class PollingManager {
     private readonly c: MinimalContext,
     private readonly state: DurableObjectState
   ) {
-    // Create a promise that will resolve when initial poll completes
-    this.initialPollPromise = new Promise((resolve) => {
+    // Initialize first poll promise
+    this.initialPollPromise = new Promise<void>((resolve) => {
       this.initialPollResolve = resolve;
     });
   }
@@ -61,10 +58,7 @@ export class PollingManager {
    * Wait for the initial polling cycle to complete
    */
   public async waitForInitialPoll(): Promise<void> {
-    if (this.hasCompletedFirstPoll) {
-      return;
-    }
-    await this.initialPollPromise;
+    return this.initialPollPromise as Promise<void>;
   }
 
   /**
@@ -88,7 +82,7 @@ export class PollingManager {
         replicationLogger.info('No active clients after initial poll, entering hibernation', {
           event: 'replication.hibernation.enter',
           reason: 'no_active_clients'
-        });
+        }, MODULE_NAME);
         
         // Stop polling and set hibernation check
         this.stopPolling();
@@ -98,7 +92,7 @@ export class PollingManager {
           event: 'replication.hibernation.alarm_set',
           nextCheck: new Date(nextCheck).toISOString(),
           intervalMs: HIBERNATION_CHECK_INTERVAL
-        });
+        }, MODULE_NAME);
         return;
       }
 
@@ -108,7 +102,7 @@ export class PollingManager {
           event: 'replication.polling.start',
           pollInterval: `${ACTIVE_POLL_INTERVAL}ms`,
           clientCheckInterval: `${CLIENT_CHECK_INTERVAL}ms`
-        });
+        }, MODULE_NAME);
         
         // Start polling interval
         this.pollingInterval = setInterval(() => this.checkClientsAndPoll(), ACTIVE_POLL_INTERVAL);
@@ -125,7 +119,7 @@ export class PollingManager {
         }, CLIENT_CHECK_INTERVAL);
       }
     } catch (err) {
-      replicationLogger.error('Error starting polling:', err);
+      replicationLogger.error('Error starting polling:', err, MODULE_NAME);
       throw err;
     }
   }
@@ -140,7 +134,7 @@ export class PollingManager {
       replicationLogger.info('No active clients found during periodic check, entering hibernation', {
         event: 'replication.hibernation.enter',
         reason: 'periodic_check'
-      });
+      }, MODULE_NAME);
       return false;
     }
     
@@ -161,7 +155,7 @@ export class PollingManager {
         await processWALChanges(changes, this.clientManager);
       }
     } catch (err) {
-      replicationLogger.error('Error in client check and poll:', err);
+      replicationLogger.error('Error in client check and poll:', err, MODULE_NAME);
     }
   }
 
@@ -172,13 +166,13 @@ export class PollingManager {
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
-      replicationLogger.info('Active polling stopped');
+      replicationLogger.info('Active polling stopped', MODULE_NAME);
     }
     
     if (this.clientCheckInterval) {
       clearInterval(this.clientCheckInterval);
       this.clientCheckInterval = null;
-      replicationLogger.info('Client check interval stopped');
+      replicationLogger.info('Client check interval stopped', MODULE_NAME);
     }
   }
 
@@ -223,7 +217,7 @@ export class PollingManager {
             changeCount: newChanges.length,
             currentLSN: lastLSN,
             previousLSN: currentLSN
-          });
+          }, MODULE_NAME);
           
           return newChanges;
         } else if (!this.hasCompletedFirstPoll) {
@@ -231,7 +225,7 @@ export class PollingManager {
           replicationLogger.info('No new changes found during initial poll', {
             event: 'replication.changes.none',
             currentLSN
-          });
+          }, MODULE_NAME);
         }
         
         return null;
@@ -239,7 +233,7 @@ export class PollingManager {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Error polling for changes:', err);
+      replicationLogger.error('Error polling for changes:', err, MODULE_NAME);
       throw err;
     }
   }
@@ -252,7 +246,7 @@ export class PollingManager {
       replicationLogger.info('Handling hibernation wake-up alarm', {
         event: 'replication.hibernation.wake',
         timestamp: new Date().toISOString()
-      });
+      }, MODULE_NAME);
 
       // Reset first poll state since we're waking up
       this.hasCompletedFirstPoll = false;
@@ -264,7 +258,7 @@ export class PollingManager {
       await this.startPolling();
       await this.waitForInitialPoll();
     } catch (err) {
-      replicationLogger.error('Error handling alarm:', err);
+      replicationLogger.error('Error handling alarm:', err, MODULE_NAME);
       // Ensure next alarm is set even if this one failed
       const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
       await this.state.storage.setAlarm(nextCheck);
@@ -272,7 +266,7 @@ export class PollingManager {
         event: 'replication.hibernation.alarm_reset',
         nextCheck: new Date(nextCheck).toISOString(),
         error: err instanceof Error ? err.message : String(err)
-      });
+      }, MODULE_NAME);
     }
   }
 } 

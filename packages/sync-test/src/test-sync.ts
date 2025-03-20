@@ -164,6 +164,10 @@ export class SyncTester {
     this.messageLog = [];
   }
 
+  public getMessageLog(): Message[] {
+    return this.messageLog;
+  }
+
   protected nextMessageId(): string {
     return `clt_${Date.now()}_${this.messageId++}`;
   }

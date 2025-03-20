@@ -6,6 +6,8 @@ import { replicationLogger } from '../middleware/logger';
 import type { MinimalContext } from '../types/hono';
 import type { WALData, PostgresWALMessage } from '../types/wal';
 
+const MODULE_NAME = 'changes';
+
 /**
  * Validates if a WAL change should be processed based on our filtering rules.
  */
@@ -85,7 +87,7 @@ export async function processWALChanges(
     tables: Array.from(new Set(tableChanges.map(c => c.table))),
     firstLSN: changes[0].lsn,
     lastLSN: changes[changes.length - 1].lsn
-  });
+  }, MODULE_NAME);
 
   // Send changes to clients
   await clientManager.handleChanges(tableChanges);
