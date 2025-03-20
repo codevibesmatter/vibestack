@@ -6,6 +6,8 @@ A modular, type-safe real-time sync system built with TypeScript and WebSocket t
 
 VibeStack is a sophisticated real-time synchronization system that enables seamless data synchronization between clients and servers. It's designed to be modular, type-safe, and highly performant, making it ideal for applications requiring real-time updates and state management.
 
+> **TODO:** Client-side alignment and simplification to align with server-side changes.
+
 ## Features
 
 - 🔄 Real-time bidirectional synchronization
@@ -13,6 +15,9 @@ VibeStack is a sophisticated real-time synchronization system that enables seaml
 - 🔒 Type-safe implementation with TypeScript
 - 🚀 Efficient WebSocket-based communication
 - 📊 Built-in support for chunked data transfer
+- 📝 WAL-only server-side change tracking (no separate change history table)
+- 🔁 Efficient LSN-based polling mechanism
+- 🛌 Intelligent hibernation for resource conservation
 - 🔍 Comprehensive testing suite
 - 🛠️ Monorepo structure using Turborepo and pnpm
 
@@ -23,13 +28,37 @@ vibestack/
 ├── apps/                    # Application implementations
 ├── packages/               # Shared packages
 │   ├── sync-test/         # Testing utilities for sync functionality
-│   ├── typeorm/           # Database integration layer
+│   ├── dataforge/         # Database integration layer
 │   ├── sync-types/        # Shared type definitions for sync
-│   ├── shared-types/      # Common type definitions
 │   ├── config/            # Configuration packages
 │   └── typescript-config/ # TypeScript configuration
 └── docs/                  # Project documentation
 ```
+
+## Technical Architecture
+
+### Sync System
+
+VibeStack uses a modern, efficient approach to database synchronization:
+
+#### Server-Side Change Tracking
+
+- **WAL-Only Approach**: Directly reads from PostgreSQL's Write-Ahead Log (WAL) without requiring a separate change history table
+- **LSN Tracking**: Efficiently tracks Log Sequence Numbers (LSN) to know exactly where to resume synchronization
+- **Stateful Management**: Uses Cloudflare Durable Objects to maintain consistent state across requests
+
+#### Replication System
+
+- **Efficient Polling**: Only retrieves changes newer than the last processed position
+- **Resource Conservation**: Automatically hibernates when no clients are connected
+- **Real-time Notifications**: Immediately pushes changes to connected clients
+
+#### Sync Flow
+
+The system supports three main sync flows:
+1. **Initial Sync**: For new clients with no previous state
+2. **Catchup Sync**: For clients that have fallen behind
+3. **Live Sync**: For real-time bidirectional changes
 
 ## Prerequisites
 
