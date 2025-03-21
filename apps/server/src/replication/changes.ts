@@ -82,11 +82,9 @@ export async function processWALChanges(
 
   // Log WAL processing at replication level
   replicationLogger.info('Processing WAL changes', {
-    event: 'replication.wal.process',
-    changeCount: tableChanges.length,
+    count: tableChanges.length,
     tables: Array.from(new Set(tableChanges.map(c => c.table))),
-    firstLSN: changes[0].lsn,
-    lastLSN: changes[changes.length - 1].lsn
+    lsnRange: `${changes[0].lsn} → ${changes[changes.length - 1].lsn}`
   }, MODULE_NAME);
 
   // Send changes to clients

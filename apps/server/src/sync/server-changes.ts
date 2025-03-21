@@ -16,6 +16,8 @@ const DEFAULT_CHUNK_SIZE = 100;
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
+const MODULE_NAME = 'server-changes';
+
 /**
  * Compare two LSNs
  * @returns -1 if lsn1 < lsn2, 0 if equal, 1 if lsn1 > lsn2
@@ -94,22 +96,22 @@ async function sendChanges(
       await messageHandler.send(message);
       success.push(true);
       
-      syncLogger.info('Sent changes chunk to client', {
+      syncLogger.info('Sent changes chunk', {
         clientId,
         chunk: i + 1,
         total: chunks,
-        changeCount: chunkChanges.length,
+        count: chunkChanges.length,
         lastLSN: message.lastLSN,
-        tables: [...new Set(chunkChanges.map(c => c.table))].join(',')
-      });
+        tables: [...new Set(chunkChanges.map(c => c.table))].length
+      }, MODULE_NAME);
     } catch (err) {
       success.push(false);
-      syncLogger.error('Failed to send changes chunk', {
+      syncLogger.error('Chunk send failed', {
         clientId,
         chunk: i + 1,
         total: chunks,
         error: err instanceof Error ? err.message : String(err)
-      });
+      }, MODULE_NAME);
     }
   }
 
@@ -148,13 +150,12 @@ async function getWALChunk(
     const items = hasMore ? result.rows.slice(0, chunkSize) : result.rows;
     const nextCursor = items.length > 0 ? items[items.length - 1].lsn : null;
 
-    syncLogger.debug('Retrieved WAL chunk', {
+    syncLogger.debug('WAL chunk retrieved', {
       startLSN,
-      chunkSize,
-      changeCount: items.length,
+      count: items.length,
       hasMore,
       nextCursor
-    });
+    }, MODULE_NAME);
 
     return {
       items,
@@ -162,11 +163,10 @@ async function getWALChunk(
       hasMore
     };
   } catch (err) {
-    syncLogger.error('Failed to get WAL chunk', {
+    syncLogger.error('WAL chunk error', {
       startLSN,
-      chunkSize,
       error: err instanceof Error ? err.message : String(err)
-    });
+    }, MODULE_NAME);
     throw err;
   }
 }
@@ -195,11 +195,11 @@ async function processWALInChunks(
     currentLSN = chunk.nextCursor!;
   }
 
-  syncLogger.info('Finished processing WAL in chunks', {
+  syncLogger.info('WAL chunks processed', {
     startLSN,
     endLSN: currentLSN,
-    totalProcessed
-  });
+    count: totalProcessed
+  }, MODULE_NAME);
 }
 
 /**
@@ -225,10 +225,10 @@ export async function performCatchupSync(
   startLSN: string,
   messageHandler: WebSocketMessageHandler
 ): Promise<void> {
-  syncLogger.info('Starting catchup sync', {
+  syncLogger.info('Catchup sync started', {
     clientId,
     startLSN
-  });
+  }, MODULE_NAME);
 
   await processWALInChunks(
     context,
@@ -251,10 +251,10 @@ export async function performCatchupSync(
   };
   await messageHandler.send(stateChangeMsg);
 
-  syncLogger.info('Completed catchup sync', {
+  syncLogger.info('Catchup sync completed', {
     clientId,
     startLSN
-  });
+  }, MODULE_NAME);
 }
 
 /**
@@ -271,25 +271,25 @@ export async function handleNewChanges(
     const success = await sendChanges(changes, lastLSN, clientId, messageHandler);
     
     if (success) {
-      syncLogger.info('Successfully sent changes to client', {
+      syncLogger.info('Changes sent successfully', {
         clientId,
-        changeCount: changes.length,
+        count: changes.length,
         lastLSN
-      });
+      }, MODULE_NAME);
     } else {
-      syncLogger.error('Failed to send some changes to client', {
+      syncLogger.error('Changes send failed', {
         clientId,
-        changeCount: changes.length,
+        count: changes.length,
         lastLSN
-      });
+      }, MODULE_NAME);
     }
     
     return success;
   } catch (err) {
-    syncLogger.error('Error handling new changes', {
+    syncLogger.error('Changes handling error', {
       clientId,
       error: err instanceof Error ? err.message : String(err)
-    });
+    }, MODULE_NAME);
     return false;
   }
 }
@@ -318,16 +318,16 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
     return aLevel - bLevel;
   });
 
-  syncLogger.info('Ordered changes by domain', {
-    changesByTable: ordered.reduce((acc, change) => {
-      acc[change.table] = (acc[change.table] || 0) + 1;
+  syncLogger.debug('Changes ordered', {
+    tableCount: Object.keys(ordered.reduce((acc, change) => {
+      acc[change.table] = true;
       return acc;
-    }, {} as Record<string, number>),
-    operationCounts: ordered.reduce((acc, change) => {
+    }, {} as Record<string, boolean>)).length,
+    operations: ordered.reduce((acc, change) => {
       acc[change.operation] = (acc[change.operation] || 0) + 1;
       return acc;
     }, {} as Record<string, number>)
-  });
+  }, MODULE_NAME);
 
   return ordered;
 } 

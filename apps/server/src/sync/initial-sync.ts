@@ -92,40 +92,22 @@ async function getTableChunk<T extends QueryResultRow>(
     LIMIT ${chunkSize + 1}
   `;
 
-  syncLogger.debug('Building database query', {
+  syncLogger.debug('Fetching table chunk', {
     table: cleanTableName(table),
-    query,
-    cursor,
-    chunkSize
+    chunkSize,
+    cursor: cursor ? 'present' : 'none' // Don't log the actual cursor value
   }, MODULE_NAME);
 
   // Create new client for this query
   const client = getDBClient(context);
-  syncLogger.debug('Created database client', {
-    table: cleanTableName(table)
-  }, MODULE_NAME);
   
   try {
-    syncLogger.debug('Connecting to database', {
-      table: cleanTableName(table)
-    }, MODULE_NAME);
-    
     await client.connect();
-    
-    syncLogger.debug('Connected to database, executing query', {
-      table: cleanTableName(table),
-      query: query.trim()
-    }, MODULE_NAME);
     
     const result = await client.query<T>(
       query,
       cursor ? [cursor] : []
     );
-
-    syncLogger.debug('Query executed successfully', {
-      table: cleanTableName(table),
-      rowCount: result.rows.length
-    }, MODULE_NAME);
 
     // Check if there are more records
     const hasMore = result.rows.length > chunkSize;
@@ -134,10 +116,10 @@ async function getTableChunk<T extends QueryResultRow>(
 
     syncLogger.debug('Retrieved table chunk', {
       table: cleanTableName(table),
-      chunkSize,
       itemCount: items.length,
       hasMore,
-      nextCursor
+      // Don't log nextCursor value to avoid cluttering logs
+      hasNextCursor: nextCursor !== null
     }, MODULE_NAME);
 
     return {
@@ -148,16 +130,10 @@ async function getTableChunk<T extends QueryResultRow>(
   } catch (error) {
     syncLogger.error('Error executing database query', {
       table: cleanTableName(table),
-      query,
-      cursor,
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
+      error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     throw error;
   } finally {
-    syncLogger.debug('Closing database connection', {
-      table: cleanTableName(table)
-    }, MODULE_NAME);
     await client.end();
   }
 }
@@ -171,9 +147,10 @@ async function processTableInChunks(
   processor: ChunkProcessor,
   options: ProcessTableOptions
 ): Promise<void> {
-  syncLogger.debug('Starting to process table in chunks', {
+  syncLogger.debug('Processing table in chunks', {
     table,
-    options
+    chunkSize: options.chunkSize,
+    startChunk: options.startChunk || 1
   }, MODULE_NAME);
 
   let cursor: string | null = null;
@@ -191,9 +168,9 @@ async function processTableInChunks(
     cursor = chunk.nextCursor;
   }
 
-  syncLogger.info('Finished processing table in chunks', {
+  syncLogger.info('Completed table processing', {
     table,
-    totalProcessed
+    totalRecords: totalProcessed
   }, MODULE_NAME);
 }
 
@@ -277,17 +254,92 @@ function waitForMessage(
       
       try {
         const rawData = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+        
+        let message;
+        try {
+          message = JSON.parse(rawData);
+        } catch (err) {
+          syncLogger.error('Failed to parse message JSON', {
+            clientId,
+            expectedType: type,
+            error: err instanceof Error ? err.message : String(err)
+          }, MODULE_NAME);
+          return; // Continue waiting for valid messages
+        }
+        
         syncLogger.debug('Received message in waitForMessage', { 
           clientId,
           expectedType: type,
-          rawData: rawData.substring(0, 100) + (rawData.length > 100 ? '...' : '')
+          actualType: message.type
         }, MODULE_NAME);
 
-        const message = JSON.parse(rawData);
-        
         // Check message type
         if (message.type === type) {
-          syncLogger.debug('Message matches expected type', { 
+          // Basic validation for all message types
+          if (!message.messageId || !message.timestamp || !message.clientId) {
+            syncLogger.error('Message missing required base fields', {
+              clientId,
+              type,
+              fields: { 
+                hasMessageId: !!message.messageId,
+                hasTimestamp: !!message.timestamp,
+                hasClientId: !!message.clientId 
+              }
+            }, MODULE_NAME);
+            return; // Continue waiting
+          }
+          
+          // Type-specific validation
+          let isValid = true;
+          
+          switch (type) {
+            case 'clt_init_received':
+              if (!message.table || typeof message.table !== 'string') {
+                syncLogger.error('Invalid clt_init_received message: missing table', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              if (message.chunk === undefined || typeof message.chunk !== 'number') {
+                syncLogger.error('Invalid clt_init_received message: missing chunk', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              break;
+              
+            case 'clt_init_processed':
+              // Only needs the base fields
+              break;
+              
+            case 'clt_changes_received':
+              if (!Array.isArray(message.changeIds)) {
+                syncLogger.error('Invalid clt_changes_received message: missing changeIds array', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              if (!message.lastLSN || typeof message.lastLSN !== 'string') {
+                syncLogger.error('Invalid clt_changes_received message: missing lastLSN', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              break;
+              
+            case 'clt_changes_applied':
+              if (!Array.isArray(message.changeIds)) {
+                syncLogger.error('Invalid clt_changes_applied message: missing changeIds array', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              if (!message.lastLSN || typeof message.lastLSN !== 'string') {
+                syncLogger.error('Invalid clt_changes_applied message: missing lastLSN', { clientId }, MODULE_NAME);
+                isValid = false;
+              }
+              break;
+              
+            default:
+              // For other message types, just proceed with basic validation
+              break;
+          }
+          
+          if (!isValid) {
+            return; // Continue waiting for a valid message
+          }
+          
+          syncLogger.debug('Message passes type validation', { 
             clientId,
             type,
             messageId: message.messageId
@@ -331,8 +383,7 @@ function waitForMessage(
             '[binary data]'
         }, MODULE_NAME);
         
-        // Don't reject here, keep waiting for the correct message
-        // Just log the error and continue
+        // Continue waiting for valid messages
       }
     };
     
@@ -447,10 +498,9 @@ export async function performInitialSync(
   }, MODULE_NAME);
   
   try {
-    // Log table hierarchy for debugging
-    syncLogger.info('Server table hierarchy for sync', { 
+    // Simplify table hierarchy log
+    syncLogger.debug('Sync tables', { 
       clientId,
-      tables: Object.keys(SERVER_TABLE_HIERARCHY),
       tableCount: Object.keys(SERVER_TABLE_HIERARCHY).length
     }, MODULE_NAME);
     
@@ -460,7 +510,11 @@ export async function performInitialSync(
     
     // Get server LSN to use for startup and comparison
     const startLSN = await stateManager.getServerLSN();
-    syncLogger.info('Starting initial sync with server LSN', { clientId, startLSN }, MODULE_NAME);
+    syncLogger.info('Initial sync with LSN', { 
+      clientId, 
+      startLSN, 
+      isResume: !!syncState 
+    }, MODULE_NAME);
     
     // Initialize sync if not resuming
     if (!syncState) {
@@ -484,7 +538,8 @@ export async function performInitialSync(
         totalChunks: 0,
         completedTables: [],
         status: 'in_progress',
-        startLSN
+        startLSN,
+        startTimeMs: Date.now() // Add timestamp when sync started
       };
       
       await stateManager.saveInitialSyncProgress(clientId, syncState);
@@ -547,28 +602,51 @@ export async function performInitialSync(
               }
             };
             
+            // Add a concise log before sending
+            syncLogger.info('Sending table chunk to client', {
+              clientId, 
+              table,
+              chunk: chunkNum,
+              total,
+              recordCount: changes.length
+            }, MODULE_NAME);
+
             await sendMessage(websocket, initChangesMsg);
             
             // Wait for client acknowledgment
-            await waitForMessage(
-              websocket, 
-              clientId,
-              'clt_init_received', 
-              (msg) => msg.table === table && msg.chunk === chunkNum
-            );
-            
-            // Update sync state after client confirms receipt
-            const updatedState: InitialSyncState = {
-              table,
-              lastChunk: chunkNum,
-              totalChunks: total,
-              status: 'in_progress',
-              startLSN: syncState?.startLSN || startLSN,
-              completedTables: syncState?.completedTables || []
-            };
-            
-            await stateManager.saveInitialSyncProgress(clientId, updatedState);
-            syncState = updatedState;
+            try {
+              await waitForMessage(
+                websocket, 
+                clientId,
+                'clt_init_received', 
+                (msg) => msg.table === table && msg.chunk === chunkNum
+              );
+              
+              // Update sync state after client confirms receipt
+              const updatedState: InitialSyncState = {
+                table,
+                lastChunk: chunkNum,
+                totalChunks: total,
+                status: 'in_progress',
+                startLSN: syncState?.startLSN || startLSN,
+                completedTables: syncState?.completedTables || [],
+                startTimeMs: syncState?.startTimeMs || Date.now()
+              };
+              
+              await stateManager.saveInitialSyncProgress(clientId, updatedState);
+              syncState = updatedState;
+            } catch (ackError) {
+              syncLogger.error('Failed to receive acknowledgment for chunk', {
+                clientId,
+                table,
+                chunk: chunkNum,
+                total,
+                error: ackError instanceof Error ? ackError.message : String(ackError)
+              }, MODULE_NAME);
+              
+              // Rethrow to abort processing this table
+              throw ackError;
+            }
           },
           { chunkSize: WS_CHUNK_SIZE, startChunk }
         );
@@ -593,7 +671,12 @@ export async function performInitialSync(
       await stateManager.saveInitialSyncProgress(clientId, updatedState);
       syncState = updatedState;
       
-      syncLogger.info('Completed table', { clientId, table }, MODULE_NAME);
+      syncLogger.info('Completed table', { 
+        clientId, 
+        table, 
+        completedCount: syncState.completedTables.length + 1,
+        totalTables: Object.keys(SERVER_TABLE_HIERARCHY).length  
+      }, MODULE_NAME);
     }
 
     // Wait for client to process all data
@@ -640,11 +723,10 @@ export async function performInitialSync(
     
     await sendMessage(websocket, stateChangeMsg);
     
-    syncLogger.info('Initial sync completed, transitioned to next state', { 
+    syncLogger.info('Sync complete, transitioned to state', { 
       clientId, 
-      nextState,
-      startLSN,
-      endLSN
+      state: nextState,
+      elapsedTimeMs: Date.now() - (syncState.startTimeMs || Date.now()) // Add fallback value
     }, MODULE_NAME);
   } catch (error) {
     syncLogger.error('Error during initial sync', {

@@ -45,7 +45,7 @@ export class ClientChangeHandler {
     const startTime = Date.now();
     const { table, operation, data } = change;
     
-    syncLogger.info('Processing client change', {
+    syncLogger.info('Processing change', {
       clientId: data.client_id,
       table,
       operation,
@@ -59,31 +59,30 @@ export class ClientChangeHandler {
 
       // Log execution result
       if (result.success) {
-        syncLogger.info('Client change executed successfully', {
+        syncLogger.info('Change applied', {
           clientId: data.client_id,
           table,
           operation,
           id: data.id,
           duration,
-          affectedFields: result.data ? Object.keys(result.data) : []
+          fieldCount: result.data ? Object.keys(result.data).length : 0
         }, MODULE_NAME);
       } else if (result.isConflict && result.error?.code === 'CRDT_CONFLICT') {
-        syncLogger.info('CRDT conflict detected (normal behavior)', {
+        syncLogger.info('CRDT conflict detected', {
           clientId: data.client_id,
           table,
           operation,
           id: data.id,
-          duration,
-          conflictDetails: result.error.details
+          duration
         }, MODULE_NAME);
       } else {
-        syncLogger.warn('Client change execution failed', {
+        syncLogger.warn('Change failed', {
           clientId: data.client_id,
           table,
           operation,
           id: data.id,
           duration,
-          error: result.error,
+          errorCode: result.error?.code,
           isConflict: result.isConflict
         }, MODULE_NAME);
       }
@@ -92,14 +91,13 @@ export class ClientChangeHandler {
     } catch (error) {
       const duration = Date.now() - startTime;
       
-      syncLogger.error('Unexpected error processing client change', {
+      syncLogger.error('Change processing error', {
         clientId: data.client_id,
         table,
         operation,
         id: data.id,
         duration,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
 
       // Write to changes_history for failed changes
@@ -143,28 +141,20 @@ export class ClientChangeHandler {
       ]);
 
       const duration = Date.now() - startTime;
-      syncLogger.info('Failed change recorded to history', {
+      syncLogger.debug('Recorded to history', {
         clientId: change.data.client_id,
         table: change.table,
-        operation: change.operation,
         id: change.data.id,
-        duration,
-        error: error instanceof Error ? error.message : String(error)
+        duration
       }, MODULE_NAME);
     } catch (recordError) {
       const duration = Date.now() - startTime;
-      syncLogger.error('Failed to record failed change', {
+      syncLogger.error('History record failed', {
         clientId: change.data.client_id,
         table: change.table,
-        operation: change.operation,
         id: change.data.id,
         duration,
-        error: recordError instanceof Error ? recordError.message : String(recordError),
-        originalError: error,
-        change: {
-          table: change.table,
-          operation: change.operation
-        }
+        error: recordError instanceof Error ? recordError.message : String(recordError)
       }, MODULE_NAME);
     }
   }
@@ -196,12 +186,13 @@ export class ClientChangeHandler {
       }
 
       const duration = Date.now() - startTime;
-      syncLogger.debug('SQL execution completed', {
+      syncLogger.debug('SQL executed', {
         clientId: data.client_id,
         table,
         operation,
         id: data.id,
-        result: result.success
+        success: result.success,
+        duration
       }, MODULE_NAME);
 
       return result;
@@ -210,13 +201,12 @@ export class ClientChangeHandler {
       
       // Check if this is a CRDT conflict (updatedAt changed)
       if (error instanceof Error && error.message.includes('concurrent update')) {
-        syncLogger.info('CRDT conflict detected in SQL execution', {
+        syncLogger.info('CRDT conflict', {
           clientId: data.client_id,
           table,
           operation,
           id: data.id,
-          duration,
-          errorMessage: error.message
+          duration
         }, MODULE_NAME);
 
         return {
@@ -230,14 +220,13 @@ export class ClientChangeHandler {
         };
       }
 
-      syncLogger.error('SQL execution failed', {
+      syncLogger.error('SQL error', {
         clientId: data.client_id,
         table,
         operation,
         id: data.id,
         duration,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
 
       return {
@@ -335,12 +324,12 @@ export class ClientChangeHandler {
 
     try {
       await messageHandler.send(message);
-      syncLogger.info('Sent changes received acknowledgment', {
+      syncLogger.debug('Ack sent: changes received', {
         clientId,
-        messageId: message.messageId
+        count: changeIds.length
       }, MODULE_NAME);
     } catch (err) {
-      syncLogger.error('Failed to send changes received acknowledgment', {
+      syncLogger.error('Ack failed: changes received', {
         clientId,
         error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
@@ -370,12 +359,13 @@ export class ClientChangeHandler {
 
     try {
       await messageHandler.send(message);
-      syncLogger.info('Sent changes applied acknowledgment', {
+      syncLogger.debug('Ack sent: changes applied', {
         clientId,
-        messageId: message.messageId
+        count: changeIds.length,
+        success
       }, MODULE_NAME);
     } catch (err) {
-      syncLogger.error('Failed to send changes applied acknowledgment', {
+      syncLogger.error('Ack failed: changes applied', {
         clientId,
         error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
@@ -392,10 +382,9 @@ export async function processClientChanges(
   context: MinimalContext,
   messageHandler: WebSocketMessageHandler
 ): Promise<void> {
-  syncLogger.info('Handling client changes', {
+  syncLogger.info('Processing batch changes', {
     clientId: message.clientId,
-    messageId: message.messageId,
-    changeCount: message.changes.length
+    count: message.changes.length
   }, MODULE_NAME);
 
   try {
@@ -421,7 +410,10 @@ export async function processClientChanges(
     };
     await messageHandler.send(response);
   } catch (error) {
-    syncLogger.error('Error handling client changes:', error, MODULE_NAME);
+    syncLogger.error('Batch processing failed', {
+      clientId: message.clientId,
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
     
     // Send error response
     const errorResponse: ServerMessage = {

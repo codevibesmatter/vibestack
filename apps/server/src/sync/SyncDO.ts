@@ -36,7 +36,7 @@ export class SyncDO implements DurableObject {
     this.env = env;
     this.syncId = state.id.toString();
     
-    syncLogger.info('📥 SyncDO lifecycle: Constructor called', {
+    syncLogger.debug('SyncDO initialized', {
       syncId: this.syncId
     }, MODULE_NAME);
     
@@ -65,7 +65,7 @@ export class SyncDO implements DurableObject {
         throw new Error(`Failed to start replication: ${response.statusText}`);
       }
     } catch (err) {
-      syncLogger.error('❌ SyncDO lifecycle: Replication init failed', {
+      syncLogger.error('Replication init failed', {
         syncId: this.syncId,
         error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
@@ -95,14 +95,16 @@ export class SyncDO implements DurableObject {
    * Handle inbound request (HTTP or WebSocket)
    */
   async fetch(request: Request): Promise<Response> {
-    syncLogger.info('📥 SyncDO lifecycle: Fetch called', {
-      syncId: this.syncId,
-      isWebSocket: request.headers.get('Upgrade') === 'websocket'
-    }, MODULE_NAME);
-
     const url = new URL(request.url);
     const clientId = url.searchParams.get('clientId');
     const lsn = url.searchParams.get('lsn');
+    
+    syncLogger.debug('Fetch request', {
+      syncId: this.syncId,
+      isWebSocket: request.headers.get('Upgrade') === 'websocket',
+      clientId: clientId || 'missing',
+      hasLSN: !!lsn
+    }, MODULE_NAME);
 
     if (!clientId) {
       syncLogger.error('Client ID missing in request', undefined, MODULE_NAME);
@@ -121,16 +123,17 @@ export class SyncDO implements DurableObject {
       return new Response('Invalid LSN format', { status: 400 });
     }
 
-    syncLogger.info('Received request', { 
+    syncLogger.info('Request parameters', { 
       clientId, 
-      lsn, 
-      method: request.method, 
-      url: request.url 
+      lsnFormat: lsn === '0/0' ? 'zero' : 'standard'
     }, MODULE_NAME);
 
     // Check if it's a WebSocket connection upgrade
     if (request.headers.get('Upgrade') === 'websocket') {
-      syncLogger.info('Handling WebSocket connection', { clientId }, MODULE_NAME);
+      syncLogger.info('WebSocket connection', { 
+        clientId,
+        status: 'accepting'
+      }, MODULE_NAME);
       
       try {
         // Create WebSocket pair
@@ -145,8 +148,8 @@ export class SyncDO implements DurableObject {
         // Store the WebSocket for later use
         this.webSocket = serverSocket;
         
-        syncLogger.info('WebSocket connection accepted', { 
-          clientId, 
+        syncLogger.debug('WebSocket ready', { 
+          clientId,
           readyState: serverSocket.readyState 
         }, MODULE_NAME);
 
@@ -157,13 +160,12 @@ export class SyncDO implements DurableObject {
               ? JSON.parse(event.data) 
               : JSON.parse(new TextDecoder().decode(event.data));
             
-            syncLogger.debug('Received WebSocket message', {
+            syncLogger.debug('WS message', {
               clientId,
-              type: data.type,
-              messageId: data.messageId
+              type: data.type
             }, MODULE_NAME);
           } catch (error) {
-            syncLogger.error('Error parsing WebSocket message', {
+            syncLogger.error('WS message parse error', {
               clientId,
               error: error instanceof Error ? error.message : String(error)
             }, MODULE_NAME);
@@ -174,19 +176,18 @@ export class SyncDO implements DurableObject {
         serverSocket.addEventListener('close', (event: { code: number, reason: string }) => {
           syncLogger.info('WebSocket closed', { 
             clientId,
-            code: event.code,
-            reason: event.reason
+            code: event.code
           }, MODULE_NAME);
           
           // Mark client as inactive
           this.state.waitUntil(
             (async () => {
               try {
-                syncLogger.info('Cleaning up connection after WebSocket close', { clientId }, MODULE_NAME);
+                syncLogger.debug('Connection cleanup started', { clientId }, MODULE_NAME);
                 await this.stateManager.cleanupConnection();
-                syncLogger.info('Connection cleanup completed', { clientId }, MODULE_NAME);
+                syncLogger.debug('Connection cleanup completed', { clientId }, MODULE_NAME);
               } catch (error) {
-                syncLogger.error('Error during connection cleanup', {
+                syncLogger.error('Connection cleanup failed', {
                   clientId,
                   error: error instanceof Error ? error.message : String(error)
                 }, MODULE_NAME);
@@ -209,9 +210,9 @@ export class SyncDO implements DurableObject {
         const context = this.getContext();
 
         // Since the URL already contains clientId and LSN, initiate sync directly
-        syncLogger.info('Starting sync process directly from WebSocket upgrade', { 
-          clientId, 
-          lsn 
+        syncLogger.info('Initiating sync', { 
+          clientId,
+          lsn: lsn === '0/0' ? '0/0' : 'specified'
         }, MODULE_NAME);
         
         // Immediately register client and start sync process in background
@@ -232,13 +233,11 @@ export class SyncDO implements DurableObject {
                 clientId
               );
               
-              syncLogger.info('Initial sync completed successfully', { clientId }, MODULE_NAME);
+              syncLogger.info('Sync completed', { clientId }, MODULE_NAME);
             } catch (error) {
-              syncLogger.error('❌ Sync process failed', {
-                syncId: this.syncId,
+              syncLogger.error('Sync failed', {
                 clientId,
-                error: error instanceof Error ? error.message : String(error),
-                stack: error instanceof Error ? error.stack : undefined
+                error: error instanceof Error ? error.message : String(error)
               }, MODULE_NAME);
               
               // Try to close the connection with an error code if something went wrong
@@ -261,7 +260,7 @@ export class SyncDO implements DurableObject {
           webSocket: clientSocket
         });
       } catch (err) {
-        syncLogger.error('❌ SyncDO lifecycle: WebSocket setup failed', {
+        syncLogger.error('WebSocket setup failed', {
           syncId: this.syncId,
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_NAME);

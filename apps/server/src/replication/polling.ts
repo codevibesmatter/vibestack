@@ -79,8 +79,7 @@ export class PollingManager {
       const hasActiveClients = await this.clientManager.hasActiveClients();
       
       if (!hasActiveClients) {
-        replicationLogger.info('No active clients after initial poll, entering hibernation', {
-          event: 'replication.hibernation.enter',
+        replicationLogger.info('Entering hibernation', {
           reason: 'no_active_clients'
         }, MODULE_NAME);
         
@@ -88,8 +87,7 @@ export class PollingManager {
         this.stopPolling();
         const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
         await this.state.storage.setAlarm(nextCheck);
-        replicationLogger.info('Set hibernation wake-up alarm', {
-          event: 'replication.hibernation.alarm_set',
+        replicationLogger.debug('Set hibernation alarm', {
           nextCheck: new Date(nextCheck).toISOString(),
           intervalMs: HIBERNATION_CHECK_INTERVAL
         }, MODULE_NAME);
@@ -98,10 +96,9 @@ export class PollingManager {
 
       // Start active polling and client checking if we have clients
       if (!this.pollingInterval) {
-        replicationLogger.debug('Starting regular polling and client checks', {
-          event: 'replication.polling.start',
-          pollInterval: `${ACTIVE_POLL_INTERVAL}ms`,
-          clientCheckInterval: `${CLIENT_CHECK_INTERVAL}ms`
+        replicationLogger.debug('Starting polling cycles', {
+          pollInterval: ACTIVE_POLL_INTERVAL,
+          clientCheckInterval: CLIENT_CHECK_INTERVAL
         }, MODULE_NAME);
         
         // Start polling interval
@@ -119,7 +116,9 @@ export class PollingManager {
         }, CLIENT_CHECK_INTERVAL);
       }
     } catch (err) {
-      replicationLogger.error('Error starting polling:', err, MODULE_NAME);
+      replicationLogger.error('Start polling error', {
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
       throw err;
     }
   }
@@ -131,8 +130,7 @@ export class PollingManager {
     const hasActiveClients = await this.clientManager.hasActiveClients();
     
     if (!hasActiveClients) {
-      replicationLogger.info('No active clients found during periodic check, entering hibernation', {
-        event: 'replication.hibernation.enter',
+      replicationLogger.info('Entering hibernation', {
         reason: 'periodic_check'
       }, MODULE_NAME);
       return false;
@@ -155,7 +153,9 @@ export class PollingManager {
         await processWALChanges(changes, this.clientManager);
       }
     } catch (err) {
-      replicationLogger.error('Error in client check and poll:', err, MODULE_NAME);
+      replicationLogger.error('Poll cycle error', {
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
     }
   }
 
@@ -166,13 +166,13 @@ export class PollingManager {
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
-      replicationLogger.info('Active polling stopped', MODULE_NAME);
+      replicationLogger.debug('Polling stopped', {}, MODULE_NAME);
     }
     
     if (this.clientCheckInterval) {
       clearInterval(this.clientCheckInterval);
       this.clientCheckInterval = null;
-      replicationLogger.info('Client check interval stopped', MODULE_NAME);
+      replicationLogger.debug('Client checks stopped', {}, MODULE_NAME);
     }
   }
 
@@ -212,9 +212,8 @@ export class PollingManager {
           const lastLSN = newChanges[newChanges.length - 1].lsn;
           await this.stateManager.setLSN(lastLSN);
           
-          replicationLogger.info('Found new WAL changes', {
-            event: 'replication.changes.found',
-            changeCount: newChanges.length,
+          replicationLogger.info('WAL changes found', {
+            count: newChanges.length,
             currentLSN: lastLSN,
             previousLSN: currentLSN
           }, MODULE_NAME);
@@ -222,8 +221,7 @@ export class PollingManager {
           return newChanges;
         } else if (!this.hasCompletedFirstPoll) {
           // Only log no changes during initial poll
-          replicationLogger.info('No new changes found during initial poll', {
-            event: 'replication.changes.none',
+          replicationLogger.debug('No changes in initial poll', {
             currentLSN
           }, MODULE_NAME);
         }
@@ -233,7 +231,9 @@ export class PollingManager {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Error polling for changes:', err, MODULE_NAME);
+      replicationLogger.error('Polling error', {
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
       throw err;
     }
   }
@@ -243,10 +243,7 @@ export class PollingManager {
    */
   public async handleAlarm(): Promise<void> {
     try {
-      replicationLogger.info('Handling hibernation wake-up alarm', {
-        event: 'replication.hibernation.wake',
-        timestamp: new Date().toISOString()
-      }, MODULE_NAME);
+      replicationLogger.info('Handling hibernation alarm', {}, MODULE_NAME);
 
       // Reset first poll state since we're waking up
       this.hasCompletedFirstPoll = false;
@@ -258,14 +255,14 @@ export class PollingManager {
       await this.startPolling();
       await this.waitForInitialPoll();
     } catch (err) {
-      replicationLogger.error('Error handling alarm:', err, MODULE_NAME);
+      replicationLogger.error('Alarm handling error', {
+        error: err instanceof Error ? err.message : String(err) 
+      }, MODULE_NAME);
       // Ensure next alarm is set even if this one failed
       const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
       await this.state.storage.setAlarm(nextCheck);
-      replicationLogger.info('Reset hibernation alarm after error', {
-        event: 'replication.hibernation.alarm_reset',
-        nextCheck: new Date(nextCheck).toISOString(),
-        error: err instanceof Error ? err.message : String(err)
+      replicationLogger.debug('Reset alarm after error', {
+        nextCheck: new Date(nextCheck).toISOString()
       }, MODULE_NAME);
     }
   }

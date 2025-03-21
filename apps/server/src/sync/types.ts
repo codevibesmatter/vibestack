@@ -22,6 +22,7 @@ export interface InitialSyncState {
   completedTables: string[];
   status: 'in_progress' | 'processing' | 'complete';
   startLSN: string;  // LSN at start of sync process
+  startTimeMs?: number; // Timestamp when sync started
 }
 
 /**

@@ -100,11 +100,10 @@ export class StateManager {
             `, [this.config.publication]);
           }
 
-          replicationLogger.info('Created replication slot and publication', {
-            event: 'replication.slot.create',
+          replicationLogger.info('Created replication resources', {
             slot: this.config.slot,
             publication: this.config.publication,
-            tables: getDomainTables()
+            tableCount: getDomainTables().length
           }, MODULE_NAME);
 
           // Get the new slot status after creation
@@ -118,8 +117,7 @@ export class StateManager {
           slotLSN = exists ? newSlotResult.rows[0].confirmed_flush_lsn : undefined;
         }
 
-        replicationLogger.info('Replication slot status', {
-          event: 'replication.slot.status',
+        replicationLogger.info('Slot status checked', {
           slot: this.config.slot,
           exists,
           slotLSN,
@@ -131,7 +129,10 @@ export class StateManager {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Failed to check replication slot:', err, MODULE_NAME);
+      replicationLogger.error('Slot check failed', {
+        error: err instanceof Error ? err.message : String(err),
+        slot: this.config.slot
+      }, MODULE_NAME);
       throw err;
     }
   }
@@ -148,15 +149,17 @@ export class StateManager {
           SELECT pg_drop_replication_slot($1);
         `, [this.config.slot]);
 
-        replicationLogger.info('Dropped replication slot', {
-          event: 'replication.slot.drop',
+        replicationLogger.info('Slot dropped', {
           slot: this.config.slot
         }, MODULE_NAME);
       } finally {
         await client.end();
       }
     } catch (err) {
-      replicationLogger.error('Failed to drop replication slot:', err, MODULE_NAME);
+      replicationLogger.error('Slot drop failed', {
+        error: err instanceof Error ? err.message : String(err),
+        slot: this.config.slot
+      }, MODULE_NAME);
       throw err;
     }
   }

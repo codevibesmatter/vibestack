@@ -43,18 +43,12 @@ export class ReplicationDO implements DurableObject {
       const lastActive = await state.storage.get<number>(ReplicationDO.LAST_ACTIVE_KEY);
       if (lastActive) {
         const hibernationDuration = Date.now() - lastActive;
-        replicationLogger.info('DO waking from hibernation', {
-          event: 'do.wake',
+        replicationLogger.info('DO waking', {
           lastActiveAt: new Date(lastActive).toISOString(),
-          hibernationDuration,
-          hibernationDurationSeconds: (hibernationDuration / 1000).toFixed(1),
-          trigger: 'constructor'
+          hibernationSecs: Math.round(hibernationDuration / 1000)
         }, MODULE_NAME);
       } else {
-        replicationLogger.info('DO starting for first time', {
-          event: 'do.start',
-          trigger: 'constructor'
-        }, MODULE_NAME);
+        replicationLogger.info('DO starting', {}, MODULE_NAME);
       }
       // Update last active timestamp
       await state.storage.put(ReplicationDO.LAST_ACTIVE_KEY, Date.now());
@@ -116,7 +110,7 @@ export class ReplicationDO implements DurableObject {
     
     const ctx = createMinimalContext(this.env, executionCtx);
 
-    replicationLogger.info('ReplicationDO handling request:', {
+    replicationLogger.debug('Request received', {
       path,
       method: request.method
     }, MODULE_NAME);
@@ -135,7 +129,7 @@ export class ReplicationDO implements DurableObject {
       }
     }
 
-    replicationLogger.warn('No matching endpoint:', { path }, MODULE_NAME);
+    replicationLogger.warn('Unknown endpoint', { path }, MODULE_NAME);
     return new Response('Not found', { status: 404 });
   }
 
@@ -146,7 +140,7 @@ export class ReplicationDO implements DurableObject {
     try {
       // Check if we're already initialized, unless forcing init
       if (!forceInit && this.pollingManager?.hasCompletedFirstPoll) {
-        replicationLogger.info('Replication system already initialized', {}, MODULE_NAME);
+        replicationLogger.info('Replication already initialized', {}, MODULE_NAME);
         const c = this.getContext();
         const slotStatus = await this.stateManager.checkSlotStatus(c);
         return {
@@ -156,7 +150,7 @@ export class ReplicationDO implements DurableObject {
       }
 
       // High level lifecycle event
-      replicationLogger.info('Starting replication system', {}, MODULE_NAME);
+      replicationLogger.info('Starting replication', {}, MODULE_NAME);
       
       // Let the modules handle their own logging
       const c = this.getContext();
@@ -184,7 +178,7 @@ export class ReplicationDO implements DurableObject {
       };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      replicationLogger.error('Failed to start replication system:', { error: errorMessage }, MODULE_NAME);
+      replicationLogger.error('Replication start failed', { error: errorMessage }, MODULE_NAME);
       
       this.pollingManager.stopPolling();
       
@@ -218,7 +212,7 @@ export class ReplicationDO implements DurableObject {
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Error during initialization:', { error: errorMessage }, MODULE_NAME);
+      replicationLogger.error('Init error', { error: errorMessage }, MODULE_NAME);
       return new Response(JSON.stringify({
         success: false,
         error: errorMessage
@@ -246,7 +240,7 @@ export class ReplicationDO implements DurableObject {
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Error getting replication status:', { error: errorMessage }, MODULE_NAME);
+      replicationLogger.error('Status error', { error: errorMessage }, MODULE_NAME);
       return new Response(JSON.stringify({
         success: false,
         error: errorMessage
@@ -279,8 +273,7 @@ export class ReplicationDO implements DurableObject {
       await this.durableObjectState.storage.put(ReplicationDO.LAST_ACTIVE_KEY, now);
       
       // High level lifecycle event
-      replicationLogger.info('DO preparing for hibernation', {
-        event: 'do.hibernate',
+      replicationLogger.info('Hibernation prep', {
         lastActiveAt: new Date(now).toISOString()
       }, MODULE_NAME);
 
@@ -288,10 +281,8 @@ export class ReplicationDO implements DurableObject {
       await this.pollingManager.stopPolling();
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      replicationLogger.error('Failed to hibernate DO', {
-        event: 'do.hibernate.error',
-        error: error.message,
-        stack: error.stack
+      replicationLogger.error('Hibernation failed', {
+        error: error.message
       }, MODULE_NAME);
       throw err;
     }
@@ -302,23 +293,19 @@ export class ReplicationDO implements DurableObject {
    */
   async alarm(): Promise<void> {
     try {
-      replicationLogger.info('Handling hibernation wake-up alarm', {
-        event: 'replication.hibernation.wake',
-        timestamp: new Date().toISOString(),
-        trigger: 'alarm'
-      }, MODULE_NAME);
+      replicationLogger.info('Alarm triggered', {}, MODULE_NAME);
 
       // Force initialization on wake-up
       await this.initializeReplication(true);
     } catch (err) {
-      replicationLogger.error('Error handling alarm:', err, MODULE_NAME);
+      replicationLogger.error('Alarm error', { 
+        error: err instanceof Error ? err.message : String(err) 
+      }, MODULE_NAME);
       // Ensure next alarm is set even if this one failed
       const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
       await this.durableObjectState.storage.setAlarm(nextCheck);
-      replicationLogger.info('Reset hibernation alarm after error', {
-        event: 'replication.hibernation.alarm_reset',
-        nextCheck: new Date(nextCheck).toISOString(),
-        error: err instanceof Error ? err.message : String(err)
+      replicationLogger.info('Alarm reset', {
+        nextCheck: new Date(nextCheck).toISOString()
       }, MODULE_NAME);
     }
   }
@@ -390,7 +377,7 @@ export class ReplicationDO implements DurableObject {
       const clients = await this.clientManager.listClients();
       return Response.json(clients);
     } catch (error) {
-      replicationLogger.error('Error getting clients', {
+      replicationLogger.error('Client listing failed', {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       return Response.json({ error: 'Failed to get clients' }, { status: 500 });

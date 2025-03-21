@@ -60,9 +60,9 @@ export class SyncStateManager implements StateManager {
     
     if (lastWake) {
       const sleepDuration = now - lastWake;
-      syncLogger.info('🌅 SyncDO woken up', {
-        sleepDurationMs: sleepDuration,
-        sleepDurationSec: Math.round(sleepDuration / 1000)
+      syncLogger.info('SyncDO wakeup', {
+        sleepMs: sleepDuration,
+        sleepSec: Math.round(sleepDuration / 1000)
       }, MODULE_NAME);
     }
     
@@ -93,14 +93,14 @@ export class SyncStateManager implements StateManager {
    * Initialize connection and register client
    */
   async initializeConnection(): Promise<void> {
-    syncLogger.info('Initializing connection in state manager', {
+    syncLogger.info('Connection initializing', {
       clientId: this.clientId,
       currentLSN: this.clientLSN
     }, MODULE_NAME);
     
     try {
       const serverLSN = await this.getServerLSN();
-      syncLogger.info('Current server LSN', { serverLSN }, MODULE_NAME);
+      syncLogger.debug('Server LSN', { serverLSN }, MODULE_NAME);
       
       // Only register client existence
       if (this.clientId) {
@@ -111,10 +111,8 @@ export class SyncStateManager implements StateManager {
         };
         const key = `client:${this.clientId}`;
         
-        syncLogger.info('Registering client existence in KV store (no expiration)', {
-          clientId: this.clientId,
-          key,
-          data: clientData
+        syncLogger.debug('Registering client in KV', {
+          clientId: this.clientId
         }, MODULE_NAME);
         
         // Register with NO expiration time - client will stay in registry until explicitly removed
@@ -126,19 +124,19 @@ export class SyncStateManager implements StateManager {
         
         // Verify registration
         const verifyData = await this.context.env.CLIENT_REGISTRY.get(key);
-        syncLogger.info('Verification of client registration', {
+        syncLogger.debug('Registration verified', {
           clientId: this.clientId,
-          exists: !!verifyData,
-          data: verifyData ? verifyData : null
+          exists: !!verifyData
         }, MODULE_NAME);
       } else {
-        syncLogger.error('Cannot register client - no clientId available', undefined, MODULE_NAME);
+        syncLogger.error('Client registration failed', {
+          reason: 'No client ID available'
+        }, MODULE_NAME);
       }
     } catch (err) {
-      syncLogger.error('Error initializing connection', {
+      syncLogger.error('Connection initialization failed', {
         clientId: this.clientId,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined
+        error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
       throw err;
     }
@@ -158,10 +156,8 @@ export class SyncStateManager implements StateManager {
     // Mark client as inactive in registry
     if (clientIdToRemove) {
       const key = `client:${clientIdToRemove}`;
-      syncLogger.info('Marking client as inactive', { 
-        clientId: clientIdToRemove,
-        key,
-        lastLSN: this.clientLSN
+      syncLogger.info('Deactivating client', { 
+        clientId: clientIdToRemove
       }, MODULE_NAME);
       
       try {
@@ -180,14 +176,13 @@ export class SyncStateManager implements StateManager {
             })
           );
           
-          syncLogger.info('Client marked as inactive', { 
+          syncLogger.debug('Client marked inactive', { 
             clientId: clientIdToRemove,
-            lastLSN: data.lastLSN,
-            disconnectedAt: new Date().toISOString()
+            lastLSN: data.lastLSN
           }, MODULE_NAME);
         }
       } catch (err) {
-        syncLogger.error('Failed to mark client as inactive', {
+        syncLogger.error('Client deactivation failed', {
           clientId: clientIdToRemove,
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_NAME);
@@ -199,7 +194,7 @@ export class SyncStateManager implements StateManager {
    * Register a new client
    */
   async registerClient(clientId: string): Promise<void> {
-    syncLogger.info('Registering client in state manager', { clientId }, MODULE_NAME);
+    syncLogger.info('Registering client', { clientId }, MODULE_NAME);
     
     try {
       this.clientId = clientId;
@@ -212,12 +207,6 @@ export class SyncStateManager implements StateManager {
       };
       const key = `client:${clientId}`;
       
-      syncLogger.info('Registering client in KV store', {
-        clientId,
-        key,
-        data: clientData
-      }, MODULE_NAME);
-      
       await this.context.env.CLIENT_REGISTRY.put(
         key,
         JSON.stringify(clientData)
@@ -225,16 +214,14 @@ export class SyncStateManager implements StateManager {
       
       // Verify registration
       const verifyData = await this.context.env.CLIENT_REGISTRY.get(key);
-      syncLogger.info('Verification of client registration', {
+      syncLogger.debug('Client registered', {
         clientId,
-        exists: !!verifyData,
-        data: verifyData ? verifyData : null
+        registered: !!verifyData
       }, MODULE_NAME);
     } catch (err) {
-      syncLogger.error('Error registering client', {
+      syncLogger.error('Client registration failed', {
         clientId,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined
+        error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
       throw err;
     }
@@ -263,7 +250,7 @@ export class SyncStateManager implements StateManager {
           );
         }
       } catch (err) {
-        syncLogger.error('Failed to update client LSN in registry', {
+        syncLogger.error('LSN update failed', {
           clientId,
           lsn,
           error: err instanceof Error ? err.message : String(err)
@@ -277,7 +264,7 @@ export class SyncStateManager implements StateManager {
    */
   trackError(error: Error): void {
     this.metrics.errors.push(error);
-    syncLogger.error('Sync error', {
+    syncLogger.error('Sync error tracked', {
       clientId: this.clientId,
       error: error.message
     }, MODULE_NAME);
@@ -321,7 +308,7 @@ export class SyncStateManager implements StateManager {
       const result = await sql<{ lsn: string }>(this.context, 'SELECT pg_current_wal_lsn() as lsn');
       return result[0].lsn;
     } catch (err) {
-      syncLogger.error('Failed to get server LSN', {
+      syncLogger.error('Server LSN fetch failed', {
         error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
       throw err;
@@ -333,23 +320,19 @@ export class SyncStateManager implements StateManager {
    */
   async saveInitialSyncProgress(clientId: string, state: InitialSyncState): Promise<void> {
     try {
-      syncLogger.debug('Saving initial sync progress', { 
+      syncLogger.debug('Saving sync progress', { 
         clientId, 
-        state: {
-          ...state,
-          status: state.status
-        }
+        status: state.status
       }, MODULE_NAME);
       
       // Use DO storage instead of database
       await this.durableObjectState.storage.put('initial_sync_state', state);
       
-      syncLogger.debug('Saved initial sync progress', { clientId }, MODULE_NAME);
+      syncLogger.debug('Progress saved', { clientId }, MODULE_NAME);
     } catch (error) {
-      syncLogger.error('Error saving initial sync progress', {
+      syncLogger.error('Saving progress failed', {
         clientId,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       throw error;
     }
@@ -360,23 +343,21 @@ export class SyncStateManager implements StateManager {
    */
   async getInitialSyncProgress(clientId: string): Promise<InitialSyncState | null> {
     try {
-      syncLogger.debug('Retrieving initial sync progress', { clientId }, MODULE_NAME);
+      syncLogger.debug('Getting sync progress', { clientId }, MODULE_NAME);
       
       // Use DO storage instead of database
       const syncState = await this.durableObjectState.storage.get<InitialSyncState>('initial_sync_state');
       
-      syncLogger.debug('Retrieved initial sync state', { 
+      syncLogger.debug('Progress retrieved', { 
         clientId, 
-        found: !!syncState,
-        syncState: syncState ? JSON.stringify(syncState) : 'null'
+        found: !!syncState
       }, MODULE_NAME);
       
       return syncState || null;
     } catch (error) {
-      syncLogger.error('Error retrieving initial sync progress', {
+      syncLogger.error('Progress retrieval failed', {
         clientId,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       return null;
     }
