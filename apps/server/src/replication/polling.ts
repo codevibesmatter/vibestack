@@ -15,8 +15,8 @@ const MODULE_NAME = 'polling';
 
 // Polling intervals
 export const ACTIVE_POLL_INTERVAL = 1000; // 1 second
-export const CLIENT_CHECK_INTERVAL = 5000; // 5 seconds
-export const HIBERNATION_CHECK_INTERVAL = 30000; // 30 seconds
+export const CLIENT_CHECK_INTERVAL = 60000; // 60 seconds
+export const HIBERNATION_CHECK_INTERVAL = 300000; // 300 seconds
 
 /**
  * Compare two LSNs
@@ -98,7 +98,7 @@ export class PollingManager {
 
       // Start active polling and client checking if we have clients
       if (!this.pollingInterval) {
-        replicationLogger.info('Starting regular polling and client checks', {
+        replicationLogger.debug('Starting regular polling and client checks', {
           event: 'replication.polling.start',
           pollInterval: `${ACTIVE_POLL_INTERVAL}ms`,
           clientCheckInterval: `${CLIENT_CHECK_INTERVAL}ms`
@@ -107,7 +107,7 @@ export class PollingManager {
         // Start polling interval
         this.pollingInterval = setInterval(() => this.checkClientsAndPoll(), ACTIVE_POLL_INTERVAL);
         
-        // Start periodic client check interval
+        // Start periodic client check interval (runs less frequently to reduce noise)
         this.clientCheckInterval = setInterval(async () => {
           const hasClients = await this.checkForActiveClients();
           if (!hasClients) {

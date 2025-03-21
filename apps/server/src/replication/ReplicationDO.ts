@@ -383,18 +383,17 @@ export class ReplicationDO implements DurableObject {
   }
 
   /**
-   * Get list of active clients
+   * Get list of clients via ClientManager
    */
   private async handleClients(): Promise<Response> {
     try {
-      const clients = await this.clientManager.getClients();
+      const clients = await this.clientManager.listClients();
       return Response.json(clients);
     } catch (error) {
-      replicationLogger.error('Error getting clients:', error, MODULE_NAME);
-      return Response.json({
-        success: false,
+      replicationLogger.error('Error getting clients', {
         error: error instanceof Error ? error.message : String(error)
-      }, { status: 500 });
+      }, MODULE_NAME);
+      return Response.json({ error: 'Failed to get clients' }, { status: 500 });
     }
   }
 } 

@@ -1,4 +1,25 @@
-import { ServiceError, ServiceErrorType, type ServiceResult } from '@repo/shared-types'
+// Define local error types to replace @repo/shared-types dependency
+export enum ServiceErrorType {
+  VALIDATION = 'validation',
+  NOT_FOUND = 'not_found',
+  UNAUTHORIZED = 'unauthorized',
+  FORBIDDEN = 'forbidden',
+  INTERNAL = 'internal',
+  CONFLICT = 'conflict',
+  BAD_REQUEST = 'bad_request'
+}
+
+export interface ServiceError {
+  type: ServiceErrorType;
+  message: string;
+  details?: Record<string, any>;
+}
+
+export interface ServiceResult<T> {
+  success: boolean;
+  data?: T;
+  error?: ServiceError;
+}
 
 export const errorUtils = {
   handleApiError(error: unknown): ServiceResult<never> {

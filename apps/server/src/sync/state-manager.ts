@@ -6,6 +6,7 @@ import type { InitialSyncState } from './types';
 
 const MODULE_NAME = 'state-manager';
 
+// Simplified sync state based on LSN comparison
 export type SyncState = 'initial' | 'catchup' | 'live';
 
 interface SyncMetrics {
@@ -21,8 +22,7 @@ export interface StateManager {
   updateClientLSN(clientId: string, lsn: string): Promise<void>;
   initializeConnection(): Promise<void>;
   cleanupConnection(): Promise<void>;
-  getCurrentState(): SyncState;
-  setState(state: SyncState): Promise<void>;
+  determineStateFromLSN(clientLSN: string, serverLSN: string): SyncState;
   getLSN(): string | null;
   getClientId(): string | null;
   getMetrics(): SyncMetrics;
@@ -30,12 +30,12 @@ export interface StateManager {
   trackError(error: Error): void;
   saveInitialSyncProgress(clientId: string, state: InitialSyncState): Promise<void>;
   getInitialSyncProgress(clientId: string): Promise<InitialSyncState | null>;
+  getServerLSN(): Promise<string>;
 }
 
 export class SyncStateManager implements StateManager {
   protected clientId: string | null = null;
-  private lsn: string | null = null;
-  private state: SyncState = 'initial';
+  private clientLSN: string | null = null;
   private metrics: SyncMetrics = {
     messagesReceived: 0,
     messagesSent: 0,
@@ -71,31 +71,43 @@ export class SyncStateManager implements StateManager {
   }
 
   /**
+   * Determine sync state based on LSN comparison
+   */
+  determineStateFromLSN(clientLSN: string, serverLSN: string): SyncState {
+    // Initial state when client LSN is 0/0
+    if (clientLSN === '0/0') {
+      return 'initial';
+    }
+    
+    // Compare LSNs (simple string comparison works for Postgres LSN format X/Y)
+    // If client LSN is less than server LSN, we need catchup
+    if (clientLSN < serverLSN) {
+      return 'catchup';
+    }
+    
+    // Client is up to date with server
+    return 'live';
+  }
+
+  /**
    * Initialize connection and register client
    */
   async initializeConnection(): Promise<void> {
     syncLogger.info('Initializing connection in state manager', {
       clientId: this.clientId,
-      currentLSN: this.lsn
+      currentLSN: this.clientLSN
     }, MODULE_NAME);
     
     try {
       const serverLSN = await this.getServerLSN();
       syncLogger.info('Current server LSN', { serverLSN }, MODULE_NAME);
       
-      this.state = await this.determineSyncState(serverLSN);
-      syncLogger.info('Determined sync state', { 
-        state: this.state, 
-        clientId: this.clientId,
-        clientLSN: this.lsn,
-        serverLSN
-      }, MODULE_NAME);
-      
       // Only register client existence
       if (this.clientId) {
         const clientData = { 
           active: true,
-          lastSeen: Date.now() 
+          lastSeen: Date.now(),
+          lastLSN: this.clientLSN || '0/0'
         };
         const key = `client:${this.clientId}`;
         
@@ -141,8 +153,7 @@ export class SyncStateManager implements StateManager {
     
     // Clear instance state
     this.clientId = null;
-    this.lsn = null;
-    this.state = 'initial';
+    this.clientLSN = null;
     
     // Mark client as inactive in registry
     if (clientIdToRemove) {
@@ -150,7 +161,7 @@ export class SyncStateManager implements StateManager {
       syncLogger.info('Marking client as inactive', { 
         clientId: clientIdToRemove,
         key,
-        lastLSN: this.lsn
+        lastLSN: this.clientLSN
       }, MODULE_NAME);
       
       try {
@@ -233,10 +244,32 @@ export class SyncStateManager implements StateManager {
    * Update client's LSN
    */
   async updateClientLSN(clientId: string, lsn: string): Promise<void> {
-    if (clientId !== this.clientId) {
-      throw new Error('Client ID mismatch');
+    this.clientLSN = lsn;
+    
+    // Store this in memory and update client registry
+    if (this.clientId) {
+      const key = `client:${this.clientId}`;
+      try {
+        const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
+        if (existingData) {
+          const data = JSON.parse(existingData);
+          await this.context.env.CLIENT_REGISTRY.put(
+            key,
+            JSON.stringify({
+              ...data,
+              lastLSN: lsn,
+              lastSeen: Date.now()
+            })
+          );
+        }
+      } catch (err) {
+        syncLogger.error('Failed to update client LSN in registry', {
+          clientId,
+          lsn,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_NAME);
+      }
     }
-    this.lsn = lsn;
   }
 
   /**
@@ -251,42 +284,19 @@ export class SyncStateManager implements StateManager {
   }
 
   /**
-   * Get all tracked errors
+   * Get metrics
+   */
+  getMetrics(): SyncMetrics {
+    return {
+      ...this.metrics,
+    };
+  }
+
+  /**
+   * Get errors
    */
   getErrors(): Error[] {
     return this.metrics.errors;
-  }
-
-  /**
-   * Get current metrics
-   */
-  getMetrics(): SyncMetrics {
-    return this.metrics;
-  }
-
-  /**
-   * Get current LSN
-   */
-  getLSN(): string | null {
-    return this.lsn;
-  }
-
-  /**
-   * Get current sync state
-   */
-  getCurrentState(): SyncState {
-    return this.state;
-  }
-
-  /**
-   * Set new sync state
-   */
-  async setState(newState: SyncState): Promise<void> {
-    this.state = newState;
-    syncLogger.info('State changed', { 
-      clientId: this.clientId, 
-      newState 
-    }, MODULE_NAME);
   }
 
   /**
@@ -297,37 +307,24 @@ export class SyncStateManager implements StateManager {
   }
 
   /**
-   * Determine initial sync state based on LSN comparison
+   * Get client LSN
    */
-  private async determineSyncState(serverLSN: string): Promise<SyncState> {
-    if (!this.lsn || this.lsn === '0/0') {
-      return 'initial';
-    }
-
-    // Check if we have an incomplete initial sync
-    const initialState = await this.getInitialSyncProgress(this.clientId!);
-    if (initialState && initialState.status !== 'complete') {
-      return 'initial';
-    }
-
-    return this.lsn === serverLSN ? 'live' : 'catchup';
+  getLSN(): string | null {
+    return this.clientLSN;
   }
 
   /**
    * Get current server LSN
    */
-  private async getServerLSN(): Promise<string> {
+  async getServerLSN(): Promise<string> {
     try {
       const result = await sql<{ lsn: string }>(this.context, 'SELECT pg_current_wal_lsn() as lsn');
       return result[0].lsn;
     } catch (err) {
       syncLogger.error('Failed to get server LSN', {
-        clientId: this.clientId,
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined
+        error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
-      // For one-time syncs, we can use a default LSN since we're not tracking changes
-      return '0/0';
+      throw err;
     }
   }
 
@@ -335,40 +332,53 @@ export class SyncStateManager implements StateManager {
    * Save initial sync progress to persistent storage
    */
   async saveInitialSyncProgress(clientId: string, state: InitialSyncState): Promise<void> {
-    if (clientId !== this.clientId) {
-      throw new Error('Client ID mismatch');
-    }
-
-    const query = `
-      INSERT INTO sync_state (client_id, type, state)
-      VALUES ($1, 'initial_sync', $2)
-      ON CONFLICT (client_id, type)
-      DO UPDATE SET state = $2
-    `;
-    const db = getDBClient(this.context);
-    await db.query(query, [clientId, JSON.stringify(state)]);
-
-    // Update in-memory state
-    if (state.status === 'complete') {
-      await this.setState('catchup');
+    try {
+      syncLogger.debug('Saving initial sync progress', { 
+        clientId, 
+        state: {
+          ...state,
+          status: state.status
+        }
+      }, MODULE_NAME);
+      
+      // Use DO storage instead of database
+      await this.durableObjectState.storage.put('initial_sync_state', state);
+      
+      syncLogger.debug('Saved initial sync progress', { clientId }, MODULE_NAME);
+    } catch (error) {
+      syncLogger.error('Error saving initial sync progress', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }, MODULE_NAME);
+      throw error;
     }
   }
 
   /**
-   * Get initial sync progress from persistent storage
+   * Get initial sync progress from Durable Object storage
    */
   async getInitialSyncProgress(clientId: string): Promise<InitialSyncState | null> {
-    if (clientId !== this.clientId) {
-      throw new Error('Client ID mismatch');
+    try {
+      syncLogger.debug('Retrieving initial sync progress', { clientId }, MODULE_NAME);
+      
+      // Use DO storage instead of database
+      const syncState = await this.durableObjectState.storage.get<InitialSyncState>('initial_sync_state');
+      
+      syncLogger.debug('Retrieved initial sync state', { 
+        clientId, 
+        found: !!syncState,
+        syncState: syncState ? JSON.stringify(syncState) : 'null'
+      }, MODULE_NAME);
+      
+      return syncState || null;
+    } catch (error) {
+      syncLogger.error('Error retrieving initial sync progress', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }, MODULE_NAME);
+      return null;
     }
-
-    const query = `
-      SELECT state
-      FROM sync_state
-      WHERE client_id = $1 AND type = 'initial_sync'
-    `;
-    const db = getDBClient(this.context);
-    const result = await db.query(query, [clientId]);
-    return result.rows[0]?.state || null;
   }
 } 

@@ -9,6 +9,8 @@ import type {
   ClientInitReceivedMessage,
   ClientInitProcessedMessage
 } from '@repo/sync-types';
+import fs from 'fs';
+import path from 'path';
 
 interface SyncValidationState {
   initStartReceived: boolean;
@@ -20,7 +22,7 @@ interface SyncValidationState {
 }
 
 class InitialSyncTester extends SyncTester {
-  private state: SyncValidationState;
+  public state: SyncValidationState;
 
   constructor() {
     super(DEFAULT_CONFIG);
@@ -34,19 +36,32 @@ class InitialSyncTester extends SyncTester {
     };
   }
 
+  public getClientId(): string {
+    return this.clientId;
+  }
+
   public async connect(): Promise<void> {
     // Add LSN to WebSocket URL
     const wsUrl = new URL(this.config.wsUrl);
     wsUrl.searchParams.set('clientId', this.clientId);
     wsUrl.searchParams.set('lsn', '0/0'); // Start from beginning for initial sync
-    this.config = { ...this.config, wsUrl: wsUrl.toString() };
+    
+    // Convert the URL to string
+    const wsUrlString = wsUrl.toString();
     
     console.log('Connecting to sync server:', {
-      url: wsUrl.toString(),
+      url: wsUrlString,
       clientId: this.clientId
     });
     
+    // Update config with the new URL
+    this.config = { ...this.config, wsUrl: wsUrlString };
+    
+    // Call parent connect method which creates the WebSocket
     await super.connect();
+    
+    // Sync starts automatically when WebSocket connects
+    console.log('Connection established, waiting for server to begin sync process');
   }
 
   private async sendInitialAck(table: string, chunk: number): Promise<void> {
@@ -174,7 +189,18 @@ class InitialSyncTester extends SyncTester {
         this.state.initCompleteReceived = true;
         this.state.initCompleteLSN = (initComplete as any).serverLSN;
         console.log('Initial sync completed with LSN:', this.state.initCompleteLSN);
+        
         // Send processed message when we receive complete
+        await this.sendInitProcessed();
+      }
+
+      // Check if all tables have been received
+      const allTablesReceived = Array.from(expectedTables)
+        .every(table => this.state.receivedTables.has(table));
+        
+      // If all tables are received and we haven't sent init processed, send it
+      if (allTablesReceived && this.state.initStartReceived && !this.state.initCompleteReceived) {
+        console.log('All tables received, sending init processed message');
         await this.sendInitProcessed();
       }
 
@@ -184,8 +210,6 @@ class InitialSyncTester extends SyncTester {
       // Validate complete flow
       if (this.state.initStartReceived && this.state.initCompleteReceived) {
         const currentState = this.getCurrentState();
-        const allTablesReceived = Array.from(expectedTables)
-          .every(table => this.state.receivedTables.has(table));
         const correctTableOrder = this.validateTableOrder(Array.from(this.state.receivedTables));
         const validLSNProgression = this.validateLSNProgression();
         
@@ -231,6 +255,20 @@ async function testInitialSync() {
     
     if (!syncValid) {
       throw new Error('Initial sync validation failed');
+    }
+    
+    // Save the LSN for future tests
+    if (tester.state.initCompleteLSN) {
+      const lsnFilePath = path.resolve(process.cwd(), '..', '..', '.lsn-state.json');
+      fs.writeFileSync(
+        lsnFilePath, 
+        JSON.stringify({
+          lsn: tester.state.initCompleteLSN,
+          timestamp: new Date().toISOString(),
+          clientId: tester.getClientId()
+        }, null, 2)
+      );
+      console.log(`Saved LSN state to ${lsnFilePath} for future tests`);
     }
     
     console.log('Initial sync test completed successfully');

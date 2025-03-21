@@ -1,18 +1,6 @@
 
 
-> @repo/server@0.0.0 build /home/benfreed/dev/tinytest/tinyhbasetry2/apps/server
-> tsup
+> @repo/server@0.1.0 build /home/benfreed/dev/tinytest/vibestack/apps/server
+> tsc --noEmit && wrangler deploy --outdir=dist
 
-[34mCLI[39m Building entry: src/index.ts
-[34mCLI[39m Using tsconfig: tsconfig.json
-[34mCLI[39m tsup v8.3.6
-[34mCLI[39m Using tsup config: /home/benfreed/dev/tinytest/tinyhbasetry2/apps/server/tsup.config.ts
-[34mCLI[39m Target: es2020
-[34mCLI[39m Cleaning output folder
-[34mESM[39m Build start
-[32mESM[39m [1mdist/index.mjs     [22m[32m69.14 KB[39m
-[32mESM[39m [1mdist/index.mjs.map [22m[32m145.25 KB[39m
-[32mESM[39m ⚡️ Build success in 191ms
-DTS Build start
-DTS ⚡️ Build success in 820ms
-DTS dist/index.d.mts 1.92 KB
+[41m[30m ELIFECYCLE [39m[49m [31mCommand failed.[39m

@@ -30,65 +30,74 @@ export interface ClientState {
  */
 export class ClientManager {
   private env: Env;
-  private static readonly CLIENT_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  private static readonly CLIENT_TIMEOUT = 10 * 60 * 1000; // 10 minutes (increased from 5)
+  private lastFullCleanupTime: number = 0;
+  private readonly FULL_CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // Once per day
 
   constructor(env: Env) {
     this.env = env;
+    this.lastFullCleanupTime = Date.now();
   }
 
   /**
-   * Get all clients from KV registry
+   * Perform a full cleanup of the client registry
+   * This is more thorough than the regular cleanup during hasActiveClients
+   * and will force-remove all stale clients
    */
-  public async getClients(): Promise<ClientState[]> {
+  public async purgeStaleClients(): Promise<number> {
     try {
-      replicationLogger.info('Fetching all clients from registry', undefined, MODULE_NAME);
+      replicationLogger.info('Starting full cleanup of client registry', undefined, MODULE_NAME);
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
-      replicationLogger.info('Client keys found in registry', { count: keys.length, keys: keys.map((k: any) => k.name) }, MODULE_NAME);
       
-      const clients: ClientState[] = [];
+      let removedCount = 0;
+      const now = Date.now();
       
       for (const key of keys) {
-        replicationLogger.debug('Retrieving client data', { key: key.name }, MODULE_NAME);
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
-        
         if (!value) {
-          replicationLogger.warn('Client key exists but no value found', { key: key.name }, MODULE_NAME);
+          await this.env.CLIENT_REGISTRY.delete(key.name);
+          removedCount++;
           continue;
         }
         
         try {
           const state = JSON.parse(value);
-          replicationLogger.debug('Client data retrieved', {
-            clientId: key.name.replace('client:', ''),
-            active: state.active,
-            lastSeen: state.lastSeen
-          }, MODULE_NAME);
+          const lastSeen = state.lastSeen || 0;
+          const timeSinceLastSeen = now - lastSeen;
+          const clientId = key.name.replace('client:', '');
           
-          clients.push({
-            clientId: key.name.replace('client:', ''),
-            active: !!state.active,
-            lastSeen: state.lastSeen || 0
-          });
+          // Remove if inactive or stale
+          if (!state.active || timeSinceLastSeen > ClientManager.CLIENT_TIMEOUT) {
+            const reason = !state.active ? 'inactive' : 'stale';
+            replicationLogger.debug(`Purging ${reason} client during cleanup`, { 
+              clientId, 
+              lastSeen, 
+              timeSinceLastSeen,
+              active: state.active
+            }, MODULE_NAME);
+            
+            await this.env.CLIENT_REGISTRY.delete(key.name);
+            removedCount++;
+          }
         } catch (err) {
-          replicationLogger.error('Failed to parse client state', {
-            key: key.name,
-            value,
-            error: err instanceof Error ? err.message : String(err)
-          }, MODULE_NAME);
+          // If we can't parse the state, just remove the client
+          await this.env.CLIENT_REGISTRY.delete(key.name);
+          removedCount++;
         }
       }
       
-      replicationLogger.info('Clients retrieved from registry', {
-        totalFound: clients.length,
-        activeCount: clients.filter(c => c.active).length
+      replicationLogger.info('Full client registry cleanup completed', { 
+        removedCount,
+        totalClients: keys.length
       }, MODULE_NAME);
       
-      return clients;
+      this.lastFullCleanupTime = now;
+      return removedCount;
     } catch (error) {
-      replicationLogger.error('Failed to get clients:', {
+      replicationLogger.error('Failed to purge stale clients:', {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
-      return [];
+      return 0;
     }
   }
 
@@ -97,19 +106,25 @@ export class ClientManager {
    */
   public async hasActiveClients(): Promise<boolean> {
     try {
-      replicationLogger.info('Checking for active clients', undefined, MODULE_NAME);
+      replicationLogger.debug('Checking for active clients', undefined, MODULE_NAME);
+      
+      // Check if we should do a full cleanup
+      const now = Date.now();
+      if (now - this.lastFullCleanupTime > this.FULL_CLEANUP_INTERVAL) {
+        await this.purgeStaleClients();
+      }
+      
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
-      replicationLogger.info('Client keys found in registry', { count: keys.length }, MODULE_NAME);
+      replicationLogger.debug('Client keys found in registry', { count: keys.length }, MODULE_NAME);
       
       if (keys.length === 0) {
-        replicationLogger.warn('No client keys found in registry', undefined, MODULE_NAME);
+        replicationLogger.debug('No client keys found in registry', undefined, MODULE_NAME);
         return false;
       }
       
       let hasActive = false;
-      const now = Date.now();
       
-      // Check each client's state and clean up stale ones
+      // Check each client's state and clean up inactive or stale ones
       for (const key of keys) {
         replicationLogger.debug('Checking client state', { key: key.name }, MODULE_NAME);
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
@@ -124,36 +139,43 @@ export class ClientManager {
         try {
           const state = JSON.parse(value);
           const lastSeen = state.lastSeen || 0;
-          const isStale = now - lastSeen > ClientManager.CLIENT_TIMEOUT;
+          const timeSinceLastSeen = now - lastSeen;
+          const clientId = key.name.replace('client:', '');
           
           replicationLogger.debug('Client state parsed', { 
-            key: key.name,
+            clientId,
             active: state.active,
             lastSeen,
-            isStale,
-            timeSinceLastSeen: now - lastSeen
+            timeSinceLastSeen
           }, MODULE_NAME);
           
-          if (state.active && !isStale) {
+          // Should remove client if:
+          // 1. It's explicitly marked as inactive, or
+          // 2. It hasn't been seen recently (stale)
+          if (!state.active || timeSinceLastSeen > ClientManager.CLIENT_TIMEOUT) {
+            const reason = !state.active ? 'inactive' : 'stale';
+            replicationLogger.info(`Removing ${reason} client`, {
+              clientId,
+              lastSeen: state.lastSeen,
+              timeSinceLastSeen,
+              active: state.active
+            }, MODULE_NAME);
+            await this.env.CLIENT_REGISTRY.delete(key.name);
+          } else {
+            // Client is active and was seen recently
             replicationLogger.info('Found active client', { 
-              clientId: key.name.replace('client:', ''),
+              clientId,
               lastSeen: state.lastSeen
             }, MODULE_NAME);
             hasActive = true;
-          } else if (isStale) {
-            // Remove stale client
-            replicationLogger.info('Removing stale client', {
-              clientId: key.name.replace('client:', ''),
-              lastSeen: state.lastSeen,
-              timeSinceLastSeen: now - lastSeen
-            }, MODULE_NAME);
-            await this.env.CLIENT_REGISTRY.delete(key.name);
           }
         } catch (err) {
           replicationLogger.error('Failed to parse client state', {
             key: key.name,
             error: err instanceof Error ? err.message : String(err)
           }, MODULE_NAME);
+          // Remove invalid entry
+          await this.env.CLIENT_REGISTRY.delete(key.name);
         }
       }
       
@@ -307,6 +329,48 @@ export class ClientManager {
         stack: err instanceof Error ? err.stack : undefined
       });
       return false;
+    }
+  }
+
+  /**
+   * List all clients in the registry
+   */
+  public async listClients(): Promise<ClientState[]> {
+    try {
+      replicationLogger.debug('Listing all clients in registry', undefined, MODULE_NAME);
+      const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
+      const clients: ClientState[] = [];
+      
+      for (const key of keys) {
+        const value = await this.env.CLIENT_REGISTRY.get(key.name);
+        if (!value) continue;
+        
+        try {
+          const state = JSON.parse(value);
+          clients.push({
+            clientId: key.name.replace('client:', ''),
+            active: state.active || false,
+            lastSeen: state.lastSeen || 0
+          });
+        } catch (err) {
+          replicationLogger.error('Failed to parse client state', {
+            key: key.name,
+            error: err instanceof Error ? err.message : String(err)
+          }, MODULE_NAME);
+        }
+      }
+      
+      replicationLogger.debug('Retrieved clients from registry', { 
+        count: clients.length
+      }, MODULE_NAME);
+      
+      return clients;
+    } catch (error) {
+      replicationLogger.error('Failed to list clients', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }, MODULE_NAME);
+      return [];
     }
   }
 } 
