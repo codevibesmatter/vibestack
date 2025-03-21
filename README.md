@@ -72,6 +72,8 @@ VibeStack is a sophisticated real-time synchronization system that enables seaml
   - Builds dependency hierarchies for efficient data synchronization
   - Handles complex entity metadata filtering
 
+> **TODO:** Implement full CRUD API code generation to automatically create type-safe endpoints from entity definitions.
+
 ## Project Structure
 
 ```
