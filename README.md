@@ -126,6 +126,8 @@ vibestack/
    pnpm dev
    ```
 
+> **TODO:** Add proper steps for entity generation (`pnpm run generate:entities`) and initial migrations (`pnpm run migration:generate:server` and `pnpm run migration:generate:client`), followed by migration execution (`pnpm run deploy`).
+
 ## Development
 
 - `pnpm build` - Build all packages and applications
