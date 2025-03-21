@@ -9,7 +9,7 @@ interface TableChange$1 {
     updated_at: string;
 }
 
-type SrvMessageType = 'srv_send_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_changes_received' | 'srv_changes_applied';
+type SrvMessageType = 'srv_send_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_lsn_update' | 'srv_changes_received' | 'srv_changes_applied';
 type CltMessageType = 'clt_sync_request' | 'clt_send_changes' | 'clt_heartbeat' | 'clt_error' | 'clt_changes_received' | 'clt_changes_applied' | 'clt_init_received' | 'clt_init_processed';
 interface BaseMessage {
     messageId: string;
@@ -48,6 +48,10 @@ interface ServerInitCompleteMessage extends ServerMessage {
 interface ServerStateChangeMessage extends ServerMessage {
     type: 'srv_state_change';
     state: 'initial' | 'catchup' | 'live';
+    lsn: string;
+}
+interface ServerLSNUpdateMessage extends ServerMessage {
+    type: 'srv_lsn_update';
     lsn: string;
 }
 interface ServerReceivedMessage extends ServerMessage {
@@ -118,4 +122,4 @@ interface ClientDeregistration {
 declare function isTableChange(payload: unknown): payload is TableChange;
 declare function isClientMessageType(type: string): type is CltMessageType;
 
-export { type BaseMessage, type ClientAppliedMessage, type ClientChangesMessage, type ClientDeregistration, type ClientHeartbeatMessage, type ClientInitProcessedMessage, type ClientInitReceivedMessage, type ClientMessage, type ClientReceivedMessage, type ClientRegistration, type CltMessageType, type Message, type ServerAppliedMessage, type ServerChangesMessage, type ServerInitChangesMessage, type ServerInitCompleteMessage, type ServerInitStartMessage, type ServerMessage, type ServerReceivedMessage, type ServerStateChangeMessage, type SrvMessageType, type TableChange, isClientMessageType, isTableChange };
+export { type BaseMessage, type ClientAppliedMessage, type ClientChangesMessage, type ClientDeregistration, type ClientHeartbeatMessage, type ClientInitProcessedMessage, type ClientInitReceivedMessage, type ClientMessage, type ClientReceivedMessage, type ClientRegistration, type CltMessageType, type Message, type ServerAppliedMessage, type ServerChangesMessage, type ServerInitChangesMessage, type ServerInitCompleteMessage, type ServerInitStartMessage, type ServerLSNUpdateMessage, type ServerMessage, type ServerReceivedMessage, type ServerStateChangeMessage, type SrvMessageType, type TableChange, isClientMessageType, isTableChange };

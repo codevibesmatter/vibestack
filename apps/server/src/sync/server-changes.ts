@@ -2,7 +2,8 @@ import type {
   TableChange,
   SrvMessageType,
   ServerChangesMessage,
-  ServerStateChangeMessage
+  ServerStateChangeMessage,
+  ServerLSNUpdateMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
@@ -240,16 +241,15 @@ export async function performCatchupSync(
     }
   );
 
-  // Send state change message
-  const stateChangeMsg: ServerStateChangeMessage = {
-    type: 'srv_state_change',
+  // Send LSN update message
+  const lsnUpdateMsg: ServerLSNUpdateMessage = {
+    type: 'srv_lsn_update',
     messageId: `srv_${Date.now()}`,
     timestamp: Date.now(),
     clientId,
-    state: 'live',
     lsn: startLSN
   };
-  await messageHandler.send(stateChangeMsg);
+  await messageHandler.send(lsnUpdateMsg);
 
   syncLogger.info('Catchup sync completed', {
     clientId,

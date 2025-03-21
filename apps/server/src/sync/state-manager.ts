@@ -20,6 +20,7 @@ interface SyncMetrics {
 export interface StateManager {
   registerClient(clientId: string): Promise<void>;
   updateClientLSN(clientId: string, lsn: string): Promise<void>;
+  updateClientSyncState(clientId: string, state: SyncState): Promise<void>;
   initializeConnection(): Promise<void>;
   cleanupConnection(): Promise<void>;
   determineStateFromLSN(clientLSN: string, serverLSN: string): SyncState;
@@ -256,6 +257,43 @@ export class SyncStateManager implements StateManager {
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_NAME);
       }
+    }
+  }
+
+  /**
+   * Update client's sync state internally (not sent to client)
+   */
+  async updateClientSyncState(clientId: string, state: SyncState): Promise<void> {
+    // Store state in DO storage
+    await this.durableObjectState.storage.put(`client:${clientId}:syncState`, state);
+    
+    // Update client registry with state info
+    const key = `client:${this.clientId}`;
+    try {
+      const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
+      if (existingData) {
+        const data = JSON.parse(existingData);
+        await this.context.env.CLIENT_REGISTRY.put(
+          key,
+          JSON.stringify({
+            ...data,
+            syncState: state,
+            lastSeen: Date.now()
+          })
+        );
+        
+        syncLogger.debug('Updated client sync state', {
+          clientId,
+          state,
+          lsn: this.clientLSN
+        }, MODULE_NAME);
+      }
+    } catch (err) {
+      syncLogger.error('Failed to update client sync state', {
+        clientId,
+        state,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
     }
   }
 

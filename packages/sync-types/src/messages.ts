@@ -7,7 +7,8 @@ export type SrvMessageType =
   | 'srv_init_complete'    // Server signals initial sync is complete
   | 'srv_heartbeat'        // Server heartbeat
   | 'srv_error'           // Server error
-  | 'srv_state_change'    // Server state change notification
+  | 'srv_state_change'    // Server state change notification (deprecated)
+  | 'srv_lsn_update'      // Server LSN update notification
   | 'srv_changes_received' // Server acknowledges receipt of changes
   | 'srv_changes_applied';  // Server signals changes were applied
 
@@ -66,6 +67,11 @@ export interface ServerInitCompleteMessage extends ServerMessage {
 export interface ServerStateChangeMessage extends ServerMessage {
   type: 'srv_state_change';
   state: 'initial' | 'catchup' | 'live';
+  lsn: string;
+}
+
+export interface ServerLSNUpdateMessage extends ServerMessage {
+  type: 'srv_lsn_update';
   lsn: string;
 }
 

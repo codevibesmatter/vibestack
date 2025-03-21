@@ -6,6 +6,14 @@ import { syncLogger } from '../middleware/logger';
 import { createMinimalContext } from '../types/hono';
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
+import { 
+  ServerMessage,
+  ClientMessage,
+  CltMessageType,
+} from '@repo/sync-types';
+
+// Add type for message handler function
+type MessageHandlerFn<T extends ClientMessage> = (message: T) => Promise<void>;
 
 const MODULE_NAME = 'SyncDO';
 
@@ -30,6 +38,8 @@ export class SyncDO implements DurableObject {
   private webSocket: WebSocket | null = null;
   private stateManager: SyncStateManager;
   private context: MinimalContext;
+  // Add message handlers map
+  private messageHandlers = new Map<CltMessageType, MessageHandlerFn<ClientMessage>>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -89,6 +99,59 @@ export class SyncDO implements DurableObject {
   // Create a minimal context for operations
   private getContext(): MinimalContext {
     return this.context;
+  }
+
+  /**
+   * Send a message to the client using type-safe interface
+   */
+  async send(message: ServerMessage): Promise<void> {
+    if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
+      syncLogger.debug('Sent message to client:', {
+        type: message.type,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      this.webSocket.send(JSON.stringify(message));
+    } else {
+      syncLogger.warn('Cannot send message, WebSocket not open:', {
+        type: message.type,
+        messageId: message.messageId,
+        connected: this.webSocket?.readyState === WS_READY_STATE.OPEN
+      }, MODULE_NAME);
+    }
+  }
+
+  /**
+   * Register a handler for a specific message type
+   */
+  onMessage<T extends CltMessageType>(
+    type: T,
+    handler: MessageHandlerFn<ClientMessage>
+  ): void {
+    this.messageHandlers.set(type, handler);
+    syncLogger.debug('Registered message handler:', { type }, MODULE_NAME);
+  }
+
+  /**
+   * Remove a message handler
+   */
+  removeHandler(type: CltMessageType): void {
+    this.messageHandlers.delete(type);
+    syncLogger.debug('Removed message handler:', { type }, MODULE_NAME);
+  }
+
+  /**
+   * Remove all message handlers
+   */
+  clearHandlers(): void {
+    this.messageHandlers.clear();
+    syncLogger.debug('Cleared all message handlers', undefined, MODULE_NAME);
+  }
+
+  /**
+   * Check if WebSocket is connected
+   */
+  isConnected(): boolean {
+    return this.webSocket?.readyState === WS_READY_STATE.OPEN;
   }
 
   /**
@@ -164,6 +227,20 @@ export class SyncDO implements DurableObject {
               clientId,
               type: data.type
             }, MODULE_NAME);
+            
+            // Process the message with registered handlers if available
+            const handler = this.messageHandlers.get(data.type);
+            if (handler) {
+              handler(data).catch(error => {
+                syncLogger.error('Message handler error', {
+                  clientId,
+                  type: data.type,
+                  error: error instanceof Error ? error.message : String(error)
+                }, MODULE_NAME);
+              });
+            }
+            // If no handler is registered, we just log it but don't warn
+            // This allows the modules to use their own message handling logic (like waitForMessage)
           } catch (error) {
             syncLogger.error('WS message parse error', {
               clientId,
@@ -225,7 +302,8 @@ export class SyncDO implements DurableObject {
               await this.stateManager.initializeConnection();
               await this.init();
               
-              // Perform the initial sync
+              // Pass the raw WebSocket to performInitialSync
+              // Let the module manage its own message handling
               await performInitialSync(
                 context,
                 serverSocket,

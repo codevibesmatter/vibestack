@@ -32,4 +32,3 @@ export declare class SyncTester {
      */
     private validateSync;
 }
-//# sourceMappingURL=test-sync.d.ts.map

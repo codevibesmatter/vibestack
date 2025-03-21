@@ -1,7 +1,7 @@
 import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
 import type { SyncStateManager } from './state-manager';
-import type { SrvMessageType } from '@repo/sync-types';
+import type { SrvMessageType, ServerMessage, ClientMessage, CltMessageType } from '@repo/sync-types';
 
 /**
  * Extend WebSocket to include client data
@@ -45,6 +45,17 @@ export interface WebSocketClientData {
   lastMessageTimestamp?: number;
   connected: boolean;
   lastActivity?: number;
+}
+
+/**
+ * WebSocket message handler interface compatible with SyncDO's handler
+ */
+export interface WebSocketHandler {
+  send(message: ServerMessage): Promise<void>;
+  onMessage<T extends CltMessageType>(type: T, handler: (message: ClientMessage) => Promise<void>): void;
+  removeHandler(type: CltMessageType): void;
+  clearHandlers(): void;
+  isConnected(): boolean;
 }
 
 /**
