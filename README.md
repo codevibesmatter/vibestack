@@ -88,30 +88,16 @@ vibestack/
 └── docs/                  # Project documentation
 ```
 
-## Technical Architecture
+## Technical Implementation Details
 
-### Sync System
+### Change Tracking and Sync Flow
 
-VibeStack uses a modern, efficient approach to database synchronization:
-
-#### Server-Side Change Tracking
-
-- **WAL-Only Approach**: Directly reads from PostgreSQL's Write-Ahead Log (WAL) without requiring a separate change history table
-- **LSN Tracking**: Efficiently tracks Log Sequence Numbers (LSN) to know exactly where to resume synchronization
-- **Stateful Management**: Uses Cloudflare Durable Objects to maintain consistent state across requests
-
-#### Replication System
-
-- **Efficient Polling**: Only retrieves changes newer than the last processed position
-- **Resource Conservation**: Automatically hibernates when no clients are connected
-- **Real-time Notifications**: Immediately pushes changes to connected clients
-
-#### Sync Flow
-
-The system supports three main sync flows:
-1. **Initial Sync**: For new clients with no previous state
-2. **Catchup Sync**: For clients that have fallen behind
-3. **Live Sync**: For real-time bidirectional changes
+- **WAL-Based Change Capture**: Uses PostgreSQL's Write-Ahead Log for efficient change detection
+- **LSN (Log Sequence Number) Tracking**: Precisely tracks database changes without extra tables
+- **Sync Flow Types**:
+  1. **Initial Sync**: Complete data download for new clients
+  2. **Catchup Sync**: Selective updates for reconnecting clients
+  3. **Live Sync**: Real-time bidirectional updates
 
 ## Prerequisites
 
