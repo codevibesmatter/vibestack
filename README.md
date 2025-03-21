@@ -59,12 +59,18 @@ VibeStack is a sophisticated real-time synchronization system that enables seaml
 - **TypeORM Integration**: ORM and database toolkit
   - Entity definition with decorators
   - Relationship mapping
-  - Query building
+  - Direct SQL queries instead of query builders
 - **Schema Management**: Define entities with TypeScript decorators
 - **Type Generation**: Automatic TypeScript type generation
 - **Multi-Database Support**: Works with both server PostgreSQL and client PGLite
 - **Migration System**: Consistent schema across environments
 - **Table Categories**: Domain, System, and Utility table classifications
+- **Custom Entity Generator**: Smart context-aware entity management
+  - Generates separate server and client entity exports
+  - Uses decorators to control property/entity visibility (@ServerOnly, @ClientOnly)
+  - Automatically discovers and analyzes entity relationships
+  - Builds dependency hierarchies for efficient data synchronization
+  - Handles complex entity metadata filtering
 
 ## Project Structure
 
