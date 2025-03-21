@@ -56,6 +56,11 @@ export interface WebSocketHandler {
   removeHandler(type: CltMessageType): void;
   clearHandlers(): void;
   isConnected(): boolean;
+  waitForMessage(
+    type: CltMessageType, 
+    filter?: (msg: any) => boolean, 
+    timeoutMs?: number
+  ): Promise<any>;
 }
 
 /**

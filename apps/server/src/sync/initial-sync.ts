@@ -17,7 +17,7 @@ import type { QueryResultRow } from '@neondatabase/serverless';
 import { getDBClient } from '../lib/db';
 import type { WebSocket } from '../types/cloudflare';
 import type { StateManager } from './state-manager';
-import type { InitialSyncState } from './types';
+import type { InitialSyncState, WebSocketHandler } from './types';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 
 const MODULE_NAME = 'initial-sync';
@@ -45,14 +45,6 @@ interface ProcessTableOptions {
   chunkSize: number;
   startChunk?: number;
 }
-
-// WebSocket ready states
-const WS_READY_STATE = {
-  CONNECTING: 0,
-  OPEN: 1,
-  CLOSING: 2,
-  CLOSED: 3
-} as const;
 
 /**
  * Clean table name by removing quotes if present
@@ -168,220 +160,24 @@ async function getServerLSN(context: MinimalContext): Promise<string> {
 
 /**
  * Send a message to the client over WebSocket
+ * @deprecated Use messageHandler.send() instead
  */
-function sendMessage(websocket: WebSocket, message: ServerMessage): Promise<void> {
-  return new Promise((resolve, reject) => {
-    try {
-      if (websocket.readyState === WS_READY_STATE.OPEN) {
-        websocket.send(JSON.stringify(message));
-        // Only log important messages or just log the type
-        syncLogger.debug('Sent message', { type: message.type }, MODULE_NAME);
-        resolve();
-      } else {
-        const error = new Error('WebSocket not open');
-        syncLogger.error('Failed to send message', { type: message.type, readyState: websocket.readyState }, MODULE_NAME);
-        reject(error);
-      }
-    } catch (error) {
-      syncLogger.error('Error sending message', { type: message.type, error: error instanceof Error ? error.message : String(error) }, MODULE_NAME);
-      reject(error);
-    }
-  });
+function sendMessage(messageHandler: WebSocketHandler, message: ServerMessage): Promise<void> {
+  return messageHandler.send(message);
 }
 
 /**
  * Wait for a message of a specific type with optional filter
+ * @deprecated Use messageHandler.waitForMessage() instead
  */
 function waitForMessage(
-  websocket: WebSocket,
+  messageHandler: WebSocketHandler,
   clientId: string,
-  type: string, 
+  type: CltMessageType, 
   filter?: (msg: any) => boolean,
   timeoutMs: number = 30000 // Default timeout of 30 seconds
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // Only log for clt_init_processed, which is the final step in each table processing
-    if (type === 'clt_init_processed') {
-      syncLogger.debug('Waiting for final client confirmation', { clientId }, MODULE_NAME);
-    }
-    
-    // Flag to track if the promise has been resolved/rejected
-    let isCompleted = false;
-    
-    // Track processed message IDs to avoid duplicates
-    const processedMessageIds = new Set<string>();
-
-    // Create timeout to avoid hanging indefinitely
-    const timeoutId = setTimeout(() => {
-      if (isCompleted) return;
-      isCompleted = true;
-      
-      syncLogger.error('Timeout waiting for message', { 
-        clientId, 
-        type,
-        timeoutMs 
-      }, MODULE_NAME);
-      
-      // Clean up event listeners
-      websocket.addEventListener = null as any;
-      
-      reject(new Error(`Timeout waiting for message type: ${type}`));
-    }, timeoutMs);
-
-    // Create a message handler
-    const messageHandler = (event: { data: any }) => {
-      if (isCompleted) return;
-      
-      try {
-        const rawData = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
-        
-        let message;
-        try {
-          message = JSON.parse(rawData);
-        } catch (err) {
-          syncLogger.error('Failed to parse message JSON', {
-            clientId,
-            expectedType: type,
-            error: err instanceof Error ? err.message : String(err)
-          }, MODULE_NAME);
-          return; // Continue waiting for valid messages
-        }
-        
-        // Skip if we've already processed this message ID
-        if (message.messageId && processedMessageIds.has(message.messageId)) {
-          return;
-        }
-        
-        // Add this message ID to processed set to avoid duplicates
-        if (message.messageId) {
-          processedMessageIds.add(message.messageId);
-        }
-        
-        // Only process if this is a message we're specifically waiting for
-        if (message.type === type) {
-          // Basic validation for all message types
-          if (!message.messageId || !message.timestamp || !message.clientId) {
-            syncLogger.error('Message missing required base fields', {
-              clientId,
-              type
-            }, MODULE_NAME);
-            return; // Continue waiting
-          }
-          
-          // Type-specific validation
-          let isValid = true;
-          
-          switch (type) {
-            case 'clt_init_received':
-              if (!message.table || typeof message.table !== 'string') {
-                syncLogger.error('Invalid clt_init_received message: missing table', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              if (message.chunk === undefined || typeof message.chunk !== 'number') {
-                syncLogger.error('Invalid clt_init_received message: missing chunk', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              break;
-              
-            case 'clt_init_processed':
-              // Only needs the base fields
-              break;
-              
-            case 'clt_changes_received':
-              if (!Array.isArray(message.changeIds)) {
-                syncLogger.error('Invalid clt_changes_received message: missing changeIds array', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              if (!message.lastLSN || typeof message.lastLSN !== 'string') {
-                syncLogger.error('Invalid clt_changes_received message: missing lastLSN', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              break;
-              
-            case 'clt_changes_applied':
-              if (!Array.isArray(message.changeIds)) {
-                syncLogger.error('Invalid clt_changes_applied message: missing changeIds array', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              if (!message.lastLSN || typeof message.lastLSN !== 'string') {
-                syncLogger.error('Invalid clt_changes_applied message: missing lastLSN', { clientId }, MODULE_NAME);
-                isValid = false;
-              }
-              break;
-              
-            default:
-              // For other message types, just proceed with basic validation
-              break;
-          }
-          
-          if (!isValid) {
-            return; // Continue waiting for a valid message
-          }
-          
-          // Apply optional filter
-          if (filter && !filter(message)) {
-            // Don't log filter misses
-            return; // Wait for another message
-          }
-          
-          // Mark as completed and clear the timeout
-          isCompleted = true;
-          clearTimeout(timeoutId);
-          
-          // Only log completion for clt_init_processed
-          if (type === 'clt_init_processed') {
-            syncLogger.info('Client confirmed processing complete', { clientId }, MODULE_NAME);
-          }
-          
-          resolve();
-        }
-      } catch (err) {
-        syncLogger.error('Error in message handler', {
-          clientId,
-          expectedType: type,
-          error: err instanceof Error ? err.message : String(err)
-        }, MODULE_NAME);
-        
-        // Continue waiting for valid messages
-      }
-    };
-    
-    // Register the handler
-    websocket.addEventListener('message', messageHandler);
-    
-    // Also handle connection close
-    const closeHandler = (event: { code: number; reason: string }) => {
-      if (isCompleted) return;
-      isCompleted = true;
-      clearTimeout(timeoutId);
-      
-      syncLogger.error('WebSocket closed while waiting for message', { 
-        clientId, 
-        type,
-        code: event.code,
-        reason: event.reason
-      }, MODULE_NAME);
-      
-      reject(new Error(`WebSocket closed while waiting for message: ${event.code} - ${event.reason}`));
-    };
-    
-    websocket.addEventListener('close', closeHandler);
-    
-    // Immediately check if WebSocket is already closed/closing
-    if (websocket.readyState !== WS_READY_STATE.OPEN) {
-      if (isCompleted) return;
-      isCompleted = true;
-      clearTimeout(timeoutId);
-      
-      syncLogger.error('WebSocket not open while waiting for message', { 
-        clientId, 
-        type,
-        readyState: websocket.readyState
-      }, MODULE_NAME);
-      
-      reject(new Error('WebSocket not open'));
-    }
-  });
+  return messageHandler.waitForMessage(type, filter, timeoutMs);
 }
 
 /**
@@ -392,7 +188,7 @@ async function processTable(
   clientId: string,
   table: string,
   stateManager: StateManager,
-  websocket: WebSocket
+  messageHandler: WebSocketHandler
 ): Promise<void> {
   // Get current sync state
   const syncState = await stateManager.getInitialSyncProgress(clientId);
@@ -421,12 +217,10 @@ async function processTable(
           total
         }
       };
-      await sendMessage(websocket, initChangesMsg);
+      await messageHandler.send(initChangesMsg);
       
       // Wait for client to acknowledge receipt
-      await waitForMessage(
-        websocket,
-        clientId,
+      await messageHandler.waitForMessage(
         'clt_init_received',
         (msg) => msg.table === table && msg.chunk === chunkNum
       );
@@ -444,7 +238,7 @@ async function sendInitialSyncComplete(
   context: MinimalContext,
   clientId: string,
   startLSN: string,
-  websocket: WebSocket
+  messageHandler: WebSocketHandler
 ): Promise<void> {
   const initCompleteMsg: ServerInitCompleteMessage = {
     type: 'srv_init_complete',
@@ -453,10 +247,10 @@ async function sendInitialSyncComplete(
     timestamp: Date.now(),
     clientId
   };
-  await sendMessage(websocket, initCompleteMsg);
+  await messageHandler.send(initCompleteMsg);
   
   // Wait for client to acknowledge processing
-  await waitForMessage(websocket, clientId, 'clt_init_processed');
+  await messageHandler.waitForMessage('clt_init_processed');
 }
 
 /**
@@ -465,7 +259,7 @@ async function sendInitialSyncComplete(
  */
 export async function performInitialSync(
   context: MinimalContext,
-  websocket: WebSocket,
+  messageHandler: WebSocketHandler,
   stateManager: StateManager,
   clientId: string
 ): Promise<void> {
@@ -506,7 +300,7 @@ export async function performInitialSync(
         serverLSN
       };
       
-      await sendMessage(websocket, initStartMsg);
+      await messageHandler.send(initStartMsg);
     }
 
     // If resuming, send resume message
@@ -519,7 +313,7 @@ export async function performInitialSync(
         serverLSN: syncState.startLSN + ' (resuming)'
       };
       
-      await sendMessage(websocket, resumeMsg);
+      await messageHandler.send(resumeMsg);
     }
 
     // Get ordered tables for sync
@@ -541,7 +335,7 @@ export async function performInitialSync(
       await stateManager.saveInitialSyncProgress(clientId, syncState);
 
       // Process this table
-      await processTable(context, clientId, tableName, stateManager, websocket);
+      await processTable(context, clientId, tableName, stateManager, messageHandler);
 
       // Mark table as completed
       syncState.completedTables.push(tableName);
@@ -556,7 +350,7 @@ export async function performInitialSync(
     const serverLSN = await stateManager.getServerLSN();
     
     // Send sync complete message and wait for client processing
-    await sendInitialSyncComplete(context, clientId, serverLSN, websocket);
+    await sendInitialSyncComplete(context, clientId, serverLSN, messageHandler);
 
     // Update client's LSN
     await stateManager.updateClientLSN(clientId, serverLSN);
@@ -573,7 +367,7 @@ export async function performInitialSync(
       lsn: serverLSN
     };
 
-    await sendMessage(websocket, lsnUpdateMsg);
+    await messageHandler.send(lsnUpdateMsg);
     
     // Calculate sync time
     if (syncState.startTimeMs) {
@@ -588,15 +382,7 @@ export async function performInitialSync(
   } catch (error) {
     syncLogger.error('Initial sync error', { clientId, error: error instanceof Error ? error.message : String(error) }, MODULE_NAME);
 
-    // Try to close connection with error code
-    try {
-      if (websocket.readyState === WS_READY_STATE.OPEN) {
-        websocket.close(1011, 'Error during initial sync');
-      }
-    } catch (closeError) {
-      syncLogger.error('Error closing WebSocket', { clientId, error: closeError instanceof Error ? closeError.message : String(closeError) }, MODULE_NAME);
-    }
-
+    // No need to manually close the WebSocket - this should be handled by the SyncDO
     throw error;
   }
 } 

@@ -7,7 +7,7 @@ import type {
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
-import type { WebSocketMessageHandler } from './websocket-handler';
+import type { WebSocketHandler } from './types';
 import { SERVER_TABLE_HIERARCHY } from '@repo/dataforge/server-entities';
 import { getDBClient } from '../lib/db';
 import type { WALChange, ChunkOptions, ChunkResult } from '../types/wal';
@@ -68,7 +68,7 @@ async function sendChanges(
   changes: TableChange[],
   lastLSN: string,
   clientId: string,
-  messageHandler: WebSocketMessageHandler
+  messageHandler: WebSocketHandler
 ): Promise<boolean> {
   if (!changes.length) {
     return false;
@@ -224,7 +224,7 @@ export async function performCatchupSync(
   context: MinimalContext,
   clientId: string,
   startLSN: string,
-  messageHandler: WebSocketMessageHandler
+  messageHandler: WebSocketHandler
 ): Promise<void> {
   syncLogger.info('Catchup sync started', {
     clientId,
@@ -264,7 +264,7 @@ export async function handleNewChanges(
   changes: TableChange[],
   lastLSN: string,
   clientId: string,
-  messageHandler: WebSocketMessageHandler
+  messageHandler: WebSocketHandler
 ): Promise<boolean> {
   try {
     // Send changes to client

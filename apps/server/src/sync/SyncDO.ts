@@ -40,6 +40,8 @@ export class SyncDO implements DurableObject {
   private context: MinimalContext;
   // Add message handlers map
   private messageHandlers = new Map<CltMessageType, MessageHandlerFn<ClientMessage>>();
+  // Add a separate map for temporary handlers used by waitForMessage
+  private tempMessageHandlers = new Map<string, (message: any) => void>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -155,6 +157,86 @@ export class SyncDO implements DurableObject {
   }
 
   /**
+   * Wait for a message of a specific type with optional filter
+   */
+  waitForMessage(
+    type: CltMessageType,
+    filter?: (msg: any) => boolean,
+    timeoutMs: number = 30000 // Default timeout of 30 seconds
+  ): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.webSocket || this.webSocket.readyState !== WS_READY_STATE.OPEN) {
+        return reject(new Error('WebSocket not open'));
+      }
+      
+      // Flag to track if the promise has been resolved/rejected
+      let isCompleted = false;
+      
+      // Create a unique handler ID for this specific wait operation
+      const handlerId = `${type}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Create timeout to avoid hanging indefinitely
+      const timeoutId = setTimeout(() => {
+        if (isCompleted) return;
+        isCompleted = true;
+        
+        // Remove the temporary message handler
+        this.tempMessageHandlers.delete(handlerId);
+        
+        syncLogger.error('Timeout waiting for message', { 
+          type,
+          timeoutMs 
+        }, MODULE_NAME);
+        
+        reject(new Error(`Timeout waiting for message type: ${type}`));
+      }, timeoutMs);
+
+      // Create a temporary message handler for this specific message type
+      const messageHandler = (message: any) => {
+        // Skip processing if we're already done
+        if (isCompleted) return;
+        
+        // Apply filter if provided
+        if (filter && !filter(message)) {
+          return; // This message doesn't match our filter criteria
+        }
+        
+        // Message matches what we're waiting for
+        clearTimeout(timeoutId);
+        isCompleted = true;
+        
+        // Remove the temporary message handler
+        this.tempMessageHandlers.delete(handlerId);
+        
+        // Resolve with the message
+        resolve(message);
+      };
+      
+      // Register temporary message handler
+      this.tempMessageHandlers.set(handlerId, messageHandler);
+      
+      // Also register to actual type so it's processed by the message listener
+      const existingHandler = this.messageHandlers.get(type);
+      const wrappedHandler: MessageHandlerFn<ClientMessage> = async (message) => {
+        // Call existing handler if any
+        if (existingHandler) {
+          await existingHandler(message);
+        }
+        
+        // Process through all temporary handlers for this type
+        for (const [id, handler] of this.tempMessageHandlers.entries()) {
+          if (id.startsWith(type)) {
+            handler(message);
+          }
+        }
+      };
+      
+      // Set or update the handler
+      this.messageHandlers.set(type, wrappedHandler);
+    });
+  }
+
+  /**
    * Handle inbound request (HTTP or WebSocket)
    */
   async fetch(request: Request): Promise<Response> {
@@ -223,7 +305,7 @@ export class SyncDO implements DurableObject {
               ? JSON.parse(event.data) 
               : JSON.parse(new TextDecoder().decode(event.data));
             
-            syncLogger.debug('WS message', {
+            syncLogger.debug('Message Received', {
               clientId,
               type: data.type
             }, MODULE_NAME);
@@ -242,7 +324,7 @@ export class SyncDO implements DurableObject {
             // If no handler is registered, we just log it but don't warn
             // This allows the modules to use their own message handling logic (like waitForMessage)
           } catch (error) {
-            syncLogger.error('WS message parse error', {
+            syncLogger.error('Message parse error', {
               clientId,
               error: error instanceof Error ? error.message : String(error)
             }, MODULE_NAME);
@@ -306,7 +388,7 @@ export class SyncDO implements DurableObject {
               // Let the module manage its own message handling
               await performInitialSync(
                 context,
-                serverSocket,
+                this, // Pass 'this' as the WebSocketHandler implementation
                 this.stateManager,
                 clientId
               );

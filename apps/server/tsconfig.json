@@ -1,5 +1,4 @@
 {
-	"extends": "../../packages/typescript-config/base.json",
 	"compilerOptions": {
 		/* Visit https://aka.ms/tsconfig.json to read more about this file */
 
@@ -38,9 +37,11 @@
 		"outDir": "./dist",
 		"baseUrl": ".",
 		"paths": {
-			"@repo/shared-types": ["../../packages/shared-types/src"],
-			"@repo/sync-types": ["../../packages/sync-types/src"]
-		}
+			"@repo/sync-types": ["../../packages/sync-types/src"],
+			"@repo/dataforge/*": ["../../packages/dataforge/src/*"]
+		},
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true
 	},
 	"include": ["src/**/*", "worker-configuration.d.ts"],
 	"exclude": ["node_modules", "dist"]

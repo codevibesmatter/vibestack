@@ -12,7 +12,7 @@ import {
 import { syncLogger } from '../middleware/logger';
 import { getDBClient } from '../lib/db';
 import type { MinimalContext } from '../types/hono';
-import type { WebSocketMessageHandler } from './websocket-handler';
+import type { WebSocketHandler } from './types';
 import type { StateManager } from './state-manager';
 
 const MODULE_NAME = 'client-changes';
@@ -312,7 +312,7 @@ export class ClientChangeHandler {
   async sendChangesReceived(
     clientId: string,
     changeIds: string[],
-    messageHandler: WebSocketMessageHandler
+    messageHandler: WebSocketHandler
   ): Promise<void> {
     const message: ServerReceivedMessage = {
       type: 'srv_changes_received',
@@ -343,7 +343,7 @@ export class ClientChangeHandler {
   async sendChangesApplied(
     clientId: string,
     changeIds: string[],
-    messageHandler: WebSocketMessageHandler,
+    messageHandler: WebSocketHandler,
     success: boolean,
     error?: Error
   ): Promise<void> {
@@ -380,7 +380,7 @@ export class ClientChangeHandler {
 export async function processClientChanges(
   message: ClientChangesMessage,
   context: MinimalContext,
-  messageHandler: WebSocketMessageHandler
+  messageHandler: WebSocketHandler
 ): Promise<void> {
   syncLogger.info('Processing batch changes', {
     clientId: message.clientId,
