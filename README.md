@@ -1,7 +1,5 @@
 # VibeStack
 
-A modular, type-safe real-time sync system built with TypeScript and WebSocket technology.
-
 ## Overview
 
 VibeStack is a sophisticated real-time synchronization system that enables seamless data synchronization between clients and servers. It's designed to be modular, type-safe, and highly performant, making it ideal for applications requiring real-time updates and state management.
@@ -10,25 +8,74 @@ VibeStack is a sophisticated real-time synchronization system that enables seaml
 
 ## Features
 
-- 🔄 Real-time bidirectional synchronization
-- 📦 Modular architecture with clear separation of concerns
-- 🔒 Type-safe implementation with TypeScript
-- 🚀 Efficient WebSocket-based communication
-- 📊 Built-in support for chunked data transfer
-- 📝 WAL-only server-side change tracking (no separate change history table)
-- 🔁 Efficient LSN-based polling mechanism
-- 🛌 Intelligent hibernation for resource conservation
-- 🔍 Comprehensive testing suite
-- 🛠️ Monorepo structure using Turborepo and pnpm
+- ✨ **Offline-First Architecture** - Continue working without an internet connection
+- 🔄 **Bi-directional Sync** - Changes flow seamlessly between server and clients
+- 🚀 **Edge-Powered Backend** - Globally distributed with minimal latency
+- 💾 **Full SQL in the Browser** - Complete PostgreSQL capabilities via WebAssembly
+- 🧠 **Local LLM & NLP Support** - PGLite pgvector extension support for vector embeddings and AI features
+- 🛡️ **Enterprise-Grade Security** - End-to-end data protection with access controls
+- 🔌 **Zero Infrastructure** - Serverless deployment with no management overhead
+- 🧰 **Developer Experience** - Type-safe APIs with excellent tooling support
+
+
+## Core Components
+
+### 1. Server Architecture
+
+- **Single Cloudflare Worker**: Serverless edge runtime for the entire backend
+  - Zero infrastructure management
+  - Global edge distribution
+  - Automatic scaling with traffic demands
+- **Hono HTTP Framework**: Lightweight, high-performance API server
+- **Neon PostgreSQL**: Serverless Postgres database
+  - WAL (Write-Ahead Log) based change capture
+  - Built-in replication capabilities
+  - Branching for development environments
+- **ReplicationDO (Durable Object)**: Manages database replication with PostgreSQL's WAL
+  - Polls for changes in the database
+  - Maintains replication state and log sequence numbers (LSN)
+  - Notifies clients of changes in real-time
+- **SyncDO (Durable Object)**: Per-client sync manager
+  - Manages WebSocket connections for individual clients
+  - Filters changes relevant to specific clients
+  - Handles client-to-server data synchronization
+  - Maintains client session state
+  - Implements conflict resolution and last-write-wins semantics
+
+### 2. Client Application
+
+- **React Frontend**: Modern, responsive user interface
+- **PGLite Integration**: PostgreSQL in WebAssembly
+  - Full SQL database running in the browser
+  - Persistent storage with IndexedDB
+  - Support for complex queries and transactions
+- **WebSocket Sync**: Real-time data synchronization
+  - Bidirectional communication with server
+  - Efficient change propagation
+  - Conflict resolution
+
+### 3. DataForge Entity Manager
+
+- **TypeORM Integration**: ORM and database toolkit
+  - Entity definition with decorators
+  - Relationship mapping
+  - Query building
+- **Schema Management**: Define entities with TypeScript decorators
+- **Type Generation**: Automatic TypeScript type generation
+- **Multi-Database Support**: Works with both server PostgreSQL and client PGLite
+- **Migration System**: Consistent schema across environments
+- **Table Categories**: Domain, System, and Utility table classifications
 
 ## Project Structure
 
 ```
 vibestack/
 ├── apps/                    # Application implementations
+│   ├── server/             # Hono server with ReplicationDO and SyncDO
+│   └── web/                # React client with PGLite integration
 ├── packages/               # Shared packages
 │   ├── sync-test/         # Testing utilities for sync functionality
-│   ├── dataforge/         # Database integration layer
+│   ├── dataforge/         # Database integration and entity management
 │   ├── sync-types/        # Shared type definitions for sync
 │   ├── config/            # Configuration packages
 │   └── typescript-config/ # TypeScript configuration

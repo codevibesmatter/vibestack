@@ -56,3 +56,6 @@ logs
 
 # Test state
 .lsn-state.json
+
+# Documentation
+docs/
