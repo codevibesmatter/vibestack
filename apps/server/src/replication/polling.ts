@@ -5,7 +5,7 @@ import { replicationLogger } from '../middleware/logger';
 import { getDBClient, sql } from '../lib/db';
 import type { MinimalContext } from '../types/hono';
 import type { TableChange } from '@repo/sync-types';
-import { processWALChanges, processAndConsumeWALChanges } from './changes';
+import { processWALChanges, processAndConsumeWALChanges } from './process-changes';
 import { ClientManager } from './client-manager';
 import { StateManager } from './state-manager';
 import type { DurableObjectState } from '../types/cloudflare';
