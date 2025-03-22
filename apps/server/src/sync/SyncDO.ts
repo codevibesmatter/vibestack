@@ -6,6 +6,7 @@ import { syncLogger } from '../middleware/logger';
 import { createMinimalContext } from '../types/hono';
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
+import { performCatchupSync } from './server-changes';
 import { 
   ServerMessage,
   ClientMessage,
@@ -65,7 +66,7 @@ export class SyncDO implements DurableObject {
   }
 
   /**
-   * Initialize replication if needed
+   * Initialize replication if needed and wait for initial poll
    */
   private async init() {
     try {
@@ -76,6 +77,17 @@ export class SyncDO implements DurableObject {
       if (!response.ok) {
         throw new Error(`Failed to start replication: ${response.statusText}`);
       }
+      
+      // Wait for initial poll to complete
+      const waitResponse = await replication.fetch(new Request('http://internal/api/replication/wait-for-initial-poll'));
+      
+      if (!waitResponse.ok) {
+        throw new Error(`Failed to wait for initial poll: ${waitResponse.statusText}`);
+      }
+      
+      syncLogger.info('Replication initialization and initial poll completed', {
+        syncId: this.syncId
+      }, MODULE_NAME);
     } catch (err) {
       syncLogger.error('Replication init failed', {
         syncId: this.syncId,
@@ -368,10 +380,13 @@ export class SyncDO implements DurableObject {
         // Create proper minimal context for operations
         const context = this.getContext();
 
-        // Since the URL already contains clientId and LSN, initiate sync directly
+        // Check if the client already has a recent LSN and needs catchup sync
+        const needsCatchupSync = lsn !== '0/0';
+        
         syncLogger.info('Initiating sync', { 
           clientId,
-          lsn: lsn === '0/0' ? '0/0' : 'specified'
+          lsn,
+          syncType: needsCatchupSync ? 'catchup' : 'initial'
         }, MODULE_NAME);
         
         // Immediately register client and start sync process in background
@@ -384,16 +399,30 @@ export class SyncDO implements DurableObject {
               await this.stateManager.initializeConnection();
               await this.init();
               
-              // Pass the raw WebSocket to performInitialSync
-              // Let the module manage its own message handling
-              await performInitialSync(
-                context,
-                this, // Pass 'this' as the WebSocketHandler implementation
-                this.stateManager,
-                clientId
-              );
+              if (needsCatchupSync) {
+                // Perform catchup sync for clients with an existing LSN
+                syncLogger.info('Starting catchup sync', { clientId, startLSN: lsn }, MODULE_NAME);
+                await performCatchupSync(
+                  context,
+                  clientId,
+                  lsn,
+                  this // Pass 'this' as the WebSocketHandler implementation
+                );
+              } else {
+                // Perform initial sync for new clients
+                syncLogger.info('Starting initial sync', { clientId }, MODULE_NAME);
+                await performInitialSync(
+                  context,
+                  this, // Pass 'this' as the WebSocketHandler implementation
+                  this.stateManager,
+                  clientId
+                );
+              }
               
-              syncLogger.info('Sync completed', { clientId }, MODULE_NAME);
+              syncLogger.info('Sync completed', { 
+                clientId, 
+                syncType: needsCatchupSync ? 'catchup' : 'initial' 
+              }, MODULE_NAME);
             } catch (error) {
               syncLogger.error('Sync failed', {
                 clientId,

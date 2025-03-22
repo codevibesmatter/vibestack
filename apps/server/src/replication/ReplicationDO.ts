@@ -126,6 +126,8 @@ export class ReplicationDO implements DurableObject {
           return this.handleStatus();
         case '/clients':
           return this.handleClients();
+        case '/wait-for-initial-poll':
+          return this.handleWaitForInitialPoll();
       }
     }
 
@@ -381,6 +383,45 @@ export class ReplicationDO implements DurableObject {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       return Response.json({ error: 'Failed to get clients' }, { status: 500 });
+    }
+  }
+
+  /**
+   * Wait for initial poll to complete
+   */
+  private async handleWaitForInitialPoll(): Promise<Response> {
+    try {
+      if (!this.pollingManager) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Polling manager not initialized'
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      replicationLogger.debug('Waiting for initial poll to complete', {}, MODULE_NAME);
+      await this.pollingManager.waitForInitialPoll();
+      replicationLogger.info('Initial poll completed', {}, MODULE_NAME);
+      
+      return new Response(JSON.stringify({
+        success: true,
+        message: 'Initial poll completed'
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      replicationLogger.error('Wait for initial poll error', { error: errorMessage }, MODULE_NAME);
+      return new Response(JSON.stringify({
+        success: false,
+        error: errorMessage
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
   }
 } 

@@ -2,10 +2,10 @@ import type { Client } from '@neondatabase/serverless';
 import type { Env } from '../types/env';
 import type { ReplicationConfig } from './types';
 import { replicationLogger } from '../middleware/logger';
-import { getDBClient } from '../lib/db';
+import { getDBClient, sql } from '../lib/db';
 import type { MinimalContext } from '../types/hono';
 import type { TableChange } from '@repo/sync-types';
-import { processWALChanges } from './changes';
+import { processWALChanges, processAndConsumeWALChanges } from './changes';
 import { ClientManager } from './client-manager';
 import { StateManager } from './state-manager';
 import type { DurableObjectState } from '../types/cloudflare';
@@ -67,7 +67,39 @@ export class PollingManager {
   public async startPolling(): Promise<void> {
     try {
       // Do initial poll to catch up on changes
-      await this.pollForChanges();
+      const changes = await this.pollForChanges();
+      
+      // Process any changes found during initial poll
+      if (changes && changes.length > 0) {
+        replicationLogger.info('Processing changes from initial poll', {
+          count: changes.length
+        }, MODULE_NAME);
+        
+        // Process and consume WAL changes before marking initial poll as complete
+        const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
+          changes,
+          this.clientManager,
+          this.c,
+          this.stateManager,
+          this.config.slot
+        );
+        
+        replicationLogger.info('Initial poll change processing completed', {
+          success,
+          storedChanges,
+          consumedChanges,
+          changeCount: changes.length
+        }, MODULE_NAME);
+        
+        if (!success) {
+          replicationLogger.warn('Initial poll processing had issues, but continuing', {
+            storedChanges,
+            consumedChanges
+          }, MODULE_NAME);
+        }
+      } else {
+        replicationLogger.info('No changes found in initial poll', {}, MODULE_NAME);
+      }
       
       // Mark first poll complete and resolve promise
       this.hasCompletedFirstPoll = true;
@@ -144,13 +176,26 @@ export class PollingManager {
    */
   private async checkClientsAndPoll(): Promise<void> {
     try {
-      // Poll for changes first - this is fast since it just checks LSN
+      // Poll for changes - this only peeks at changes without consuming them
       const changes = await this.pollForChanges();
       
       // Process changes if any were found
       if (changes && changes.length > 0) {
-        // Process and send changes to clients
-        await processWALChanges(changes, this.clientManager);
+        // Let the changes module handle processing, storage, and LSN advancement
+        const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
+          changes,
+          this.clientManager,
+          this.c,
+          this.stateManager,
+          this.config.slot
+        );
+        
+        replicationLogger.info('Completed WAL change processing cycle', {
+          success,
+          storedChanges,
+          consumedChanges,
+          changeCount: changes.length
+        }, MODULE_NAME);
       }
     } catch (err) {
       replicationLogger.error('Poll cycle error', {
@@ -177,59 +222,54 @@ export class PollingManager {
   }
 
   /**
-   * Poll for new changes
+   * Poll for new changes without advancing the LSN
    */
   private async pollForChanges(): Promise<WALData[] | null> {
     try {
-      const client = getDBClient(this.c);
-      await client.connect();
-      try {
-        // Get current LSN from state manager
-        const currentLSN = await this.stateManager.getLSN();
+      // Get current LSN from state manager
+      const currentLSN = await this.stateManager.getLSN();
 
-        const result = await client.query(`
-          SELECT data, lsn, xid 
-          FROM pg_logical_slot_peek_changes(
-            $1,
-            NULL,
-            NULL,
-            'include-xids', '1',
-            'include-timestamp', 'true'
-          )
-          WHERE lsn > $2::pg_lsn
-          LIMIT 100;
-        `, [this.config.slot, currentLSN]);
-        
-        // Map changes to our format
-        const newChanges = result.rows.map(row => ({
-          data: row.data,
-          lsn: row.lsn,
-          xid: row.xid
-        }));
+      // Use peek_changes which doesn't consume/advance the WAL
+      const query = `
+        SELECT data, lsn, xid 
+        FROM pg_logical_slot_peek_changes(
+          $1,
+          NULL,
+          NULL,
+          'include-xids', '1',
+          'include-timestamp', 'true'
+        )
+        WHERE lsn > $2::pg_lsn
+        LIMIT 100;
+      `;
+      
+      // Use sql helper which manages connections automatically
+      const rows = await sql(this.c, query, [this.config.slot, currentLSN]);
+      
+      // Map changes to our format
+      const newChanges = rows.map(row => ({
+        data: row.data as string,
+        lsn: row.lsn as string,
+        xid: row.xid as string
+      }));
 
-        // If we have changes, update LSN and return them
-        if (newChanges.length > 0) {
-          const lastLSN = newChanges[newChanges.length - 1].lsn;
-          await this.stateManager.setLSN(lastLSN);
-          
-          replicationLogger.info('WAL changes found', {
-            count: newChanges.length,
-            currentLSN: lastLSN,
-            previousLSN: currentLSN
-          }, MODULE_NAME);
-          
-          return newChanges;
-        } else if (!this.hasCompletedFirstPoll) {
-          // Only log no changes during initial poll
-          replicationLogger.debug('No changes in initial poll', {
-            currentLSN
-          }, MODULE_NAME);
-        }
+      // Log if we found changes, but don't advance LSN - that's now handled in changes module
+      if (newChanges.length > 0) {
+        replicationLogger.info('WAL changes found', {
+          count: newChanges.length,
+          currentLSN,
+          lastLSN: newChanges[newChanges.length - 1].lsn
+        }, MODULE_NAME);
         
-        return null;
-      } finally {
-        await client.end();
+        return newChanges;
+      } else if (!this.hasCompletedFirstPoll) {
+        // Only log no changes during initial poll
+        replicationLogger.debug('No changes in initial poll', {
+          currentLSN
+        }, MODULE_NAME);
       }
+      
+      return null;
     } catch (err) {
       replicationLogger.error('Polling error', {
         error: err instanceof Error ? err.message : String(err)
