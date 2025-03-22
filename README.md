@@ -1,20 +1,16 @@
 # VibeStack
 
-## Overview
+## A full stack, local first, edge and AI native framework for data intensive web applications.
 
-VibeStack is a sophisticated real-time synchronization system that enables seamless data synchronization between clients and servers. It's designed to be modular, type-safe, and highly performant, making it ideal for applications requiring real-time updates and state management.
-
-> **TODO:** Client-side alignment and simplification to align with server-side changes.
-
-## Features
+## Vision
 
 - ✨ **Offline-First Architecture** - Continue working without an internet connection
 - 🔄 **Bi-directional Sync** - Changes flow seamlessly between server and clients
-- 🚀 **Edge-Powered Backend** - Globally distributed with minimal latency
 - 💾 **Full SQL in the Browser** - Complete PostgreSQL capabilities via WebAssembly
-- 🧠 **Local LLM & NLP Support** - PGLite pgvector extension support for vector embeddings and AI features
-- 🛡️ **Enterprise-Grade Security** - End-to-end data protection with access controls
+- 🧠 **Local LLM & NLP Support** - Local, in-browser models for day-to-day operations with heavy loads offloaded to APIs
 - 🔌 **Zero Infrastructure** - Serverless deployment with no management overhead
+- 🚀 **Edge-Powered Backend** - Cloudflare prmitives and Neon Postgres for low
+- Fully automatic LLM freidnly data modal, schema, migration and api factory from a central hub
 - 🧰 **Developer Experience** - Type-safe APIs with excellent tooling support
 
 
@@ -112,7 +108,6 @@ vibestack/
    git clone git@github.com:codevibesmatter/vibestack.git
    cd vibestack
    ```
-
 2. Install dependencies:
    ```bash
    pnpm install

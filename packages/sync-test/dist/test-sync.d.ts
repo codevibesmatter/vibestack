@@ -9,7 +9,7 @@ export declare class SyncTester {
     private ws;
     private currentState;
     constructor(config?: Partial<Config>);
-    connect(): Promise<void>;
+    connect(startingLSN?: string, clientId?: string): Promise<void>;
     disconnect(code?: number, reason?: string): Promise<void>;
     sendMessage(message: Message): Promise<void>;
     private handleMessage;
@@ -17,7 +17,14 @@ export declare class SyncTester {
     getLastMessage<T extends Message>(type: string): T | undefined;
     getCurrentState(): 'initial' | 'catchup' | 'live';
     clearMessageLog(): void;
+    /**
+     * Get the message log for analysis
+     */
     getMessageLog(): Message[];
+    /**
+     * Get the client ID
+     */
+    getClientId(): string;
     protected nextMessageId(): string;
     /**
      * Run the test scenario

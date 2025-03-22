@@ -1,7 +1,8 @@
-import { replicationLogger } from '../middleware/logger';
-import type { Env } from '../types/env';
 import type { DurableObjectState } from '../types/cloudflare';
 import type { TableChange } from '@repo/sync-types';
+import { replicationLogger } from '../middleware/logger';
+import type { Env } from '../types/env';
+import type { MinimalContext } from '../types/hono';
 
 const MODULE_NAME = 'client-manager';
 
@@ -23,6 +24,11 @@ export interface ClientState {
   clientId: string;
   active: boolean;
   lastSeen: number;
+}
+
+// Extend TableChange for our internal use to include LSN
+interface ReplicationTableChange extends TableChange {
+  lsn: string;
 }
 
 /**
@@ -183,52 +189,30 @@ export class ClientManager {
   }
 
   /**
-   * Handle changes and notify relevant clients
+   * Broadcast changes to all connected clients
    */
-  async handleChanges(changes: TableChange[]): Promise<void> {
+  async broadcastChanges(changes: TableChange[]): Promise<void> {
     try {
-      // Get all active clients from KV
-      const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
-      const clientsToNotify: string[] = [];
-
-      // Check each client's state
-      for (const key of keys) {
-        const value = await this.env.CLIENT_REGISTRY.get(key.name);
-        if (!value) continue;
-
-        const state = JSON.parse(value);
-        if (!state.active) continue;
-
-        const clientId = key.name.replace('client:', '');
-        
-        // Filter out clients that originated all the changes
-        const clientChanges = changes.filter(change => 
-          change.data?.client_id === clientId
-        );
-
-        if (clientChanges.length !== changes.length) {
-          clientsToNotify.push(clientId);
-        }
-      }
-
-      // Only proceed with notifications if we have clients to notify
-      if (clientsToNotify.length > 0) {
-        // Notify each relevant client
-        let notifiedCount = 0;
-        for (const clientId of clientsToNotify) {
-          const success = await this.wakeUpClient(clientId, changes);
-          if (success) notifiedCount++;
-        }
-        
-        if (notifiedCount > 0) {
-          replicationLogger.info('Clients notified', {
-            notifiedCount,
-            totalClients: clientsToNotify.length
-          }, MODULE_NAME);
-        }
-      }
+      replicationLogger.info('Changes received for broadcasting', {
+        count: changes.length,
+        tables: Array.from(new Set(changes.map(c => c.table)))
+      }, MODULE_NAME);
+      
+      // NOTE: Client notification has been refactored
+      // Previously, this code attempted to notify clients in real-time via the Sync DO,
+      // but that approach was replaced with a more reliable pull-based model where
+      // clients query the change_history table directly when they reconnect.
+      //
+      // Changes are now stored in the change_history table by the replication system,
+      // and clients will retrieve them on their next sync cycle based on their last known LSN.
+      
+      replicationLogger.debug('Changes saved to history table, clients will retrieve on next sync', {
+        count: changes.length
+      }, MODULE_NAME);
+      
+      return;
     } catch (error) {
-      replicationLogger.error('Changes handling failed', {
+      replicationLogger.error('Changes broadcasting failed', {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       throw error;
@@ -271,7 +255,12 @@ export class ClientManager {
           count: changes.length 
         }, MODULE_NAME);
         
-        const response = await syncDO.fetch('http://internal/new-changes', {
+        // Create the URL with required parameters
+        const url = new URL('http://internal/new-changes');
+        url.searchParams.set('clientId', clientId);
+        url.searchParams.set('lsn', '0/0'); // Default value when we don't have LSN info
+        
+        const response = await syncDO.fetch(url.toString(), {
           method: 'POST',
           body: JSON.stringify({ changes })
         });
@@ -303,6 +292,28 @@ export class ClientManager {
       }, MODULE_NAME);
       return false;
     }
+  }
+
+  /**
+   * Compare two LSNs (Logical Sequence Numbers)
+   * Returns true if lsn1 > lsn2, false otherwise
+   */
+  private compareLSNs(lsn1: string, lsn2: string): boolean {
+    if (lsn1 === lsn2) return false;
+    if (lsn2 === '0/0') return true;
+    if (lsn1 === '0/0') return false;
+    
+    // Parse LSNs (format: "X/Y")
+    const [major1, minor1] = lsn1.split('/').map(Number);
+    const [major2, minor2] = lsn2.split('/').map(Number);
+    
+    // Compare major parts
+    if (major1 !== major2) {
+      return major1 > major2;
+    }
+    
+    // If major parts are equal, compare minor parts
+    return minor1 > minor2;
   }
 
   /**

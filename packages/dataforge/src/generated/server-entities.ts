@@ -1,5 +1,6 @@
 // Generated server entities - DO NOT EDIT
 
+export * from '../entities/ChangeHistory.js';
 export * from '../entities/ClientMigration.js';
 export * from '../entities/Comment.js';
 export * from '../entities/HealthCheckState.js';
@@ -7,6 +8,7 @@ export * from '../entities/Project.js';
 export * from '../entities/Task.js';
 export * from '../entities/User.js';
 
+import { ChangeHistory } from '../entities/ChangeHistory.js';
 import { ClientMigration } from '../entities/ClientMigration.js';
 import { Comment } from '../entities/Comment.js';
 import { HealthCheckState } from '../entities/HealthCheckState.js';
@@ -16,6 +18,7 @@ import { User } from '../entities/User.js';
 
 // Export entity array for TypeORM
 export const serverEntities = [
+  ChangeHistory,
   ClientMigration,
   Comment,
   HealthCheckState,
@@ -44,6 +47,7 @@ export const SERVER_DOMAIN_TABLES = [
 
 // system tables for server context
 export const SERVER_SYSTEM_TABLES = [
+  '"change_history"',
   '"client_migration"',
   '"health_check_state"',
 ] as const;

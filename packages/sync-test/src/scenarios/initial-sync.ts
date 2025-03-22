@@ -510,7 +510,7 @@ async function testInitialSync() {
     // Save the LSN for future tests
     const finalLSN = tester.getLastMessage<ServerInitCompleteMessage>('srv_init_complete')?.serverLSN;
     if (finalLSN) {
-      const lsnFilePath = path.resolve(process.cwd(), '..', '..', '.lsn-state.json');
+      const lsnFilePath = path.join(process.cwd(), '.sync-test-lsn.json');
       fs.writeFileSync(
         lsnFilePath, 
         JSON.stringify({

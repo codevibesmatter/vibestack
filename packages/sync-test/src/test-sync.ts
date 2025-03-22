@@ -164,8 +164,18 @@ export class SyncTester {
     this.messageLog = [];
   }
 
+  /**
+   * Get the message log for analysis
+   */
   public getMessageLog(): Message[] {
     return this.messageLog;
+  }
+
+  /**
+   * Get the client ID
+   */
+  public getClientId(): string {
+    return this.clientId;
   }
 
   protected nextMessageId(): string {

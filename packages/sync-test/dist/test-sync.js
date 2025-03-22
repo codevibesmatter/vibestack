@@ -25,12 +25,30 @@ export class SyncTester {
         this.ws = null;
         this.currentState = 'initial';
     }
-    async connect() {
+    async connect(startingLSN, clientId) {
         if (this.connected) {
             throw new Error('Already connected');
         }
+        // If a clientId is provided, use it instead of the random one
+        if (clientId) {
+            this.clientId = clientId;
+            console.log(`Using provided client ID: ${this.clientId}`);
+        }
         return new Promise((resolve, reject) => {
-            this.ws = new WebSocket(this.config.wsUrl);
+            // Build WebSocket URL with parameters
+            const wsUrl = new URL(this.config.wsUrl);
+            wsUrl.searchParams.set('clientId', this.clientId);
+            // Add LSN parameter if provided (for catchup sync)
+            if (startingLSN) {
+                wsUrl.searchParams.set('lsn', startingLSN);
+                console.log(`Connecting with LSN: ${startingLSN}`);
+            }
+            else {
+                // Use 0/0 for initial sync
+                wsUrl.searchParams.set('lsn', '0/0');
+            }
+            console.log(`Connecting to: ${wsUrl.toString()}`);
+            this.ws = new WebSocket(wsUrl.toString());
             this.ws.on('open', () => {
                 this.connected = true;
                 resolve();
@@ -101,8 +119,17 @@ export class SyncTester {
     clearMessageLog() {
         this.messageLog = [];
     }
+    /**
+     * Get the message log for analysis
+     */
     getMessageLog() {
         return this.messageLog;
+    }
+    /**
+     * Get the client ID
+     */
+    getClientId() {
+        return this.clientId;
     }
     nextMessageId() {
         return `clt_${Date.now()}_${this.messageId++}`;
