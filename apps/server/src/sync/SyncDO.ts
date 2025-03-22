@@ -408,6 +408,9 @@ export class SyncDO implements DurableObject {
                   lsn,
                   this // Pass 'this' as the WebSocketHandler implementation
                 );
+                
+                // Update client sync state to live after catchup completes successfully
+                await this.stateManager.updateClientSyncState(clientId, 'live');
               } else {
                 // Perform initial sync for new clients
                 syncLogger.info('Starting initial sync', { clientId }, MODULE_NAME);
@@ -418,11 +421,6 @@ export class SyncDO implements DurableObject {
                   clientId
                 );
               }
-              
-              syncLogger.info('Sync completed', { 
-                clientId, 
-                syncType: needsCatchupSync ? 'catchup' : 'initial' 
-              }, MODULE_NAME);
             } catch (error) {
               syncLogger.error('Sync failed', {
                 clientId,

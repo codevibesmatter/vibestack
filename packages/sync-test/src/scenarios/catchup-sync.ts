@@ -41,23 +41,68 @@ function getLSNInfoFromFile(): { lsn: string, clientId?: string } {
     // Try the new location first
     const lsnFile = path.join(process.cwd(), '.sync-test-lsn.json');
     if (fs.existsSync(lsnFile)) {
-      const fileContent = fs.readFileSync(lsnFile, 'utf8');
-      const data = JSON.parse(fileContent);
-      return {
-        lsn: data.lsn || '0/0',
-        clientId: data.clientId
-      };
+      try {
+        const fileContent = fs.readFileSync(lsnFile, 'utf8');
+        // Try to parse JSON and handle potential corruption
+        try {
+          const data = JSON.parse(fileContent);
+          // Validate the data has expected structure
+          if (typeof data !== 'object' || data === null) {
+            throw new Error('Invalid LSN file format: not an object');
+          }
+          
+          if (!('lsn' in data)) {
+            throw new Error('Invalid LSN file format: missing lsn property');
+          }
+          
+          return {
+            lsn: data.lsn || '0/0',
+            clientId: data.clientId
+          };
+        } catch (jsonError) {
+          console.error(`Error parsing LSN file ${lsnFile}:`, jsonError instanceof Error ? jsonError.message : String(jsonError));
+          console.warn(`Corrupt LSN file detected at ${lsnFile}. Using default LSN.`);
+          
+          // Try to repair the file by creating a backup and writing a default
+          try {
+            const backupFile = `${lsnFile}.bak`;
+            fs.copyFileSync(lsnFile, backupFile);
+            console.warn(`Backed up corrupt LSN file to ${backupFile}`);
+            
+            // Write a default LSN file
+            const defaultData = {
+              lsn: '0/0',
+              timestamp: new Date().toISOString(),
+              note: 'Auto-generated after corrupt LSN file was detected'
+            };
+            fs.writeFileSync(lsnFile, JSON.stringify(defaultData, null, 2));
+            console.warn(`Created new default LSN file at ${lsnFile}`);
+          } catch (repairError) {
+            console.error(`Failed to repair corrupt LSN file:`, repairError instanceof Error ? repairError.message : String(repairError));
+          }
+          
+          return { lsn: '0/0' };
+        }
+      } catch (readError) {
+        console.error(`Error reading LSN file ${lsnFile}:`, readError instanceof Error ? readError.message : String(readError));
+        return { lsn: '0/0' };
+      }
     }
     
     // Legacy location (for backward compatibility)
     const legacyFile = path.join(process.cwd(), '../../.lsn-state.json');
     if (fs.existsSync(legacyFile)) {
-      const fileContent = fs.readFileSync(legacyFile, 'utf8');
-      const data = JSON.parse(fileContent);
-      return {
-        lsn: data.lsn || '0/0',
-        clientId: data.clientId
-      };
+      try {
+        const fileContent = fs.readFileSync(legacyFile, 'utf8');
+        const data = JSON.parse(fileContent);
+        return {
+          lsn: data.lsn || '0/0',
+          clientId: data.clientId
+        };
+      } catch (error) {
+        console.warn(`Error reading legacy LSN file ${legacyFile}:`, error);
+        return { lsn: '0/0' };
+      }
     }
     
     // Default
@@ -73,9 +118,29 @@ function getLSNInfoFromFile(): { lsn: string, clientId?: string } {
  * Similar to the server-side implementation in server-changes.ts
  */
 function compareLSN(lsn1: string, lsn2: string): number {
-  const [major1, minor1] = lsn1.split('/').map(Number);
-  const [major2, minor2] = lsn2.split('/').map(Number);
+  if (lsn1 === lsn2) return 0;
   
+  // Parse the LSNs into parts
+  const [major1Str, minor1Str] = lsn1.split('/');
+  const [major2Str, minor2Str] = lsn2.split('/');
+  
+  // Convert to numbers (major parts are decimal, minor parts are hex)
+  const major1 = parseInt(major1Str, 10);
+  const minor1 = parseInt(minor1Str, 16); // Hex value
+  const major2 = parseInt(major2Str, 10);
+  const minor2 = parseInt(minor2Str, 16); // Hex value
+  
+  // For debugging purposes
+  if (process.env.DEBUG_LSN) {
+    console.debug('LSN comparison:', {
+      lsn1, lsn2,
+      major1, minor1,
+      major2, minor2,
+      result: major1 === major2 ? (minor1 < minor2 ? -1 : minor1 > minor2 ? 1 : 0) : (major1 < major2 ? -1 : 1)
+    });
+  }
+  
+  // Compare parts
   if (major1 < major2) return -1;
   if (major1 > major2) return 1;
   if (minor1 < minor2) return -1;
@@ -385,23 +450,52 @@ async function testCatchupSync() {
     // Save the new LSN to the file
     const lsnFile = path.join(process.cwd(), '.sync-test-lsn.json');
     
-    // Always save the LSN, even if it didn't advance, to preserve the server's last known LSN
-    // Make sure we're using the finalLSN from the sync completed message
-    if (syncCompletedReceived && syncCompletedFinalLSN && compareLSN(syncCompletedFinalLSN, finalLSN) > 0) {
+    // Always use the sync completed finalLSN when available as this represents 
+    // the server's authoritative position after sync
+    if (syncCompletedReceived && syncCompletedFinalLSN) {
+      // Update to use the server's reported final position
       finalLSN = syncCompletedFinalLSN;
       console.log(`Using final LSN from sync completed message: ${finalLSN}`);
     }
     
     console.log(`Saving LSN to file: ${finalLSN}`);
-    fs.writeFileSync(
-      lsnFile, 
-      JSON.stringify({
+    try {
+      // Format the JSON data with proper indentation
+      const jsonData = {
         lsn: finalLSN,
         timestamp: new Date().toISOString(),
         clientId: tester.getClientId()
-      }, null, 2)
-    );
-    console.log(`Saved LSN state to ${lsnFile} for future tests`);
+      };
+      
+      // Validate JSON stringification works before writing
+      const jsonContent = JSON.stringify(jsonData, null, 2);
+      
+      // Ensure the JSON is valid by parsing it back
+      try {
+        JSON.parse(jsonContent);
+      } catch (jsonError) {
+        throw new Error(`Invalid JSON data would be written: ${jsonError instanceof Error ? jsonError.message : String(jsonError)}`);
+      }
+      
+      // Write the file with validated JSON
+      fs.writeFileSync(lsnFile, jsonContent);
+      console.log(`Saved LSN state to ${lsnFile} for future tests`);
+      
+      // Verify the file was written correctly
+      try {
+        const savedContent = fs.readFileSync(lsnFile, 'utf8');
+        const savedData = JSON.parse(savedContent);
+        if (savedData.lsn !== finalLSN) {
+          throw new Error(`Verification failed: Saved LSN (${savedData.lsn}) does not match expected LSN (${finalLSN})`);
+        }
+      } catch (verifyError) {
+        console.error(`❌ LSN save verification failed:`, verifyError instanceof Error ? verifyError.message : String(verifyError));
+        throw new Error(`Failed to verify LSN save: ${verifyError instanceof Error ? verifyError.message : String(verifyError)}`);
+      }
+    } catch (saveError) {
+      console.error(`❌ Failed to save LSN state to ${lsnFile}:`, saveError instanceof Error ? saveError.message : String(saveError));
+      throw new Error(`Failed to save LSN state: ${saveError instanceof Error ? saveError.message : String(saveError)}`);
+    }
     
     // Report results
     console.log('\nCatchup Sync Results:');
@@ -424,15 +518,30 @@ async function testCatchupSync() {
       console.log('Success: Received changes during catchup');
     }
     
-    // Always use the sync completed finalLSN if available for validation
-    if (syncCompletedReceived && syncCompletedFinalLSN) {
-      finalLSN = syncCompletedFinalLSN;
-    }
-    
     // Validate LSN advancement
-    if (compareLSN(finalLSN, startingLSN) <= 0 && totalChanges > 0) {
-      console.warn('Warning: LSN did not advance despite receiving changes. This may indicate a synchronization issue.');
-    } else if (compareLSN(finalLSN, startingLSN) > 0) {
+    const lsnComparison = compareLSN(finalLSN, startingLSN);
+    if (lsnComparison <= 0 && totalChanges > 0) {
+      console.warn(`Warning: LSN did not advance (${startingLSN} → ${finalLSN}) despite receiving ${totalChanges} changes. This may indicate a synchronization issue.`);
+      // Add additional diagnostic information
+      if (syncCompletedReceived && syncCompletedFinalLSN) {
+        if (syncCompletedFinalLSN !== finalLSN) {
+          console.warn(`Diagnostic: Server reported finalLSN=${syncCompletedFinalLSN} but test is using finalLSN=${finalLSN}`);
+        }
+      }
+      
+      // Debug LSN comparison
+      console.debug(`LSN comparison debug: compareLSN("${finalLSN}", "${startingLSN}") = ${lsnComparison}`);
+      
+      try {
+        // Add more detailed comparison info
+        const [startMajor, startMinor] = startingLSN.split('/');
+        const [finalMajor, finalMinor] = finalLSN.split('/');
+        console.debug(`LSN parts: Starting(${startMajor}/${startMinor}) → Final(${finalMajor}/${finalMinor})`);
+        console.debug(`Decimal values: Starting(${parseInt(startMajor, 10)}/${parseInt(startMinor, 16)}) → Final(${parseInt(finalMajor, 10)}/${parseInt(finalMinor, 16)})`);
+      } catch (error) {
+        console.error('Error in LSN debug:', error);
+      }
+    } else if (lsnComparison > 0) {
       console.log(`Success: LSN advanced from ${startingLSN} to ${finalLSN}`);
     }
     

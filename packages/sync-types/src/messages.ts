@@ -10,7 +10,8 @@ export type SrvMessageType =
   | 'srv_state_change'    // Server state change notification (deprecated)
   | 'srv_lsn_update'      // Server LSN update notification
   | 'srv_changes_received' // Server acknowledges receipt of changes
-  | 'srv_changes_applied';  // Server signals changes were applied
+  | 'srv_changes_applied'  // Server signals changes were applied
+  | 'srv_sync_completed';  // Server signals catchup sync completed with summary
 
 export type CltMessageType =
   | 'clt_sync_request'      // Client requests sync
@@ -87,6 +88,15 @@ export interface ServerAppliedMessage extends ServerMessage {
   error?: string;
 }
 
+export interface ServerSyncCompletedMessage extends ServerMessage {
+  type: 'srv_sync_completed';
+  startLSN: string;       // Starting LSN for the sync
+  finalLSN: string;       // Final LSN after sync
+  changeCount: number;    // Total number of changes sent
+  success: boolean;       // Whether sync completed successfully
+  error?: string;         // Error message if any
+}
+
 // Client message interfaces
 export interface ClientMessage extends BaseMessage {
   type: CltMessageType;
@@ -128,3 +138,5 @@ export interface ClientInitProcessedMessage extends ClientMessage {
 
 // Union types for all messages
 export type Message = ServerMessage | ClientMessage;
+
+// No need for named exports since these are already exported at declaration

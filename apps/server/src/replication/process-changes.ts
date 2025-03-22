@@ -5,6 +5,7 @@ import type { MinimalContext } from '../types/hono';
 import type { WALData, PostgresWALMessage } from '../types/wal';
 import { sql } from '../lib/db';
 import { StateManager } from './state-manager';
+import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 
 /**
  * Process Changes Module
@@ -45,6 +46,34 @@ import { StateManager } from './state-manager';
 const MODULE_NAME = 'process-changes';
 
 /**
+ * Check if a table should be tracked for replication
+ * Uses SERVER_DOMAIN_TABLES to determine which tables should be tracked
+ */
+export function shouldTrackTable(tableName: string): boolean {
+  // Skip the change_history table itself to avoid recursive loops
+  if (tableName === 'change_history') {
+    return false;
+  }
+  
+  // Use SERVER_DOMAIN_TABLES to determine which tables should be tracked
+  // The array contains quoted table names like '"users"', so we need to handle that
+  const normalizedTableName = `"${tableName}"`;
+  
+  // Check if the normalized name is in the domain tables
+  // Using type casting to handle the type mismatch
+  const shouldTrack = SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
+  
+  if (!shouldTrack) {
+    replicationLogger.debug('Filtered: Table not in SERVER_DOMAIN_TABLES', {
+      table: tableName,
+      normalizedName: normalizedTableName
+    }, MODULE_NAME);
+  }
+  
+  return shouldTrack;
+}
+
+/**
  * Validates if a WAL change contains the necessary data to be processed.
  * Checks for schema, table, and column data presence.
  */
@@ -53,21 +82,28 @@ export function isValidTableChange(
   lsn: string
 ): boolean {
   if (!change?.schema || !change?.table) {
-    replicationLogger.debug('Filtered: Missing schema or table', {
-      lsn,
-      hasSchema: !!change?.schema,
-      hasTable: !!change?.table
-    }, MODULE_NAME);
+    // Skip debug logging for common filter cases
+    return false;
+  }
+  
+  // Check if this is a table we should track
+  if (!shouldTrackTable(change.table)) {
     return false;
   }
 
+  // For DELETE operations, we don't require column data
+  if (change.kind === 'delete') {
+    // For deletes, we still need to identify which record was deleted
+    if (!change.oldkeys) {
+      // Skip detailed debug logging
+      return false;
+    }
+    return true;
+  }
+
+  // For INSERT and UPDATE operations, we need column data
   if (!change.columnnames || !change.columnvalues) {
-    replicationLogger.debug('Filtered: Missing column data', {
-      lsn,
-      table: change.table,
-      hasColumnNames: !!change.columnnames,
-      hasColumnValues: !!change.columnvalues
-    }, MODULE_NAME);
+    // Skip detailed debug logging
     return false;
   }
 
@@ -83,9 +119,7 @@ export function transformWALToTableChange(wal: WALData): TableChange | null {
     // Parse WAL data
     const parsedData = wal.data ? JSON.parse(wal.data) as PostgresWALMessage : null;
     if (!parsedData?.change || !Array.isArray(parsedData.change)) {
-      replicationLogger.debug('Invalid WAL data format', { 
-        lsn: wal.lsn
-      }, MODULE_NAME);
+      // Skip debug logging for invalid formats
       return null;
     }
 
@@ -97,11 +131,33 @@ export function transformWALToTableChange(wal: WALData): TableChange | null {
       return null;
     }
 
-    // Transform column arrays to structured object
-    const data = change.columnvalues?.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
-      acc[change.columnnames[index]] = value;
-      return acc;
-    }, {});
+    // Handle data differently based on operation type
+    let data: Record<string, unknown> = {};
+    
+    if (change.kind === 'delete') {
+      // For deletes, use oldkeys to identify the deleted record
+      if (change.oldkeys) {
+        data = change.oldkeys.keyvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
+          acc[change.oldkeys!.keynames[index]] = value;
+          return acc;
+        }, {});
+        
+        // Only log delete operations in debug mode when troubleshooting specific issues
+        // replicationLogger.debug('Processed DELETE operation', {
+        //   lsn: wal.lsn,
+        //   table: change.table,
+        //   keys: Object.keys(data)
+        // }, MODULE_NAME);
+      }
+    } else {
+      // For inserts and updates, use column data
+      if (change.columnnames && change.columnvalues) {
+        data = change.columnvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
+          acc[change.columnnames![index]] = value;
+          return acc;
+        }, {});
+      }
+    }
 
     // Return in our universal format
     return {
@@ -109,7 +165,7 @@ export function transformWALToTableChange(wal: WALData): TableChange | null {
       operation: change.kind,
       data,
       lsn: wal.lsn,
-      updated_at: data.updated_at as string || new Date().toISOString()
+      updated_at: (data.updated_at as string) || new Date().toISOString()
     };
   } catch (error) {
     replicationLogger.error('Error transforming WAL data', {
@@ -129,12 +185,8 @@ export function transformWALChanges(changes: WALData[]): TableChange[] {
     .map(transformWALToTableChange)
     .filter((change): change is TableChange => change !== null);
   
-  replicationLogger.info('WAL changes transformed', {
-    originalCount: changes.length,
-    transformedCount: tableChanges.length,
-    tables: Array.from(new Set(tableChanges.map(c => c.table)))
-  }, MODULE_NAME);
-  
+  // Count operations by type for logging but don't log here
+  // This will be logged in storeChangesInHistory instead
   return tableChanges;
 }
 
@@ -150,9 +202,20 @@ export async function storeChangesInHistory(
     return true;
   }
 
-  replicationLogger.info('Storing changes in history table', { 
+  // Count operations by type for concise logging
+  const ops = changes.reduce((acc: Record<string, number>, change) => {
+    acc[change.operation] = (acc[change.operation] || 0) + 1;
+    return acc;
+  }, {});
+  
+  // Get unique tables for logging
+  const tables = Array.from(new Set(changes.map(c => c.table)));
+
+  // Single informative log for storage start that includes transform info
+  replicationLogger.info('Store changes', { 
     count: changes.length,
-    tables: Array.from(new Set(changes.map(c => c.table)))
+    ops,
+    tables: tables.length > 0 ? tables : []
   }, MODULE_NAME);
 
   try {
@@ -190,12 +253,12 @@ export async function storeChangesInHistory(
       await sql(context, query, values);
     }
     
-    replicationLogger.info('Changes stored in history table', { count: changes.length }, MODULE_NAME);
+    // Simple completion log - only essential info
+    replicationLogger.info('Changes stored', { count: changes.length }, MODULE_NAME);
     return true;
   } catch (error) {
-    replicationLogger.error('Failed to store changes in history table', {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
+    replicationLogger.error('Store failed', {
+      error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     return false;
   }
@@ -232,11 +295,11 @@ export async function consumeWALAndUpdateLSN(
     const consumeResult = await sql(context, consumeQuery, [slotName, lastLSN]);
     const consumedCount = consumeResult.length;
     
-    replicationLogger.info('Consumed WAL changes and advanced LSN', {
-      consumedCount,
-      newLSN: lastLSN,
-      previousLSN: currentLSN,
-      slotName
+    // Single concise log with LSN transition
+    replicationLogger.info('LSN advanced', {
+      count: consumedCount,
+      lsn: `${currentLSN} → ${lastLSN}`,
+      slot: slotName
     }, MODULE_NAME);
     
     // Update the LSN in the state manager
@@ -265,15 +328,19 @@ export async function broadcastChangesToClients(
   }
   
   try {
-    replicationLogger.info('Broadcasting changes to clients', {
+    // Count tables for concise logging
+    const tables = Array.from(new Set(changes.map(c => c.table)));
+    
+    // Single concise log with table count
+    replicationLogger.info('Broadcasting', {
       count: changes.length,
-      tables: Array.from(new Set(changes.map(c => c.table)))
+      tables: tables.length > 0 ? tables : []
     }, MODULE_NAME);
     
     await clientManager.broadcastChanges(changes);
     return true;
   } catch (error) {
-    replicationLogger.error('Error broadcasting changes to clients', {
+    replicationLogger.error('Broadcast failed', {
       error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     return false;
@@ -295,18 +362,12 @@ export async function processWALChanges(
     return { tableChanges: [], storedSuccessfully: true };
   }
 
-  replicationLogger.info('Processing WAL changes', { 
-    count: changes.length,
-    lsnRange: changes.length > 0 ? `${changes[0].lsn} → ${changes[changes.length - 1].lsn}` : 'empty'
-  }, MODULE_NAME);
-  
   // ====== STEP 1: TRANSFORM ======
   // Convert WAL changes to TableChange format and filter invalid ones
   const tableChanges = transformWALChanges(changes);
   
   // Early return if no valid changes after transformation
   if (tableChanges.length === 0) {
-    replicationLogger.info('No valid changes after transformation', {}, MODULE_NAME);
     return { tableChanges: [], storedSuccessfully: true };
   }
   
@@ -331,7 +392,6 @@ export async function processAndConsumeWALChanges(
 ): Promise<{ success: boolean, storedChanges: boolean, consumedChanges: boolean }> {
   // Early return if no changes
   if (!peekedChanges || peekedChanges.length === 0) {
-    replicationLogger.info('No WAL changes to process', {}, MODULE_NAME);
     return { success: true, storedChanges: false, consumedChanges: false };
   }
 
@@ -341,8 +401,8 @@ export async function processAndConsumeWALChanges(
   
   // Only proceed to LSN update if storage was successful
   if (!storedSuccessfully) {
-    replicationLogger.warn('Changes were not successfully stored, not consuming WAL changes', {
-      lsnRange: peekedChanges.length > 0 ? `${peekedChanges[0].lsn} → ${peekedChanges[peekedChanges.length - 1].lsn}` : 'empty'
+    replicationLogger.warn('Changes not stored, skipping WAL consume', {
+      lsn: peekedChanges[peekedChanges.length - 1].lsn
     }, MODULE_NAME);
     return { success: true, storedChanges: false, consumedChanges: false };
   }

@@ -193,9 +193,14 @@ export class ClientManager {
    */
   async broadcastChanges(changes: TableChange[]): Promise<void> {
     try {
-      replicationLogger.info('Changes received for broadcasting', {
+      replicationLogger.info('Broadcasting', {
         count: changes.length,
-        tables: Array.from(new Set(changes.map(c => c.table)))
+        tables: Object.keys(
+          changes.reduce((acc: Record<string, boolean>, c) => {
+            acc[c.table] = true;
+            return acc;
+          }, {})
+        ).length
       }, MODULE_NAME);
       
       // NOTE: Client notification has been refactored
@@ -206,13 +211,9 @@ export class ClientManager {
       // Changes are now stored in the change_history table by the replication system,
       // and clients will retrieve them on their next sync cycle based on their last known LSN.
       
-      replicationLogger.debug('Changes saved to history table, clients will retrieve on next sync', {
-        count: changes.length
-      }, MODULE_NAME);
-      
       return;
     } catch (error) {
-      replicationLogger.error('Changes broadcasting failed', {
+      replicationLogger.error('Broadcast failed', {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       throw error;
@@ -353,6 +354,72 @@ export class ClientManager {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       return [];
+    }
+  }
+
+  /**
+   * Get a client by ID
+   */
+  public async getClientById(clientId: string): Promise<ClientState | null> {
+    try {
+      const clientKey = `client:${clientId}`;
+      const value = await this.env.CLIENT_REGISTRY.get(clientKey);
+      
+      if (!value) {
+        return null;
+      }
+      
+      try {
+        const state = JSON.parse(value);
+        return {
+          clientId,
+          active: state.active || false,
+          lastSeen: state.lastSeen || 0
+        };
+      } catch (err) {
+        replicationLogger.error('Client parse error', {
+          clientId,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_NAME);
+        return null;
+      }
+    } catch (error) {
+      replicationLogger.error('Client retrieval failed', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      return null;
+    }
+  }
+
+  /**
+   * Attempt to wake a client via its DO
+   */
+  async wakeClient(clientId: string): Promise<boolean> {
+    try {
+      // Check if the client is in our registry
+      const client = await this.getClientById(clientId);
+      if (!client) {
+        replicationLogger.warn('Client not found', { clientId }, MODULE_NAME);
+        return false;
+      }
+      
+      // Check if the client is still active
+      if (!client.lastSeen || Date.now() - client.lastSeen > 300000) { // 5 minutes
+        replicationLogger.debug('Skipping inactive client', { clientId }, MODULE_NAME);
+        return false;
+      }
+      
+      replicationLogger.debug('Waking client', { clientId }, MODULE_NAME);
+      
+      // Client should wake up on its next polling cycle
+      return true;
+    } catch (error) {
+      replicationLogger.error('Wake failed', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      return false;
     }
   }
 } 

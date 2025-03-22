@@ -11,8 +11,12 @@ export interface PostgresWALMessage {
     schema: string;
     table: string;
     kind: 'insert' | 'update' | 'delete';
-    columnnames: string[];
-    columnvalues: unknown[];
+    columnnames?: string[];
+    columnvalues?: unknown[];
+    oldkeys?: {
+      keynames: string[];
+      keyvalues: unknown[];
+    };
   }>;
   lsn: string;
   xid?: number;

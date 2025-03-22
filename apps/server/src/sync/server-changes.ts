@@ -3,7 +3,8 @@ import type {
   SrvMessageType,
   ServerChangesMessage,
   ServerStateChangeMessage,
-  ServerLSNUpdateMessage
+  ServerLSNUpdateMessage,
+  ServerSyncCompletedMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
@@ -24,9 +25,19 @@ const MODULE_NAME = 'server-changes';
  * @returns -1 if lsn1 < lsn2, 0 if equal, 1 if lsn1 > lsn2
  */
 export function compareLSN(lsn1: string, lsn2: string): number {
-  const [major1, minor1] = lsn1.split('/').map(Number);
-  const [major2, minor2] = lsn2.split('/').map(Number);
+  if (lsn1 === lsn2) return 0;
   
+  // Parse the LSNs into parts
+  const [major1Str, minor1Str] = lsn1.split('/');
+  const [major2Str, minor2Str] = lsn2.split('/');
+  
+  // Convert to numbers
+  const major1 = parseInt(major1Str, 10);
+  const minor1 = parseInt(minor1Str, 16); // Hex value
+  const major2 = parseInt(major2Str, 10);
+  const minor2 = parseInt(minor2Str, 16); // Hex value
+  
+  // Compare parts
   if (major1 < major2) return -1;
   if (major1 > major2) return 1;
   if (minor1 < minor2) return -1;
@@ -231,6 +242,8 @@ export async function performCatchupSync(
     startLSN
   }, MODULE_NAME);
 
+  let changeCount = 0; // Track total changes sent for reporting
+  
   try {
     // Get current server LSN (just using local DB connection)
     const client = getDBClient(context);
@@ -264,14 +277,24 @@ export async function performCatchupSync(
           let lastLSN = startLSN;
           
           while (hasMoreChanges) {
-            // Query changes from history table
+            // Query changes from history table using proper LSN comparison
+            // Be careful with casting - pg_lsn() expects text input
             const result = await client.query(`
               SELECT lsn, table_name, operation, data 
               FROM change_history 
-              WHERE lsn > $1 AND lsn <= $2
-              ORDER BY lsn ASC
+              WHERE lsn::pg_lsn > $1::pg_lsn AND lsn::pg_lsn <= $2::pg_lsn
+              ORDER BY lsn::pg_lsn ASC
               LIMIT $3 OFFSET $4
             `, [startLSN, serverLSN, pageSize, offset]);
+            
+            // Log query performance
+            syncLogger.debug('Retrieved changes from history', {
+              startLSN,
+              serverLSN,
+              limit: pageSize,
+              offset,
+              resultCount: result.rows.length
+            }, MODULE_NAME);
             
             // Convert to TableChange format
             const changes: TableChange[] = result.rows.map(row => ({
@@ -299,9 +322,12 @@ export async function performCatchupSync(
             const orderedChanges = orderChangesByDomain(allChanges);
             await sendChanges(orderedChanges, lastLSN, clientId, messageHandler);
             
+            // Update the change count for final reporting
+            changeCount = orderedChanges.length;
+            
             syncLogger.info('Sent historical changes to client', {
               clientId,
-              changeCount: orderedChanges.length,
+              changeCount,
               lastLSN
             }, MODULE_NAME);
             
@@ -332,20 +358,25 @@ export async function performCatchupSync(
       }, MODULE_NAME);
     }
     
-    // Send LSN update message with the final server LSN
-    const lsnUpdateMsg: ServerLSNUpdateMessage = {
-      type: 'srv_lsn_update',
+    // Send a sync completed message with all relevant information
+    const syncCompletedMsg: ServerSyncCompletedMessage = {
+      type: 'srv_sync_completed',
       messageId: `srv_${Date.now()}`,
       timestamp: Date.now(),
       clientId,
-      lsn: serverLSN
+      startLSN,
+      finalLSN: serverLSN,
+      changeCount,
+      success: true
     };
-    await messageHandler.send(lsnUpdateMsg);
+    
+    await messageHandler.send(syncCompletedMsg);
     
     syncLogger.info('Catchup sync completed', {
       clientId,
       startLSN,
-      finalLSN: serverLSN
+      finalLSN: serverLSN,
+      changeCount
     }, MODULE_NAME);
   } catch (error) {
     syncLogger.error('Catchup sync failed', {
@@ -354,15 +385,26 @@ export async function performCatchupSync(
       error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     
-    // Still send an LSN update to avoid client being stuck
-    const lsnUpdateMsg: ServerLSNUpdateMessage = {
-      type: 'srv_lsn_update',
+    // Send a sync completed message with error information
+    const syncCompletedMsg: ServerSyncCompletedMessage = {
+      type: 'srv_sync_completed',
       messageId: `srv_${Date.now()}`,
       timestamp: Date.now(),
       clientId,
-      lsn: startLSN
+      startLSN,
+      finalLSN: startLSN,
+      changeCount: 0,
+      success: false,
+      error: error instanceof Error ? error.message : String(error)
     };
-    await messageHandler.send(lsnUpdateMsg);
+    
+    await messageHandler.send(syncCompletedMsg);
+    
+    syncLogger.error('Catchup sync failed, completion message sent', {
+      clientId,
+      startLSN,
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
   }
 }
 
@@ -427,15 +469,25 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
     return aLevel - bLevel;
   });
 
+  // Count operations by type
+  const operationCounts = ordered.reduce((acc, change) => {
+    acc[change.operation] = (acc[change.operation] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  // Ensure all operation types are represented in logs, even if count is 0
+  const operations = {
+    insert: operationCounts.insert || 0,
+    update: operationCounts.update || 0,
+    delete: operationCounts.delete || 0
+  };
+
   syncLogger.debug('Changes ordered', {
     tableCount: Object.keys(ordered.reduce((acc, change) => {
       acc[change.table] = true;
       return acc;
     }, {} as Record<string, boolean>)).length,
-    operations: ordered.reduce((acc, change) => {
-      acc[change.operation] = (acc[change.operation] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>)
+    operations
   }, MODULE_NAME);
 
   return ordered;
