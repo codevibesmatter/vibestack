@@ -15,6 +15,25 @@ The sync module is organized into the following components:
 - **state**: Manages state persistence for the Durable Object.
 - **types**: Shared type definitions for the sync module.
 
+### Integration with Replication
+
+The sync module works closely with the replication system:
+
+1. **Initialization Sequence**:
+   - When a client connects, the SyncDO initializes the replication system
+   - SyncDO waits for the replication system's initial poll to complete
+   - This ensures any pending WAL changes are processed before sync operations begin
+
+2. **Change Source**:
+   - Changes are read from the `change_history` table, which is populated by the replication system
+   - Each client tracks its current position using an LSN (Log Sequence Number)
+   - Catchup sync retrieves changes newer than the client's LSN
+
+3. **Race Condition Prevention**:
+   - The SyncDO calls `ReplicationDO.waitForInitialPoll()` before starting sync
+   - This ensures the replication system has completed processing all WAL changes
+   - Without this synchronization, clients might not see changes made right before their connection
+
 ### Connection Module
 
 The connection module is organized into the following components:
@@ -39,6 +58,38 @@ The flow for WebSocket connections is:
 3. A SyncDO instance is created or retrieved based on the client ID
 4. The request is forwarded to the SyncDO instance
 5. The SyncDO handles the WebSocket connection using the Hibernation API
+
+## Synchronization Process
+
+The sync module implements a two-phase synchronization process:
+
+1. **Initial Synchronization**:
+   - For new clients or clients with LSN '0/0'
+   - Performs a full data sync from the current database state
+   - Sets the client's LSN to the current database LSN
+
+2. **Catchup Synchronization**:
+   - For existing clients with a valid LSN
+   - Queries the `change_history` table for changes newer than the client's LSN
+   - Updates the client's LSN after each batch of changes is processed
+   - Uses pagination to handle large volumes of changes efficiently
+
+### Change History Table
+
+The sync system relies on the `change_history` table maintained by the replication system:
+
+- **Purpose**: Provides a persistent record of all database changes in chronological order
+- **Query Process**: 
+  ```sql
+  SELECT * FROM change_history 
+  WHERE lsn > $1::pg_lsn 
+  ORDER BY lsn ASC 
+  LIMIT $2
+  ```
+- **Benefits**:
+  - Reliable change history for clients that reconnect
+  - Efficient catchup using LSN-based pagination
+  - Complete ordering of all changes across tables
 
 ## WebSocket Hibernation API
 
@@ -66,6 +117,31 @@ The Durable Object implements the following WebSocket event handlers:
 
 These handlers are implemented in the `websocket-handlers.ts` file and used by the `SyncDO` class.
 
+## Race Condition Prevention
+
+The sync system implements several safeguards against race conditions:
+
+1. **Replication Initialization Wait**:
+   - The SyncDO waits for the replication system to complete its initial polling
+   - This prevents sync operations from starting before the change_history table is populated
+   - Uses the ReplicationDO's `/wait-for-initial-poll` endpoint
+
+2. **Transactional LSN Updates**:
+   - Client LSN updates are atomic and stored in durable storage
+   - This ensures clients never lose their position, even during DO eviction
+
+3. **Ordered Change Processing**:
+   - Changes are always processed in strict LSN order
+   - This maintains causal consistency across all clients
+
+## Testing
+
+The sync system includes comprehensive testing:
+
+- **Sync Test Scenarios**: Various scenarios like initial sync, catchup sync, and error handling
+- **Race Condition Testing**: Verifies that sync operations correctly wait for replication initialization
+- **Synchronization Testing**: Ensures changes are delivered in the correct order
+
 ## File Structure
 
 ```
@@ -77,6 +153,8 @@ apps/server/src/sync/
 │   └── websocket-handlers.ts // WebSocket event handlers
 ├── client-registry.ts        // Client registration in KV store
 ├── changes.ts                // Change processing logic
+├── initial-sync.ts           // Initial sync implementation
+├── server-changes.ts         // Server changes implementation using change_history
 ├── index.ts                  // Main exports
 ├── README.md                 // This file
 ├── replication.ts            // Replication logic
@@ -135,3 +213,4 @@ This modular approach makes the code easier to maintain and test, while also mak
 3. **Better Alignment with DO Principles**: Uses Durable Objects' built-in state management
 4. **Reduced Code Complexity**: Fewer components and interfaces to maintain
 5. **Clearer Responsibility**: Clients are responsible for their state, DO is responsible for serving changes 
+6. **Resilient To Race Conditions**: Proper synchronization with the replication system 
