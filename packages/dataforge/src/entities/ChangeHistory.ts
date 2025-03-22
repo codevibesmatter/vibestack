@@ -2,7 +2,8 @@ import {
   Entity,
   PrimaryGeneratedColumn,
   Column,
-  CreateDateColumn
+  CreateDateColumn,
+  Index
 } from 'typeorm';
 
 /**
@@ -13,6 +14,8 @@ export class ChangeHistory {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
+  // Regular text index for basic lookups
+  @Index()
   @Column({ type: 'text', nullable: false })
   lsn!: string;
 
