@@ -15,7 +15,8 @@ export class SyncTester {
     messageLog;
     messageId;
     ws;
-    currentState;
+    serverLSN = '0/0';
+    onMessage = null;
     constructor(config = {}) {
         this.config = { ...DEFAULT_CONFIG, ...config };
         this.clientId = uuidv4();
@@ -23,31 +24,23 @@ export class SyncTester {
         this.messageLog = [];
         this.messageId = 0;
         this.ws = null;
-        this.currentState = 'initial';
     }
-    async connect(startingLSN, clientId) {
+    // Connect with optional LSN and client ID for catchup sync
+    async connect(lsn, clientId) {
         if (this.connected) {
             throw new Error('Already connected');
         }
-        // If a clientId is provided, use it instead of the random one
+        // Use provided client ID if available
         if (clientId) {
             this.clientId = clientId;
-            console.log(`Using provided client ID: ${this.clientId}`);
+        }
+        // Build URL with parameters
+        const wsUrl = new URL(this.config.wsUrl);
+        wsUrl.searchParams.set('clientId', this.clientId);
+        if (lsn) {
+            wsUrl.searchParams.set('lsn', lsn);
         }
         return new Promise((resolve, reject) => {
-            // Build WebSocket URL with parameters
-            const wsUrl = new URL(this.config.wsUrl);
-            wsUrl.searchParams.set('clientId', this.clientId);
-            // Add LSN parameter if provided (for catchup sync)
-            if (startingLSN) {
-                wsUrl.searchParams.set('lsn', startingLSN);
-                console.log(`Connecting with LSN: ${startingLSN}`);
-            }
-            else {
-                // Use 0/0 for initial sync
-                wsUrl.searchParams.set('lsn', '0/0');
-            }
-            console.log(`Connecting to: ${wsUrl.toString()}`);
             this.ws = new WebSocket(wsUrl.toString());
             this.ws.on('open', () => {
                 this.connected = true;
@@ -56,6 +49,7 @@ export class SyncTester {
             this.ws.on('message', (data) => {
                 try {
                     const message = JSON.parse(data.toString());
+                    console.log(`Received message: ${message.type}`);
                     this.handleMessage(message);
                 }
                 catch (err) {
@@ -98,23 +92,38 @@ export class SyncTester {
             });
         });
     }
+    /**
+     * Handle an incoming message
+     */
     handleMessage(message) {
-        // Only log the message and track basic state
+        // Add message to log
         this.messageLog.push(message);
-        if ('type' in message && message.type === 'srv_state_change') {
-            this.currentState = message.state;
+        // Log all incoming messages with a basic type indicator
+        if ('type' in message) {
+            const type = message.type;
+            const shortType = type.substring(0, 12);
+            console.log(`📩 RECEIVED: ${shortType.padEnd(12)} (total messages: ${this.messageLog.length})`);
+        }
+        // Call the onMessage handler if set
+        if (this.onMessage) {
+            this.onMessage(message);
+        }
+        // Store LSN updates for later reference
+        if ('type' in message && message.type === 'srv_lsn_update') {
+            const lsnUpdateMessage = message;
+            this.serverLSN = lsnUpdateMessage.lsn;
         }
     }
     // Helper methods for tests
     getMessagesByType(type) {
-        return this.messageLog.filter(msg => msg.type === type);
+        return this.messageLog.filter(msg => 'type' in msg && msg.type === type);
     }
     getLastMessage(type) {
-        const messages = this.messageLog.filter((msg) => msg.type === type);
+        const messages = this.messageLog.filter((msg) => 'type' in msg && msg.type === type);
         return messages[messages.length - 1];
     }
-    getCurrentState() {
-        return this.currentState;
+    getServerLSN() {
+        return this.serverLSN;
     }
     clearMessageLog() {
         this.messageLog = [];
@@ -131,63 +140,16 @@ export class SyncTester {
     getClientId() {
         return this.clientId;
     }
+    /**
+     * Generate a unique message ID
+     */
     nextMessageId() {
         return `clt_${Date.now()}_${this.messageId++}`;
     }
     /**
-     * Run the test scenario
+     * Check if tester is connected
      */
-    async runTest() {
-        // Wait for initial sync to complete
-        await this.waitForState('live');
-        // Run basic validation
-        await this.validateSync();
-        // Disconnect cleanly
-        await this.disconnect(1000, 'Test complete');
-    }
-    /**
-     * Wait for a specific sync state
-     */
-    async waitForState(targetState, timeout = 30000) {
-        return new Promise((resolve, reject) => {
-            const start = Date.now();
-            const checkState = () => {
-                if (this.currentState === targetState) {
-                    resolve();
-                }
-                else if (Date.now() - start > timeout) {
-                    reject(new Error(`Timeout waiting for state ${targetState}`));
-                }
-                else {
-                    setTimeout(checkState, 100);
-                }
-            };
-            checkState();
-        });
-    }
-    /**
-     * Validate the sync process
-     */
-    async validateSync() {
-        // Basic validation that we received messages in order
-        const initStart = this.messageLog.find(m => m.type === 'srv_init_start');
-        const initComplete = this.messageLog.find(m => m.type === 'srv_init_complete');
-        const stateChange = this.messageLog.find(m => m.type === 'srv_state_change');
-        if (!initStart)
-            throw new Error('Missing srv_init_start message');
-        if (!initComplete)
-            throw new Error('Missing srv_init_complete message');
-        if (!stateChange)
-            throw new Error('Missing srv_state_change message');
-        // Validate message order
-        const initStartIndex = this.messageLog.indexOf(initStart);
-        const initCompleteIndex = this.messageLog.indexOf(initComplete);
-        const stateChangeIndex = this.messageLog.indexOf(stateChange);
-        if (initStartIndex > initCompleteIndex) {
-            throw new Error('srv_init_start received after srv_init_complete');
-        }
-        if (initCompleteIndex > stateChangeIndex) {
-            throw new Error('srv_init_complete received after srv_state_change');
-        }
+    isConnected() {
+        return this.connected;
     }
 }

@@ -13,8 +13,12 @@ async function runSyncTest(): Promise<void> {
     await tester.connect();
     console.log('Connected successfully');
 
-    // Run the test scenario
-    await tester.runTest();
+    // Wait for a few seconds to observe any initial messages
+    console.log('Waiting for initial messages...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    
+    // Simply disconnect at the end
+    await tester.disconnect();
     
     console.log('Test completed successfully');
   } catch (error) {

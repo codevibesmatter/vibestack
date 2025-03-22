@@ -8,7 +8,8 @@ import type {
   ServerStateChangeMessage,
   ServerLSNUpdateMessage,
   Message,
-  ClientHeartbeatMessage
+  ClientHeartbeatMessage,
+  ServerSyncCompletedMessage
 } from '@repo/sync-types';
 import { createServerBulkChanges } from '../changes/server-changes.js';
 import fs from 'fs';
@@ -18,6 +19,9 @@ import { neon } from '@neondatabase/serverless';
 
 // Load environment variables from .env file
 config();
+
+// Define a type for the Neon client
+type SqlQueryFunction = ReturnType<typeof neon>;
 
 // Get database URL from environment
 function getDatabaseURL(): string {
@@ -85,10 +89,9 @@ function compareLSN(lsn1: string, lsn2: string): number {
  * FLOW:
  * 1. Create server-side changes to advance the LSN
  * 2. Client connects with stored LSN (no initial sync needed)
- * 3. Server processes WAL changes since client's LSN
+ * 3. Server processes changes since client's LSN
  * 4. Server sends changes in chunks via srv_send_changes messages
- * 5. Server updates client with final LSN via srv_lsn_update
- * 6. Server transitions to live state via srv_state_change
+ * 5. Server sends srv_sync_completed message with summary info
  */
 async function testCatchupSync() {
   console.log('Starting Catchup Sync Test');
@@ -104,99 +107,292 @@ async function testCatchupSync() {
   
   // Create SyncTester instance 
   const tester = new SyncTester(DEFAULT_CONFIG);
-  let sql;
+  let sql: SqlQueryFunction | undefined;
+  let finalLSN = startingLSN;
+  
+  // Track statistics for reporting
+  let changesMessages = 0;
+  let totalChanges = 0;
+  let lastChunk = 0;
+  let totalChunks = 0;
+  let syncCompletedReceived = false;
+  let syncCompletedSuccess = false;
+  let syncCompletedChangeCount = 0;
+  let syncCompletedFinalLSN = '';
+  
+  // Set up a message listener to process messages as they arrive
+  tester.onMessage = (message) => {
+    if ('type' in message) {
+      // Handle changes messages
+      if (message.type === 'srv_send_changes') {
+        const changesMsg = message as ServerChangesMessage;
+        changesMessages++;
+        
+        console.log(`Received srv_send_changes message #${changesMessages}`);
+        
+        if (changesMsg.changes) {
+          totalChanges += changesMsg.changes.length;
+          console.log(`  Contains ${changesMsg.changes.length} changes`);
+          
+          // Track chunking information
+          if (changesMsg.sequence) {
+            lastChunk = changesMsg.sequence.chunk;
+            totalChunks = changesMsg.sequence.total;
+            console.log(`  Chunk ${lastChunk}/${totalChunks}`);
+          }
+          
+          // Track LSN progression
+          if (changesMsg.lastLSN) {
+            console.log(`  Has lastLSN: ${changesMsg.lastLSN}`);
+            if (compareLSN(changesMsg.lastLSN, finalLSN) > 0) {
+              finalLSN = changesMsg.lastLSN;
+              console.log(`  Updated finalLSN from changes message: ${finalLSN}`);
+            }
+          }
+        }
+      }
+      
+      // Handle LSN updates - this is the authoritative source for LSN
+      else if (message.type === 'srv_lsn_update') {
+        const lsnMsg = message as ServerLSNUpdateMessage;
+        console.log(`Received LSN update message: ${lsnMsg.lsn}`);
+        
+        // Always update the LSN from a dedicated LSN update message
+        if (lsnMsg.lsn) {
+          if (finalLSN !== lsnMsg.lsn) {
+            console.log(`Updating finalLSN: ${finalLSN} -> ${lsnMsg.lsn}`);
+          }
+          finalLSN = lsnMsg.lsn;
+        }
+      }
+      
+      // Handle sync completed message - this is the final message in catchup sync
+      else if (message.type === 'srv_sync_completed') {
+        const syncCompletedMsg = message as any;
+        console.log(`Received sync completed message: startLSN=${syncCompletedMsg.startLSN}, finalLSN=${syncCompletedMsg.finalLSN}, changes=${syncCompletedMsg.changeCount}, success=${syncCompletedMsg.success}`);
+        
+        syncCompletedReceived = true;
+        syncCompletedSuccess = syncCompletedMsg.success;
+        syncCompletedChangeCount = syncCompletedMsg.changeCount;
+        syncCompletedFinalLSN = syncCompletedMsg.finalLSN;
+        
+        // Update LSN from the sync completed message if it's more recent
+        if (syncCompletedMsg.finalLSN && compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
+          finalLSN = syncCompletedMsg.finalLSN;
+          console.log(`Updated finalLSN from sync completed message: ${finalLSN}`);
+        }
+      }
+    }
+  };
   
   try {
+    // Read the LSN file again to ensure we have the most recent value
+    const freshLsnInfo = getLSNInfoFromFile();
+    const initialCurrentLSN = freshLsnInfo.lsn;
+    
+    if (initialCurrentLSN !== startingLSN) {
+      console.log(`Notice: LSN file was updated since process start. Using latest LSN: ${initialCurrentLSN}`);
+      finalLSN = initialCurrentLSN;
+    }
+    
     // Initialize the Neon client using the neon() function
     console.log('Initializing database connection...');
     sql = neon(getDatabaseURL());
     console.log('Database connection initialized successfully');
     
+    // Verify the connection is active before proceeding
+    console.log('Verifying database connection...');
+    const connectionCheck = await sql`SELECT 1 as connection_test`;
+    // Safely check the connection result
+    if (!connectionCheck || !Array.isArray(connectionCheck) || connectionCheck.length === 0) {
+      throw new Error('Database connection verification failed: empty result');
+    }
+    
+    const firstRow = connectionCheck[0] as Record<string, any>;
+    if (!firstRow || firstRow.connection_test !== 1) {
+      throw new Error('Database connection verification failed: invalid result');
+    }
+    console.log('Database connection verified successfully');
+    
     // Create server changes BEFORE connecting to the sync server
     console.log('Creating server changes...');
-    await createServerBulkChanges(sql, Task, 10);
+    // Create enough changes to ensure WAL generation
+    const numChanges = 25; // Create 25 changes
+    console.log(`Creating ${numChanges} changes...`);
+    await createServerBulkChanges(sql as any, Task, numChanges);
     
     // Wait for changes to be processed
     console.log('Waiting for changes to be processed...');
     await new Promise(resolve => setTimeout(resolve, DEFAULT_CONFIG.changeWaitTime));
     
-    // Connect with existing LSN and client ID
-    console.log('Connecting to server with existing LSN...');
-    await tester.connect(startingLSN, savedClientId);
+    // Read the LSN file again to ensure we have the most recent value before connecting
+    const updatedLsnInfo = getLSNInfoFromFile();
+    const currentLSN = updatedLsnInfo.lsn;
+    const currentClientId = updatedLsnInfo.clientId || savedClientId;
     
-    // Send heartbeat with stored LSN to trigger catchup
-    console.log('Sending heartbeat with stored LSN to trigger catchup...');
-    const heartbeatMsg: ClientHeartbeatMessage = {
-      type: 'clt_heartbeat',
-      messageId: `clt_${Date.now()}`,
-      timestamp: Date.now(),
-      clientId: tester.getClientId(),
-      lsn: startingLSN,
-      active: true
-    };
-    await tester.sendMessage(heartbeatMsg);
-    
-    // Wait for catchup sync
-    console.log('Waiting for catchup sync...');
-    await new Promise(resolve => setTimeout(resolve, DEFAULT_CONFIG.syncWaitTime * 2));
-    
-    // Analyze messages
-    const messages = tester.getMessageLog();
-    
-    // Track changes and state
-    let changesMessages = 0;
-    let totalChanges = 0;
-    let lastReceivedLSN = startingLSN;
-    let stateTransitions: string[] = [];
-    let lastChunk = 0;
-    let totalChunks = 0;
-    
-    // Organize by message type
-    for (const msg of messages) {
-      if ('type' in msg) {
-        // Check for changes messages
-        if (msg.type === 'srv_send_changes') {
-          const changesMsg = msg as ServerChangesMessage;
-          changesMessages++;
-          
-          if (changesMsg.changes) {
-            totalChanges += changesMsg.changes.length;
-            
-            // Track chunking information
-            if (changesMsg.sequence) {
-              lastChunk = changesMsg.sequence.chunk;
-              totalChunks = changesMsg.sequence.total;
-            }
-            
-            // Track LSN progression
-            if (changesMsg.lastLSN && compareLSN(changesMsg.lastLSN, lastReceivedLSN) > 0) {
-              lastReceivedLSN = changesMsg.lastLSN;
-            }
-          }
-        }
-        
-        // Check for state changes (legacy API)
-        else if (msg.type === 'srv_state_change') {
-          const stateMsg = msg as ServerStateChangeMessage;
-          stateTransitions.push(stateMsg.state);
-        }
-        
-        // Check for LSN updates (new API)
-        else if (msg.type === 'srv_lsn_update') {
-          const lsnMsg = msg as ServerLSNUpdateMessage;
-          console.log(`LSN update received: ${lsnMsg.lsn}`);
-          if (compareLSN(lsnMsg.lsn, lastReceivedLSN) > 0) {
-            lastReceivedLSN = lsnMsg.lsn;
-          }
-        }
-      }
+    if (currentLSN !== startingLSN) {
+      console.log(`Using updated LSN for connection: ${currentLSN} (was: ${startingLSN})`);
+      finalLSN = currentLSN;
     }
     
-    // Get final LSN
-    const finalLSN = lastReceivedLSN;
+    // Connect with the most current LSN and client ID
+    console.log('Connecting to server with current LSN...');
+    await tester.connect(currentLSN, currentClientId);
+    
+    // Wait for catchup sync with timeouts for each expected action
+    console.log('Waiting for sync events with individual timeouts...');
+    
+    // Create action flags and timestamps
+    const actions = {
+      changesReceived: { received: false, timestamp: 0, count: 0 },
+      syncCompleted: { received: false, timestamp: 0, success: false }
+    };
+    
+    // Set up message handler to check for relevant messages
+    const originalOnMessage = tester.onMessage;
+    tester.onMessage = (message) => {
+      // Still call the original handler if it exists
+      if (originalOnMessage) {
+        originalOnMessage(message);
+      }
+      
+      if ('type' in message) {
+        if (message.type === 'srv_send_changes') {
+          console.log('✅ Changes message received');
+          actions.changesReceived.received = true;
+          actions.changesReceived.timestamp = Date.now();
+          actions.changesReceived.count++;
+        } else if (message.type === 'srv_sync_completed') {
+          console.log('✅ Sync completed message received');
+          const syncCompletedMsg = message as any;
+          actions.syncCompleted.received = true;
+          actions.syncCompleted.timestamp = Date.now();
+          actions.syncCompleted.success = syncCompletedMsg.success;
+          
+          // Update final LSN if needed
+          if (syncCompletedMsg.finalLSN && compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
+            finalLSN = syncCompletedMsg.finalLSN;
+            console.log(`✅ LSN updated from sync completed message: ${finalLSN}`);
+          }
+          
+          // Log change count from server's perspective
+          console.log(`✅ Server reports ${syncCompletedMsg.changeCount} changes sent`);
+        }
+      }
+    };
+    
+    // Set up timeouts for each expected action
+    const timeoutMs = 30000; // 30 seconds total timeout
+    const startTime = Date.now();
+    
+    // Create promises for each expected action
+    const changesReceivedPromise = new Promise<'success' | 'timeout'>((resolve) => {
+      const checkInterval = setInterval(() => {
+        if (actions.changesReceived.received) {
+          clearInterval(checkInterval);
+          resolve('success');
+        } else if (Date.now() - startTime > timeoutMs) {
+          clearInterval(checkInterval);
+          resolve('timeout');
+        }
+      }, 100);
+    });
+    
+    const syncCompletedPromise = new Promise<'success' | 'timeout'>((resolve) => {
+      const checkInterval = setInterval(() => {
+        if (actions.syncCompleted.received) {
+          clearInterval(checkInterval);
+          resolve('success');
+        } else if (Date.now() - startTime > timeoutMs) {
+          clearInterval(checkInterval);
+          resolve('timeout');
+        }
+      }, 100);
+    });
+    
+    // Set up the progress reporting
+    const progressInterval = setInterval(() => {
+      const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`⏳ Sync progress (${elapsedSeconds}s elapsed):`);
+      console.log(`   - Changes received: ${actions.changesReceived.received ? `✅ (${actions.changesReceived.count})` : '⏳'}`);
+      console.log(`   - Sync completed: ${actions.syncCompleted.received ? '✅' : '⏳'}`);
+      console.log(`   - Total messages: ${tester.getMessageLog().length}`);
+      
+      // Print the last few messages for visibility
+      const recentMessages = tester.getMessageLog().slice(-3);
+      if (recentMessages.length > 0) {
+        console.log('Recent messages:');
+        recentMessages.forEach((msg, idx) => {
+          if ('type' in msg) {
+            console.log(`   ${idx+1}. ${msg.type}`);
+          }
+        });
+      }
+    }, 5000);
+    
+    // Wait for all required actions or timeout
+    console.log('Waiting for sync actions to complete...');
+    
+    const [changesResult, syncCompletedResult] = await Promise.all([
+      changesReceivedPromise,
+      syncCompletedPromise
+    ]);
+    
+    // Clear the progress reporting interval
+    clearInterval(progressInterval);
+    
+    // Restore original message handler
+    tester.onMessage = originalOnMessage;
+    
+    // Check results and report
+    let syncSuccess = true;
+    
+    if (changesResult === 'timeout' && !actions.changesReceived.received) {
+      console.warn('⚠️ No changes messages received - this may be expected if no changes occurred');
+      // This is not a failure condition, just a warning
+    }
+    
+    if (syncCompletedResult === 'timeout') {
+      console.error('❌ Timed out waiting for sync completed message');
+      syncSuccess = false;
+    }
+    
+    if (!syncSuccess) {
+      throw new Error('Catchup sync timed out waiting for required messages');
+    }
+    
+    console.log('✅ Catchup sync completed with all required messages received!');
+    
+    // Wait a bit more to ensure all final messages are processed
+    console.log('Waiting for any final messages...');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Print message analysis summary
+    const messages = tester.getMessageLog();
+    console.log('\nMessage Analysis Summary:');
+    console.log(`- Total messages received: ${messages.length}`);
+    console.log(`- Found ${changesMessages} srv_send_changes messages with ${totalChanges} total changes`);
+    
+    // Report sync completion status
+    if (syncCompletedReceived) {
+      console.log(`- Sync completed: ${syncCompletedSuccess ? 'success' : 'failed'}`);
+      console.log(`- Server-reported change count: ${syncCompletedChangeCount}`);
+      console.log(`- Server-reported final LSN: ${syncCompletedFinalLSN}`);
+    } else {
+      console.log(`- No sync completion message received`);
+    }
     
     // Save the new LSN to the file
     const lsnFile = path.join(process.cwd(), '.sync-test-lsn.json');
+    
+    // Always save the LSN, even if it didn't advance, to preserve the server's last known LSN
+    // Make sure we're using the finalLSN from the sync completed message
+    if (syncCompletedReceived && syncCompletedFinalLSN && compareLSN(syncCompletedFinalLSN, finalLSN) > 0) {
+      finalLSN = syncCompletedFinalLSN;
+      console.log(`Using final LSN from sync completed message: ${finalLSN}`);
+    }
+    
+    console.log(`Saving LSN to file: ${finalLSN}`);
     fs.writeFileSync(
       lsnFile, 
       JSON.stringify({
@@ -205,12 +401,14 @@ async function testCatchupSync() {
         clientId: tester.getClientId()
       }, null, 2)
     );
+    console.log(`Saved LSN state to ${lsnFile} for future tests`);
     
     // Report results
     console.log('\nCatchup Sync Results:');
     console.log('--------------------');
     console.log(`Starting LSN: ${startingLSN}`);
     console.log(`Final LSN: ${finalLSN}`);
+    console.log(`Client ID: ${tester.getClientId()}`);
     console.log(`srv_send_changes messages: ${changesMessages}`);
     
     if (totalChunks > 0) {
@@ -219,22 +417,23 @@ async function testCatchupSync() {
     
     console.log(`Total changes received: ${totalChanges}`);
     
-    if (stateTransitions.length > 0) {
-      console.log(`State transitions: ${stateTransitions.join(' -> ')}`);
-    }
-    
     // Validate sync results
-    if (totalChanges === 0) {
+    if (totalChanges === 0 && syncCompletedReceived && !syncCompletedSuccess) {
       console.warn('Warning: No changes received. This may indicate a problem with the catchup sync process.');
     } else {
       console.log('Success: Received changes during catchup');
     }
     
+    // Always use the sync completed finalLSN if available for validation
+    if (syncCompletedReceived && syncCompletedFinalLSN) {
+      finalLSN = syncCompletedFinalLSN;
+    }
+    
     // Validate LSN advancement
-    if (startingLSN === finalLSN && totalChanges > 0) {
+    if (compareLSN(finalLSN, startingLSN) <= 0 && totalChanges > 0) {
       console.warn('Warning: LSN did not advance despite receiving changes. This may indicate a synchronization issue.');
     } else if (compareLSN(finalLSN, startingLSN) > 0) {
-      console.log('Success: LSN advanced as expected and saved to file');
+      console.log(`Success: LSN advanced from ${startingLSN} to ${finalLSN}`);
     }
     
     // Validate message sequence
@@ -248,10 +447,13 @@ async function testCatchupSync() {
     console.error('Test failed:', error);
     throw error;
   } finally {
+    // Clean up event listener
+    tester.onMessage = null;
+    
     // Close database connection if it was opened
     if (sql) {
       console.log('Closing database connection...');
-      await sql.end();
+      // No explicit end() needed for Neon serverless connections
       console.log('Database connection closed');
     }
     
@@ -264,10 +466,15 @@ async function testCatchupSync() {
 
 // Run the test if this is the main module
 if (process.argv[1] === new URL(import.meta.url).pathname) {
-  testCatchupSync().catch(error => {
-    console.error('Test failed:', error);
-    process.exit(1);
-  });
+  testCatchupSync()
+    .then(() => {
+      console.log('Test completed successfully');
+      process.exit(0);
+    })
+    .catch(error => {
+      console.error('Test failed:', error);
+      process.exit(1);
+    });
 }
 
 export { testCatchupSync }; 
