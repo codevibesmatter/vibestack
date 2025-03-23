@@ -12,7 +12,7 @@ import type { ReplicationConfig, ReplicationMetrics } from './types';
 import { DEFAULT_REPLICATION_CONFIG } from './types';
 import { ClientManager } from './client-manager';
 import { replicationLogger } from '../middleware/logger';
-import { PollingManager, HIBERNATION_CHECK_INTERVAL } from './polling';
+import { PollingManager } from './polling';
 import { getDBClient } from '../lib/db';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 import { AppBindings, createMinimalContext, MinimalContext } from '../types/hono';
@@ -81,6 +81,9 @@ export class ReplicationDO implements DurableObject {
       ctx,
       this.durableObjectState
     );
+    
+    // Start polling immediately on construction
+    this.durableObjectState.waitUntil(this.initializeReplication(true));
   }
 
   private getContext(): MinimalContext {
@@ -266,49 +269,27 @@ export class ReplicationDO implements DurableObject {
   }
 
   /**
-   * Clean up resources when the Durable Object is about to hibernate
+   * Clean up resources before the Durable Object shuts down
    */
   private async cleanup(): Promise<void> {
     try {
-      // Update last active timestamp before hibernation
+      // Update last active timestamp 
       const now = Date.now();
       await this.durableObjectState.storage.put(ReplicationDO.LAST_ACTIVE_KEY, now);
       
-      // High level lifecycle event
-      replicationLogger.info('Hibernation prep', {
+      // Log clean shutdown
+      replicationLogger.info('DO shutting down', {
         lastActiveAt: new Date(now).toISOString()
       }, MODULE_NAME);
 
-      // Let polling manager handle its own cleanup logging
+      // Stop the polling interval
       await this.pollingManager.stopPolling();
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
-      replicationLogger.error('Hibernation failed', {
+      replicationLogger.error('Cleanup failed', {
         error: error.message
       }, MODULE_NAME);
       throw err;
-    }
-  }
-
-  /**
-   * Handle DO alarm - required for hibernation
-   */
-  async alarm(): Promise<void> {
-    try {
-      replicationLogger.info('Alarm triggered', {}, MODULE_NAME);
-
-      // Force initialization on wake-up
-      await this.initializeReplication(true);
-    } catch (err) {
-      replicationLogger.error('Alarm error', { 
-        error: err instanceof Error ? err.message : String(err) 
-      }, MODULE_NAME);
-      // Ensure next alarm is set even if this one failed
-      const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
-      await this.durableObjectState.storage.setAlarm(nextCheck);
-      replicationLogger.info('Alarm reset', {
-        nextCheck: new Date(nextCheck).toISOString()
-      }, MODULE_NAME);
     }
   }
 

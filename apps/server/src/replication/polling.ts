@@ -15,8 +15,6 @@ const MODULE_NAME = 'polling';
 
 // Polling intervals
 export const ACTIVE_POLL_INTERVAL = 1000; // 1 second
-export const CLIENT_CHECK_INTERVAL = 60000; // 60 seconds
-export const HIBERNATION_CHECK_INTERVAL = 300000; // 300 seconds
 
 /**
  * Compare two LSNs
@@ -36,7 +34,6 @@ function compareLSNs(lsn1: string, lsn2: string): boolean {
 
 export class PollingManager {
   private pollingInterval: ReturnType<typeof setInterval> | null = null;
-  private clientCheckInterval: ReturnType<typeof setInterval> | null = null;
   public hasCompletedFirstPoll = false;
   private initialPollPromise: Promise<void> | null = null;
   private initialPollResolve: (() => void) | null = null;
@@ -107,45 +104,14 @@ export class PollingManager {
         this.initialPollResolve();
       }
 
-      // Check for active clients after initial poll
-      const hasActiveClients = await this.clientManager.hasActiveClients();
-      
-      if (!hasActiveClients) {
-        replicationLogger.info('Entering hibernation', {
-          reason: 'no_active_clients'
-        }, MODULE_NAME);
-        
-        // Stop polling and set hibernation check
-        this.stopPolling();
-        const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
-        await this.state.storage.setAlarm(nextCheck);
-        replicationLogger.debug('Set hibernation alarm', {
-          nextCheck: new Date(nextCheck).toISOString(),
-          intervalMs: HIBERNATION_CHECK_INTERVAL
-        }, MODULE_NAME);
-        return;
-      }
-
-      // Start active polling and client checking if we have clients
+      // Start continuous polling regardless of client state
       if (!this.pollingInterval) {
-        replicationLogger.debug('Starting polling cycles', {
-          pollInterval: ACTIVE_POLL_INTERVAL,
-          clientCheckInterval: CLIENT_CHECK_INTERVAL
+        replicationLogger.debug('Starting continuous polling', {
+          pollInterval: ACTIVE_POLL_INTERVAL
         }, MODULE_NAME);
         
-        // Start polling interval
-        this.pollingInterval = setInterval(() => this.checkClientsAndPoll(), ACTIVE_POLL_INTERVAL);
-        
-        // Start periodic client check interval (runs less frequently to reduce noise)
-        this.clientCheckInterval = setInterval(async () => {
-          const hasClients = await this.checkForActiveClients();
-          if (!hasClients) {
-            // Stop both intervals and enter hibernation
-            this.stopPolling();
-            const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
-            await this.state.storage.setAlarm(nextCheck);
-          }
-        }, CLIENT_CHECK_INTERVAL);
+        // Start polling interval - simplified to only poll for changes without client checks
+        this.pollingInterval = setInterval(() => this.pollAndProcess(), ACTIVE_POLL_INTERVAL);
       }
     } catch (err) {
       replicationLogger.error('Start polling error', {
@@ -156,25 +122,9 @@ export class PollingManager {
   }
 
   /**
-   * Check for active clients and handle hibernation if none found
+   * Poll for changes and process them
    */
-  private async checkForActiveClients(): Promise<boolean> {
-    const hasActiveClients = await this.clientManager.hasActiveClients();
-    
-    if (!hasActiveClients) {
-      replicationLogger.info('Entering hibernation', {
-        reason: 'periodic_check'
-      }, MODULE_NAME);
-      return false;
-    }
-    
-    return true;
-  }
-
-  /**
-   * Check for changes and notify active clients if needed
-   */
-  private async checkClientsAndPoll(): Promise<void> {
+  private async pollAndProcess(): Promise<void> {
     try {
       // Poll for changes - this only peeks at changes without consuming them
       const changes = await this.pollForChanges();
@@ -212,12 +162,6 @@ export class PollingManager {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
       replicationLogger.debug('Polling stopped', {}, MODULE_NAME);
-    }
-    
-    if (this.clientCheckInterval) {
-      clearInterval(this.clientCheckInterval);
-      this.clientCheckInterval = null;
-      replicationLogger.debug('Client checks stopped', {}, MODULE_NAME);
     }
   }
 
@@ -275,35 +219,6 @@ export class PollingManager {
         error: err instanceof Error ? err.message : String(err)
       }, MODULE_NAME);
       throw err;
-    }
-  }
-
-  /**
-   * Handle DO alarm - check clients and restart polling if needed
-   */
-  public async handleAlarm(): Promise<void> {
-    try {
-      replicationLogger.info('Handling hibernation alarm', {}, MODULE_NAME);
-
-      // Reset first poll state since we're waking up
-      this.hasCompletedFirstPoll = false;
-      this.initialPollPromise = new Promise((resolve) => {
-        this.initialPollResolve = resolve;
-      });
-
-      // Start polling again - this will check for clients and re-hibernate if none
-      await this.startPolling();
-      await this.waitForInitialPoll();
-    } catch (err) {
-      replicationLogger.error('Alarm handling error', {
-        error: err instanceof Error ? err.message : String(err) 
-      }, MODULE_NAME);
-      // Ensure next alarm is set even if this one failed
-      const nextCheck = Date.now() + HIBERNATION_CHECK_INTERVAL;
-      await this.state.storage.setAlarm(nextCheck);
-      replicationLogger.debug('Reset alarm after error', {
-        nextCheck: new Date(nextCheck).toISOString()
-      }, MODULE_NAME);
     }
   }
 } 
