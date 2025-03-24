@@ -3,11 +3,8 @@ import type {
   ServerInitStartMessage, 
   ServerInitChangesMessage, 
   ServerInitCompleteMessage,
-  ServerStateChangeMessage,
-  ClientMessage,
   CltMessageType,
-  TableChange,
-  ServerLSNUpdateMessage
+  TableChange
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
@@ -358,17 +355,6 @@ export async function performInitialSync(
     // Track state change internally
     await stateManager.updateClientSyncState(clientId, 'live');
 
-    // Send LSN update instead of state change
-    const lsnUpdateMsg: ServerLSNUpdateMessage = {
-      type: 'srv_lsn_update',
-      messageId: `srv_${Date.now()}`,
-      timestamp: Date.now(),
-      clientId,
-      lsn: serverLSN
-    };
-
-    await messageHandler.send(lsnUpdateMsg);
-    
     // Calculate sync time
     if (syncState.startTimeMs) {
       const syncTimeMs = Date.now() - syncState.startTimeMs;

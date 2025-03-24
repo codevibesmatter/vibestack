@@ -109,6 +109,48 @@ async function getCurrentServerLSN(context: MinimalContext): Promise<string> {
 }
 
 /**
+ * Create a successful catchup sync completion message
+ */
+export function createCatchupSyncCompletion(
+  clientId: string,
+  startLSN: string,
+  finalLSN: string,
+  changeCount: number
+): ServerSyncCompletedMessage {
+  return {
+    type: 'srv_sync_completed',
+    messageId: `srv_${Date.now()}_completion`,
+    timestamp: Date.now(),
+    clientId,
+    startLSN,
+    finalLSN,
+    changeCount,
+    success: true
+  };
+}
+
+/**
+ * Create a failed catchup sync completion message
+ */
+export function createCatchupSyncError(
+  clientId: string,
+  startLSN: string,
+  error: Error | string
+): ServerSyncCompletedMessage {
+  return {
+    type: 'srv_sync_completed',
+    messageId: `srv_${Date.now()}_completion`,
+    timestamp: Date.now(),
+    clientId,
+    startLSN,
+    finalLSN: startLSN,
+    changeCount: 0,
+    success: false,
+    error: error instanceof Error ? error.message : String(error)
+  };
+}
+
+/**
  * Perform catchup sync for a client
  * This uses changes from the change_history table
  */
@@ -126,15 +168,15 @@ export async function performCatchupSync(
   let changeCount = 0; // Track total changes sent for reporting
   
   try {
-    // Get current server LSN from the Replication DO
-    const serverLSN = await getCurrentServerLSN(context);
+    // Get current server LSN from the Replication DO at the start of sync
+    const initialServerLSN = await getCurrentServerLSN(context);
     let finalLSN = startLSN; // This will track the final LSN after changes
     
     // If client is behind, use the change_history table to get changes
-    if (compareLSN(startLSN, serverLSN) < 0) {
+    if (compareLSN(startLSN, initialServerLSN) < 0) {
       syncLogger.info('Client is behind server, retrieving changes from history', {
         clientLSN: startLSN,
-        serverLSN
+        serverLSN: initialServerLSN
       }, MODULE_NAME);
       
       try {
@@ -157,12 +199,12 @@ export async function performCatchupSync(
               WHERE lsn::pg_lsn > $1::pg_lsn AND lsn::pg_lsn <= $2::pg_lsn
               ORDER BY lsn::pg_lsn ASC
               LIMIT $3 OFFSET $4
-            `, [startLSN, serverLSN, pageSize, offset]);
+            `, [startLSN, initialServerLSN, pageSize, offset]);
             
             // Log query performance
             syncLogger.debug('Retrieved changes from history', {
               startLSN,
-              serverLSN,
+              serverLSN: initialServerLSN,
               limit: pageSize,
               offset,
               resultCount: result.rows.length
@@ -225,7 +267,7 @@ export async function performCatchupSync(
             syncLogger.info('No historical changes found', {
               clientId,
               startLSN,
-              serverLSN
+              serverLSN: initialServerLSN
             }, MODULE_NAME);
           }
         } finally {
@@ -242,21 +284,51 @@ export async function performCatchupSync(
       // Client is already up to date
       syncLogger.info('Client LSN is current with server', {
         clientLSN: startLSN,
-        serverLSN
+        serverLSN: initialServerLSN
       }, MODULE_NAME);
     }
     
-    // Send a sync completed message with all relevant information
-    const syncCompletedMsg: ServerSyncCompletedMessage = {
-      type: 'srv_sync_completed',
-      messageId: `srv_${Date.now()}_completion`,
-      timestamp: Date.now(),
+    // Check for new changes that may have occurred during sync
+    const finalServerLSN = await getCurrentServerLSN(context);
+    
+    if (compareLSN(initialServerLSN, finalServerLSN) < 0) {
+      // New changes were detected during the sync
+      syncLogger.info('New changes detected during catchup sync, restarting catchup process', {
+        clientId,
+        initialServerLSN,
+        finalServerLSN,
+        completedUpTo: finalLSN
+      }, MODULE_NAME);
+      
+      // Send a sync completed message for this batch before restarting
+      const syncCompletedMsg = createCatchupSyncCompletion(
+        clientId,
+        startLSN,
+        finalLSN,
+        changeCount
+      );
+      
+      await messageHandler.send(syncCompletedMsg);
+      
+      // Restart catchup sync from the final LSN we reached
+      await performCatchupSync(
+        context,
+        clientId,
+        finalLSN,
+        messageHandler
+      );
+      
+      // We've restarted the sync, so return from this call
+      return;
+    }
+    
+    // No new changes detected, complete the sync normally
+    const syncCompletedMsg = createCatchupSyncCompletion(
       clientId,
       startLSN,
       finalLSN,
-      changeCount,
-      success: true
-    };
+      changeCount
+    );
     
     await messageHandler.send(syncCompletedMsg);
     
@@ -274,17 +346,11 @@ export async function performCatchupSync(
     }, MODULE_NAME);
     
     // Send a sync completed message with error information
-    const syncCompletedMsg: ServerSyncCompletedMessage = {
-      type: 'srv_sync_completed',
-      messageId: `srv_${Date.now()}_completion`,
-      timestamp: Date.now(),
+    const syncCompletedMsg = createCatchupSyncError(
       clientId,
       startLSN,
-      finalLSN: startLSN,
-      changeCount: 0,
-      success: false,
-      error: error instanceof Error ? error.message : String(error)
-    };
+      error instanceof Error ? error : String(error)
+    );
     
     await messageHandler.send(syncCompletedMsg);
     
@@ -365,7 +431,7 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
 }
 
 /**
- * Process live changes for a client
+ * Send live changes to a client
  * This handles real-time notifications for clients with active connections
  * @param context The context object
  * @param clientId The client ID
@@ -374,20 +440,20 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
  * @param providedLSN Optional LSN that overrides the LSN from changes
  * @returns An object with success status and the LSN used
  */
-export async function performLiveSync(
+export async function sendLiveChanges(
   context: MinimalContext,
   clientId: string,
   changes: TableChange[],
   messageHandler: WebSocketHandler,
   providedLSN?: string
 ): Promise<{ success: boolean; lsn: string }> {
-  const MODULE_TAG = `${MODULE_NAME}:live-sync`;
+  const MODULE_TAG = `${MODULE_NAME}:live-changes`;
   
   // Start tracking time for performance monitoring
   const startTime = Date.now();
   
   try {
-    syncLogger.info('Live sync started', { 
+    syncLogger.info('Sending live changes', { 
       clientId, 
       changeCount: changes.length,
       tables: [...new Set(changes.map(c => c.table))].join(','),
@@ -460,41 +526,40 @@ export async function performLiveSync(
       return { success: false, lsn: '0/0' };
     }
     
-    // Send a sync completed message to notify the client of completed live sync
-    const completedMessage: ServerSyncCompletedMessage = {
-      type: 'srv_sync_completed',
-      messageId: `srv_${Date.now()}_completion`,
-      timestamp: Date.now(),
+    syncLogger.info('Live changes sent successfully', {
       clientId,
-      startLSN: '0/0', // For live sync, we don't have a meaningful start LSN
-      finalLSN: currentLSN,
+      lsn: currentLSN,
       changeCount: orderedChanges.length,
-      success: true
-    };
-    
-    try {
-      await messageHandler.send(completedMessage);
-      syncLogger.info('Live sync completed', {
-        clientId,
-        lsn: currentLSN,
-        changeCount: orderedChanges.length,
-        duration: Date.now() - startTime
-      }, MODULE_TAG);
-    } catch (error) {
-      syncLogger.error('Error sending sync completed message', {
-        clientId,
-        error: error instanceof Error ? error.message : String(error)
-      }, MODULE_TAG);
-      // We still consider this a success since the changes were delivered
-    }
+      duration: Date.now() - startTime
+    }, MODULE_TAG);
     
     return { success: true, lsn: currentLSN };
   } catch (error) {
-    syncLogger.error('Live sync failed', {
+    syncLogger.error('Live changes send failed', {
       clientId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined
     }, MODULE_TAG);
     return { success: false, lsn: '0/0' };
   }
+}
+
+/**
+ * Create a confirmation message for a client that's already in sync
+ * Used when a client connects and is already up-to-date
+ */
+export function createLiveSyncConfirmation(
+  clientId: string,
+  lsn: string
+): ServerSyncCompletedMessage {
+  return {
+    type: 'srv_sync_completed',
+    messageId: `srv_${Date.now()}_completion`,
+    timestamp: Date.now(),
+    clientId,
+    startLSN: lsn,  // Current LSN as both start and final
+    finalLSN: lsn,
+    changeCount: 0, // No changes were sent
+    success: true
+  };
 } 

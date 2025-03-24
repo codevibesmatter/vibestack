@@ -1,23 +1,26 @@
-import type { TableChange } from '@repo/sync-types';
-import type { Env, ExecutionContext } from '../types/env';
-import type { DurableObjectState, WebSocket } from '../types/cloudflare';
-import type { MinimalContext } from '../types/hono';
-import { syncLogger } from '../middleware/logger';
-import { createMinimalContext } from '../types/hono';
+/**
+ * SyncDO.ts - Improved Sync Durable Object
+ * 
+ * This is a refactored version of SyncDO with clearer separation of concerns:
+ * - Request routing
+ * - Connection management
+ * - Sync strategy determination
+ * - Module delegation
+ * - State transitions
+ */
+
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
-import { performCatchupSync, performLiveSync } from './server-changes';
-import { 
-  ServerMessage,
+import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation } from './server-changes';
+import type { 
+  ServerMessage, 
   ClientMessage,
-  CltMessageType,
-  ServerChangesMessage,
 } from '@repo/sync-types';
-
-// Add type for message handler function
-type MessageHandlerFn<T extends ClientMessage> = (message: T) => Promise<void>;
-
-const MODULE_NAME = 'SyncDO';
+import type { MinimalContext } from '../types/hono';
+import type { Env } from '../types/env';
+import { syncLogger } from '../middleware/logger';
+import type { WebSocketHandler } from './types';
+import { compareLSN } from '../lib/sync-common';
 
 // WebSocket ready states
 const WS_READY_STATE = {
@@ -25,90 +28,630 @@ const WS_READY_STATE = {
   OPEN: 1,
   CLOSING: 2,
   CLOSED: 3
-} as const;
+};
+
+const MODULE_NAME = 'SyncDO';
 
 /**
- * SyncDO (Sync Durable Object) is a thin wrapper that:
- * 1. Handles DO lifecycle (fetch, webSocket events)
- * 2. Coordinates sync process
- * 3. Provides basic error handling
+ * Type of sync to perform based on client state
  */
-export class SyncDO implements DurableObject {
+enum SyncStrategy {
+  INITIAL = 'initial',
+  CATCHUP = 'catchup',
+  LIVE = 'live'
+}
+
+/**
+ * Helper function to extract query parameters from a request
+ */
+function getQueryParam(request: Request, name: string): string | null {
+  const url = new URL(request.url);
+  return url.searchParams.get(name);
+}
+
+/**
+ * Check if LSN is in valid format
+ */
+function isValidLSN(lsn: string): boolean {
+  // LSN is typically in format X/X where X is a hexadecimal number
+  return /^[0-9A-Fa-f]+\/[0-9A-Fa-f]+$/.test(lsn) || lsn === '0/0';
+}
+
+/**
+ * SyncDO is responsible for managing WebSocket connections and sync flow
+ */
+export class SyncDO implements DurableObject, WebSocketHandler {
   private state: DurableObjectState;
   private env: Env;
-  private syncId: string;
   private webSocket: WebSocket | null = null;
   private stateManager: SyncStateManager;
-  private context: MinimalContext;
-  // Add message handlers map
-  private messageHandlers = new Map<CltMessageType, MessageHandlerFn<ClientMessage>>();
-  // Add a separate map for temporary handlers used by waitForMessage
-  private tempMessageHandlers = new Map<string, (message: any) => void>();
+  private clientId: string = '';
+  private syncId: string;
+  private messageHandlers: Map<ClientMessage['type'], Array<(message: ClientMessage) => Promise<void>>> = new Map();
+  private messageQueue: Map<ClientMessage['type'], ClientMessage[]> = new Map();
+  private waitingResolvers: Map<string, {
+    resolve: (message: any) => void,
+    reject: (error: Error) => void,
+    timer: NodeJS.Timeout | null
+  }> = new Map();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-    this.syncId = state.id.toString();
     
-    syncLogger.debug('SyncDO initialized', {
-      syncId: this.syncId
-    }, MODULE_NAME);
-    
-    // Create execution context
-    const executionCtx: ExecutionContext = {
-      waitUntil: (promise: Promise<any>) => this.state.waitUntil(promise),
-      passThroughOnException: () => {},
-      props: undefined
+    // Create context for state manager
+    const context: MinimalContext = {
+      env: this.env,
+      executionCtx: {
+        waitUntil: (promise: Promise<any>) => this.state.waitUntil(promise),
+        passThroughOnException: () => {},
+        props: undefined
+      }
     };
     
-    // Initialize context and state manager
-    this.context = createMinimalContext(env, executionCtx);
-    this.stateManager = new SyncStateManager(this.context, state);
+    this.stateManager = new SyncStateManager(context, state as any);
+    this.syncId = state.id.toString();
+    
+    syncLogger.debug('SyncDO constructed', {
+      syncId: this.syncId
+    }, MODULE_NAME);
   }
 
   /**
-   * Initialize replication if needed
+   * Main handler for all requests
    */
-  private async init() {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
     try {
-      const id = this.env.REPLICATION.idFromName('replication');
-      const replication = this.env.REPLICATION.get(id);
-      const response = await replication.fetch(new Request('http://internal/api/replication/init'));
+      // Route requests based on path
+      if (path === '/api/sync') {
+        // This is the main WebSocket connect point from index.ts
+        return this.handleWebSocketUpgrade(request);
+      } else if (path.startsWith('/api/sync/ws')) {
+        // Legacy path, also handle WebSocket
+        return this.handleWebSocketUpgrade(request);
+      } else if (path === '/api/sync/new-changes' || path === '/new-changes') {
+        // Handle both paths for backward compatibility
+        return this.handleNewChanges(request);
+      } else if (path === '/api/sync/metrics' || path === '/metrics') {
+        // Handle both paths for metrics too
+        return this.handleMetrics();
+      } else {
+        return new Response('Not found', { status: 404 });
+      }
+    } catch (error) {
+      syncLogger.error('Request handling error', {
+        path,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }, MODULE_NAME);
       
-      if (!response.ok) {
-        throw new Error(`Failed to start replication: ${response.statusText}`);
+      return new Response(JSON.stringify({
+        error: 'Internal Server Error',
+        message: error instanceof Error ? error.message : String(error)
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  /**
+   * Handle WebSocket upgrade requests
+   */
+  private async handleWebSocketUpgrade(request: Request): Promise<Response> {
+    // Extract parameters
+    let clientId = getQueryParam(request, 'clientId');
+    let clientLSN = getQueryParam(request, 'lsn');
+    
+    // Log request parameters
+    syncLogger.info('WebSocket connection request', {
+      clientId,
+      lsn: clientLSN
+    }, MODULE_NAME);
+    
+    // Basic validation
+    if (!clientId) {
+      return new Response('Missing clientId parameter', { status: 400 });
+    }
+    
+    // Validate LSN if provided
+    if (clientLSN && !isValidLSN(clientLSN)) {
+      syncLogger.error('Invalid LSN format', {
+        clientId,
+        lsn: clientLSN
+      }, MODULE_NAME);
+      return new Response('Invalid LSN format', { status: 400 });
+    }
+    
+    // If LSN is missing, default to initial sync with explicit 0/0
+    if (!clientLSN) {
+      clientLSN = '0/0';
+      syncLogger.info('No LSN provided, will perform initial sync', {
+        clientId
+      }, MODULE_NAME);
+    }
+    
+    // Set up WebSocket
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+    
+    // Store WebSocket and client ID
+    this.webSocket = server;
+    this.clientId = clientId;
+
+    // Configure WebSocket
+    server.accept();
+    this.setupWebSocketEventHandlers(server);
+    
+    // Determine sync strategy and perform sync
+    try {
+      // Replication is now handled at worker level
+      syncLogger.info('Determining sync strategy for client', {
+        clientId,
+        lsn: clientLSN
+      }, MODULE_NAME);
+      
+      const strategy = await this.determineSyncStrategy(clientId, clientLSN);
+      await this.performSync(strategy, clientId, clientLSN);
+    } catch (error) {
+      syncLogger.error('WebSocket initialization error', {
+        clientId,
+        lsn: clientLSN,
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      
+      // Close WebSocket on error
+      if (server.readyState === WS_READY_STATE.OPEN) {
+        server.close(1011, 'Internal Server Error');
+      }
+    }
+    
+    // Return the client WebSocket
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
+  }
+  
+  /**
+   * Set up WebSocket event handlers
+   */
+  private setupWebSocketEventHandlers(ws: WebSocket): void {
+    ws.addEventListener('message', async (event) => {
+      await this.handleWebSocketMessage(event);
+    });
+    
+    ws.addEventListener('close', (event) => {
+      syncLogger.info('WebSocket closed', {
+        clientId: this.clientId,
+        code: event.code,
+        reason: event.reason
+      }, MODULE_NAME);
+      
+      // Mark client as inactive when connection closes
+      this.state.waitUntil(
+        (async () => {
+          try {
+            syncLogger.debug('Connection cleanup started', { clientId: this.clientId }, MODULE_NAME);
+            await this.stateManager.cleanupConnection();
+            syncLogger.debug('Connection cleanup completed', { clientId: this.clientId }, MODULE_NAME);
+          } catch (error) {
+            syncLogger.error('Connection cleanup failed', {
+              clientId: this.clientId,
+              error: error instanceof Error ? error.message : String(error)
+            }, MODULE_NAME);
+          }
+        })()
+      );
+      
+      this.webSocket = null;
+    });
+    
+    ws.addEventListener('error', (event) => {
+      syncLogger.error('WebSocket error', {
+        clientId: this.clientId
+      }, MODULE_NAME);
+      
+      this.webSocket = null;
+    });
+  }
+  
+  /**
+   * Handle incoming WebSocket messages
+   */
+  private async handleWebSocketMessage(event: MessageEvent): Promise<void> {
+    try {
+      const message = JSON.parse(event.data as string) as ClientMessage;
+      
+      syncLogger.debug('Received client message', {
+        type: message.type,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      
+      // Store in message queue for waitForMessage
+      if (!this.messageQueue.has(message.type)) {
+        this.messageQueue.set(message.type, []);
+      }
+      this.messageQueue.get(message.type)!.push(message);
+      
+      // Check if someone is waiting for this message type
+      this.checkWaitingResolvers(message.type, message);
+      
+      // Process handlers for this message type
+      const handlers = this.messageHandlers.get(message.type) || [];
+      for (const handler of handlers) {
+        try {
+          await handler(message);
+        } catch (handlerError) {
+          syncLogger.error('Error in message handler', {
+            type: message.type,
+            error: handlerError instanceof Error ? handlerError.message : String(handlerError)
+          }, MODULE_NAME);
+        }
+      }
+    } catch (error) {
+      syncLogger.error('Error processing message', {
+        error: error instanceof Error ? error.message : String(error),
+        data: typeof event.data === 'string' ? event.data.substring(0, 100) : 'non-string data'
+      }, MODULE_NAME);
+    }
+  }
+  
+  /**
+   * Check if any waiting resolvers match this message
+   */
+  private checkWaitingResolvers(type: string, message: ClientMessage): void {
+    // Generate waitId
+    const waitIds = Array.from(this.waitingResolvers.keys()).filter(id => 
+      id.startsWith(`wait_${type}_`)
+    );
+    
+    for (const waitId of waitIds) {
+      const resolver = this.waitingResolvers.get(waitId);
+      if (!resolver) continue;
+      
+      // Clear timer if exists
+      if (resolver.timer) {
+        clearTimeout(resolver.timer);
       }
       
-      syncLogger.info('Replication initialization completed', {
-        syncId: this.syncId
-      }, MODULE_NAME);
-    } catch (err) {
-      syncLogger.error('Replication init failed', {
-        syncId: this.syncId,
-        error: err instanceof Error ? err.message : String(err)
-      }, MODULE_NAME);
-      throw err;
+      // Resolve with the message
+      resolver.resolve(message);
+      
+      // Remove from waiting resolvers
+      this.waitingResolvers.delete(waitId);
     }
   }
-
+  
   /**
-   * Send a message to the client
+   * Determine which sync strategy to use based on client state
    */
-  private async sendMessage(message: any): Promise<void> {
-    if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
-      this.webSocket.send(JSON.stringify(message));
-    } else {
-      syncLogger.warn('Cannot send message, WebSocket not open', { 
-        messageType: message.type 
+  private async determineSyncStrategy(
+    clientId: string, 
+    clientLSN: string
+  ): Promise<SyncStrategy> {
+    // Register the client
+    await this.stateManager.registerClient(clientId);
+    
+    // Store the client's LSN
+    await this.stateManager.updateClientLSN(clientId, clientLSN);
+    
+    // Get the current server LSN
+    const serverLSN = await this.stateManager.getServerLSN();
+    
+    syncLogger.info('Determining sync strategy', {
+      clientId,
+      clientLSN,
+      serverLSN
+    }, MODULE_NAME);
+    
+    // If client has no LSN (0/0), it needs initial sync
+    if (clientLSN === '0/0') {
+      syncLogger.info('Client needs initial sync', {
+        clientId
       }, MODULE_NAME);
+      return SyncStrategy.INITIAL;
+    }
+    
+    // If client LSN is behind server LSN, client needs catchup sync
+    if (compareLSN(clientLSN, serverLSN) < 0) {
+      syncLogger.info('Client needs catchup sync', {
+        clientId,
+        clientLSN,
+        serverLSN
+      }, MODULE_NAME);
+      return SyncStrategy.CATCHUP;
+    }
+    
+    // Client is up to date
+    syncLogger.info('Client is up to date', {
+      clientId,
+      lsn: clientLSN
+    }, MODULE_NAME);
+    return SyncStrategy.LIVE;
+  }
+  
+  /**
+   * Perform the appropriate sync based on determined strategy
+   */
+  private async performSync(
+    strategy: SyncStrategy,
+    clientId: string,
+    lsn: string
+  ): Promise<void> {
+    const context = this.getContext();
+    
+    switch (strategy) {
+      case SyncStrategy.INITIAL:
+        syncLogger.info('Starting initial sync', { 
+          clientId 
+        }, MODULE_NAME);
+        
+        // Update sync state
+        await this.stateManager.updateClientSyncState(clientId, 'initial');
+        
+        // Perform initial sync
+        await performInitialSync(
+          context,
+          this,  // WebSocketHandler - we implement this interface now
+          this.stateManager,
+          clientId
+        );
+        break;
+        
+      case SyncStrategy.CATCHUP:
+        syncLogger.info('Starting catchup sync', { 
+          clientId, 
+          startLSN: lsn 
+        }, MODULE_NAME);
+        
+        // Update sync state
+        await this.stateManager.updateClientSyncState(clientId, 'catchup');
+        
+        // Perform catchup sync
+        await performCatchupSync(
+          context,
+          clientId,
+          lsn,
+          this  // WebSocketHandler - we implement this interface now
+        );
+        
+        // After catchup, update client state to live
+        await this.stateManager.updateClientSyncState(clientId, 'live');
+        break;
+        
+      case SyncStrategy.LIVE:
+        // Already in live state, send a confirmation message
+        syncLogger.info('Client already in live sync state', { 
+          clientId 
+        }, MODULE_NAME);
+        
+        // Update sync state
+        await this.stateManager.updateClientSyncState(clientId, 'live');
+        
+        // Create and send sync completed message
+        const syncCompletedMsg = createLiveSyncConfirmation(clientId, lsn);
+        await this.send(syncCompletedMsg);
+        break;
     }
   }
+  
+  /**
+   * Handle new changes notification
+   */
+  private async handleNewChanges(request: Request): Promise<Response> {
+    // Extract parameters from request
+    const clientId = getQueryParam(request, 'clientId');
+    const lsnFromUrl = getQueryParam(request, 'lsn');
 
-  // Create a minimal context for operations
-  private getContext(): MinimalContext {
-    return this.context;
+    syncLogger.info('Received new changes request', {
+      clientId,
+      lsnFromUrl
+    }, MODULE_NAME);
+
+    // Basic validation
+    if (!clientId) {
+      return new Response('Missing clientId parameter', { 
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Validate LSN if provided
+    if (lsnFromUrl && !isValidLSN(lsnFromUrl)) {
+      syncLogger.error('Invalid LSN format in request', {
+        clientId,
+        lsn: lsnFromUrl
+      }, MODULE_NAME);
+      return new Response(JSON.stringify({
+        error: 'Invalid LSN format'
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Parse the request body to get the changes
+    let requestData;
+    let changes;
+    try {
+      requestData = await request.json() as { 
+        changes: any[],
+        lastLSN?: string 
+      };
+      
+      // Extract changes array from request data
+      changes = requestData.changes || [];
+      
+      if (!Array.isArray(changes)) {
+        throw new Error('Expected array of changes');
+      }
+      
+      syncLogger.info('Received client notification request', {
+        clientId,
+        changeCount: changes.length,
+        connectionActive: this.isConnected(),
+        receivedLSN: requestData.lastLSN || 'not provided'
+      }, MODULE_NAME);
+    } catch (error) {
+      return new Response(JSON.stringify({
+        error: 'Invalid changes format',
+        details: error instanceof Error ? error.message : String(error)
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // If no changes, return success immediately
+    if (changes.length === 0) {
+      return new Response(JSON.stringify({
+        success: true,
+        notified: false,
+        message: 'No changes to notify'
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // If we don't have an active WebSocket connection, can't notify
+    if (!this.isConnected()) {
+      syncLogger.warn('Cannot notify client, no active connection', {
+        clientId
+      }, MODULE_NAME);
+      
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'No active WebSocket connection for client'
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get client LSN - prefer URL parameter, fallback to request body, then state manager
+    let lsn = lsnFromUrl;
+    
+    // If not in URL params, try the request body
+    if (!lsn && requestData.lastLSN) {
+      lsn = requestData.lastLSN;
+    }
+    
+    // If still not found, fallback to state manager
+    if (!lsn) {
+      try {
+        // Use getLSN from state manager if clientId matches current clientId
+        if (this.clientId === clientId) {
+          lsn = this.stateManager.getLSN();
+          if (!lsn) {
+            syncLogger.warn('No LSN available for client', {
+              clientId
+            }, MODULE_NAME);
+            // Don't throw here, but use 0/0 as a last resort
+            lsn = '0/0';
+          }
+        } else {
+          syncLogger.warn('Client ID mismatch, cannot get LSN from state manager', {
+            requestClientId: clientId,
+            currentClientId: this.clientId
+          }, MODULE_NAME);
+          // For consistency with previous implementation
+          lsn = '0/0';
+        }
+      } catch (error) {
+        syncLogger.error('Failed to get client LSN', {
+          clientId,
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+        // For consistency with previous implementation
+        lsn = '0/0';
+      }
+    }
+
+    // Send changes to client
+    const ctx = this.getContext();
+    
+    syncLogger.debug('Using LSN for sync', {
+      clientId,
+      providedLSN: lsn,
+      source: lsnFromUrl ? 'url' : (requestData.lastLSN ? 'request body' : 'state-manager')
+    }, MODULE_NAME);
+    
+    const result = await sendLiveChanges(
+      ctx,          // Context for logging/environment
+      clientId,     // Client ID
+      changes,      // The changes to send 
+      this,         // WebSocketHandler (this instance)
+      lsn           // LSN from request or state manager
+    );
+
+    if (result.success) {
+      return new Response(JSON.stringify({
+        success: true,
+        notified: true,
+        lsn: result.lsn
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } else {
+      syncLogger.warn('Failed to send live changes', {
+        clientId
+      }, MODULE_NAME);
+      
+      return new Response(JSON.stringify({
+        success: false,
+        error: 'Failed to send live changes',
+        partialSuccess: true
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   }
-
+  
+  /**
+   * Handle metrics request
+   */
+  private async handleMetrics(): Promise<Response> {
+    const metrics = await this.stateManager.getMetrics();
+    const errors = await this.stateManager.getErrors();
+    
+    return new Response(JSON.stringify({
+      ...metrics,
+      errors: errors.map(err => ({
+        message: err.message,
+        stack: err.stack
+      })),
+      lastLSN: this.stateManager.getLSN(),
+      lastWakeTime: metrics.lastWakeTime,
+      connections: this.webSocket ? 1 : 0,
+      id: this.syncId
+    }), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+  
+  /**
+   * Create a minimal context for use with other modules
+   */
+  private getContext(): MinimalContext {
+    return {
+      env: this.env,
+      executionCtx: {
+        waitUntil: (promise: Promise<any>) => this.state.waitUntil(promise),
+        passThroughOnException: () => {},
+        props: undefined
+      }
+    };
+  }
+  
+  // WebSocketHandler implementation
+  
   /**
    * Send a message to the client using type-safe interface
    */
@@ -127,458 +670,106 @@ export class SyncDO implements DurableObject {
       }, MODULE_NAME);
     }
   }
-
+  
   /**
-   * Register a handler for a specific message type
+   * Register a message handler for a specific message type
    */
-  onMessage<T extends CltMessageType>(
-    type: T,
-    handler: MessageHandlerFn<ClientMessage>
+  onMessage<T extends ClientMessage['type']>(
+    type: T, 
+    handler: (message: ClientMessage) => Promise<void>
   ): void {
-    this.messageHandlers.set(type, handler);
-    syncLogger.debug('Registered message handler:', { type }, MODULE_NAME);
+    if (!this.messageHandlers.has(type)) {
+      this.messageHandlers.set(type, []);
+    }
+    
+    this.messageHandlers.get(type)!.push(handler);
+    
+    syncLogger.debug('Registered message handler', { 
+      type,
+      handlersCount: this.messageHandlers.get(type)!.length
+    }, MODULE_NAME);
   }
-
+  
   /**
-   * Remove a message handler
+   * Remove a message handler for a specific type
    */
-  removeHandler(type: CltMessageType): void {
+  removeHandler(type: ClientMessage['type']): void {
     this.messageHandlers.delete(type);
-    syncLogger.debug('Removed message handler:', { type }, MODULE_NAME);
+    syncLogger.debug('Removed all handlers for type', { type }, MODULE_NAME);
   }
-
+  
   /**
-   * Remove all message handlers
+   * Clear all message handlers
    */
   clearHandlers(): void {
     this.messageHandlers.clear();
-    syncLogger.debug('Cleared all message handlers', undefined, MODULE_NAME);
+    syncLogger.debug('Cleared all message handlers', {}, MODULE_NAME);
   }
-
+  
   /**
-   * Check if WebSocket is connected
+   * Check if the WebSocket is connected
    */
   isConnected(): boolean {
-    return this.webSocket?.readyState === WS_READY_STATE.OPEN;
+    return this.webSocket !== null && this.webSocket.readyState === WS_READY_STATE.OPEN;
   }
-
+  
   /**
-   * Wait for a message of a specific type with optional filter
+   * Wait for a specific message type from client
    */
-  waitForMessage(
-    type: CltMessageType,
-    filter?: (msg: any) => boolean,
-    timeoutMs: number = 30000 // Default timeout of 30 seconds
+  async waitForMessage(
+    type: ClientMessage['type'], 
+    filter?: ((msg: any) => boolean) | undefined, 
+    timeoutMs: number = 30000
   ): Promise<any> {
-    return new Promise((resolve, reject) => {
-      if (!this.webSocket || this.webSocket.readyState !== WS_READY_STATE.OPEN) {
-        return reject(new Error('WebSocket not open'));
-      }
-      
-      // Flag to track if the promise has been resolved/rejected
-      let isCompleted = false;
-      
-      // Create a unique handler ID for this specific wait operation
-      const handlerId = `${type}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      // Create timeout to avoid hanging indefinitely
-      const timeoutId = setTimeout(() => {
-        if (isCompleted) return;
-        isCompleted = true;
-        
-        // Remove the temporary message handler
-        this.tempMessageHandlers.delete(handlerId);
-        
-        syncLogger.error('Timeout waiting for message', { 
-          type,
-          timeoutMs 
-        }, MODULE_NAME);
-        
-        reject(new Error(`Timeout waiting for message type: ${type}`));
-      }, timeoutMs);
-
-      // Create a temporary message handler for this specific message type
-      const messageHandler = (message: any) => {
-        // Skip processing if we're already done
-        if (isCompleted) return;
-        
-        // Apply filter if provided
-        if (filter && !filter(message)) {
-          return; // This message doesn't match our filter criteria
-        }
-        
-        // Message matches what we're waiting for
-        clearTimeout(timeoutId);
-        isCompleted = true;
-        
-        // Remove the temporary message handler
-        this.tempMessageHandlers.delete(handlerId);
-        
-        // Resolve with the message
-        resolve(message);
-      };
-      
-      // Register temporary message handler
-      this.tempMessageHandlers.set(handlerId, messageHandler);
-      
-      // Also register to actual type so it's processed by the message listener
-      const existingHandler = this.messageHandlers.get(type);
-      const wrappedHandler: MessageHandlerFn<ClientMessage> = async (message) => {
-        // Call existing handler if any
-        if (existingHandler) {
-          await existingHandler(message);
-        }
-        
-        // Process through all temporary handlers for this type
-        for (const [id, handler] of this.tempMessageHandlers.entries()) {
-          if (id.startsWith(type)) {
-            handler(message);
-          }
-        }
-      };
-      
-      // Set or update the handler
-      this.messageHandlers.set(type, wrappedHandler);
-    });
-  }
-
-  /**
-   * Handle inbound request (HTTP or WebSocket)
-   */
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const clientId = url.searchParams.get('clientId');
-    const lsn = url.searchParams.get('lsn');
+    // Check if we already have a message of this type in the queue
+    const existingMessages = this.messageQueue.get(type) || [];
     
-    syncLogger.debug('Fetch request', {
-      syncId: this.syncId,
-      isWebSocket: request.headers.get('Upgrade') === 'websocket',
-      clientId: clientId || 'missing',
-      hasLSN: !!lsn
-    }, MODULE_NAME);
-
-    if (!clientId) {
-      syncLogger.error('Client ID missing in request', undefined, MODULE_NAME);
-      return new Response('Missing clientId parameter', { status: 400 });
+    // If we have messages and no filter, return the first one
+    if (existingMessages.length > 0 && !filter) {
+      const message = existingMessages.shift();
+      return message;
     }
-
-    if (!lsn) {
-      syncLogger.error('LSN missing in request', undefined, MODULE_NAME);
-      return new Response('Missing lsn parameter', { status: 400 });
+    
+    // If we have messages and a filter, check if any match
+    if (existingMessages.length > 0 && filter) {
+      const index = existingMessages.findIndex(msg => filter(msg));
+      if (index >= 0) {
+        const message = existingMessages.splice(index, 1)[0];
+        return message;
+      }
     }
-
-    // Validate LSN format (X/Y where X and Y are hexadecimal)
-    const isValidLSN = (lsn: string): boolean => /^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn) || lsn === '0/0';
-    if (!isValidLSN(lsn)) {
-      syncLogger.error('Invalid LSN format', { lsn }, MODULE_NAME);
-      return new Response('Invalid LSN format', { status: 400 });
-    }
-
-    syncLogger.info('Request parameters', { 
-      clientId, 
-      lsnFormat: lsn === '0/0' ? 'zero' : 'standard'
-    }, MODULE_NAME);
-
-    // Check if it's a WebSocket connection upgrade
-    if (request.headers.get('Upgrade') === 'websocket') {
-      syncLogger.info('WebSocket connection', { 
-        clientId,
-        status: 'accepting'
-      }, MODULE_NAME);
+    
+    // Otherwise, we need to wait for a new message
+    return new Promise((resolve, reject) => {
+      const waitId = `wait_${type}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
       
-      try {
-        // Create WebSocket pair
-        // @ts-ignore: WebSocketPair is defined in Cloudflare Workers runtime
-        const pair = new WebSocketPair();
-        const clientSocket = pair[0];
-        const serverSocket = pair[1];
-        
-        // Accept the connection on the server side
-        serverSocket.accept();
-        
-        // Store the WebSocket for later use
-        this.webSocket = serverSocket;
-        
-        syncLogger.debug('WebSocket ready', { 
-          clientId,
-          readyState: serverSocket.readyState 
-        }, MODULE_NAME);
-
-        // Log whenever we receive a message
-        serverSocket.addEventListener('message', (event: { data: any }) => {
-          try {
-            const data = typeof event.data === 'string' 
-              ? JSON.parse(event.data) 
-              : JSON.parse(new TextDecoder().decode(event.data));
-            
-            syncLogger.debug('Message Received', {
-              clientId,
-              type: data.type
-            }, MODULE_NAME);
-            
-            // Process the message with registered handlers if available
-            const handler = this.messageHandlers.get(data.type);
-            if (handler) {
-              handler(data).catch(error => {
-                syncLogger.error('Message handler error', {
-                  clientId,
-                  type: data.type,
-                  error: error instanceof Error ? error.message : String(error)
-                }, MODULE_NAME);
-              });
-            }
-            // If no handler is registered, we just log it but don't warn
-            // This allows the modules to use their own message handling logic (like waitForMessage)
-          } catch (error) {
-            syncLogger.error('Message parse error', {
-              clientId,
-              error: error instanceof Error ? error.message : String(error)
-            }, MODULE_NAME);
+      // Set up timeout
+      const timer = setTimeout(() => {
+        if (this.waitingResolvers.has(waitId)) {
+          this.waitingResolvers.delete(waitId);
+          reject(new Error(`Timeout waiting for message of type ${type}`));
+        }
+      }, timeoutMs);
+      
+      // Store resolver
+      this.waitingResolvers.set(waitId, {
+        resolve: (message: any) => {
+          // If there's a filter and the message doesn't match, continue waiting
+          if (filter && !filter(message)) {
+            return;
           }
-        });
-
-        // Set up close event handler
-        serverSocket.addEventListener('close', (event: { code: number, reason: string }) => {
-          syncLogger.info('WebSocket closed', { 
-            clientId,
-            code: event.code
-          }, MODULE_NAME);
           
-          // Mark client as inactive
-          this.state.waitUntil(
-            (async () => {
-              try {
-                syncLogger.debug('Connection cleanup started', { clientId }, MODULE_NAME);
-                await this.stateManager.cleanupConnection();
-                syncLogger.debug('Connection cleanup completed', { clientId }, MODULE_NAME);
-              } catch (error) {
-                syncLogger.error('Connection cleanup failed', {
-                  clientId,
-                  error: error instanceof Error ? error.message : String(error)
-                }, MODULE_NAME);
-              }
-            })()
-          );
-          
-          this.webSocket = null;
-        });
-
-        // Set up error event handler
-        serverSocket.addEventListener('error', (event: { error: any }) => {
-          syncLogger.error('WebSocket error', { 
-            clientId,
-            error: event.error
-          }, MODULE_NAME);
-        });
-
-        // Create proper minimal context for operations
-        const context = this.getContext();
-
-        // Check if the client already has a recent LSN and needs catchup sync
-        const needsCatchupSync = lsn !== '0/0';
-        
-        syncLogger.info('Initiating sync', { 
-          clientId,
-          lsn,
-          syncType: needsCatchupSync ? 'catchup' : 'initial'
-        }, MODULE_NAME);
-        
-        // Immediately register client and start sync process in background
-        this.state.waitUntil(
-          (async () => {
-            try {
-              // First register the client and update LSN
-              await this.stateManager.registerClient(clientId);
-              await this.stateManager.updateClientLSN(clientId, lsn);
-              await this.stateManager.initializeConnection();
-              await this.init();
-              
-              if (needsCatchupSync) {
-                // Perform catchup sync for clients with an existing LSN
-                syncLogger.info('Starting catchup sync', { clientId, startLSN: lsn }, MODULE_NAME);
-                await performCatchupSync(
-                  context,
-                  clientId,
-                  lsn,
-                  this // Pass 'this' as the WebSocketHandler implementation
-                );
-                
-                // Update client sync state to live after catchup completes successfully
-                await this.stateManager.updateClientSyncState(clientId, 'live');
-              } else {
-                // Perform initial sync for new clients
-                syncLogger.info('Starting initial sync', { clientId }, MODULE_NAME);
-                await performInitialSync(
-                  context,
-                  this, // Pass 'this' as the WebSocketHandler implementation
-                  this.stateManager,
-                  clientId
-                );
-              }
-            } catch (error) {
-              syncLogger.error('Sync failed', {
-                clientId,
-                error: error instanceof Error ? error.message : String(error)
-              }, MODULE_NAME);
-              
-              // Try to close the connection with an error code if something went wrong
-              try {
-                if (serverSocket.readyState === 1) { // Open
-                  serverSocket.close(1011, 'Internal server error during sync');
-                }
-              } catch (closeError) {
-                syncLogger.error('Error closing WebSocket connection', {
-                  clientId,
-                  error: closeError instanceof Error ? closeError.message : String(closeError)
-                }, MODULE_NAME);
-              }
-            }
-          })()
-        );
-
-        return new Response(null, {
-          status: 101,
-          webSocket: clientSocket
-        });
-      } catch (err) {
-        syncLogger.error('WebSocket setup failed', {
-          syncId: this.syncId,
-          error: err instanceof Error ? err.message : String(err)
-        }, MODULE_NAME);
-        return new Response('Internal Server Error', { status: 500 });
-      }
-    }
-
-    // Handle metrics request
-    if (url.pathname.endsWith('/metrics')) {
-      const metrics = await this.stateManager.getMetrics();
-      const errors = await this.stateManager.getErrors();
-      
-      return new Response(JSON.stringify({
-        ...metrics,
-        errors: errors.map(err => ({
-          message: err.message,
-          stack: err.stack
-        })),
-        lastLSN: this.stateManager.getLSN(),
-        lastWakeTime: metrics.lastWakeTime
-      }), {
-        headers: { 'Content-Type': 'application/json' }
+          resolve(message);
+        },
+        reject,
+        timer
       });
-    }
-
-    // Handle the /new-changes endpoint for client notifications
-    if (url.pathname === '/new-changes') {
-      try {
-        // Ensure we have a client ID
-        if (!clientId) {
-          syncLogger.error('Client ID missing in notification request', undefined, MODULE_NAME);
-          return new Response('Missing clientId parameter', { status: 400 });
-        }
-
-        // Parse the request body to get the changes
-        const requestData = await request.json() as { 
-          changes: TableChange[],
-          lastLSN?: string 
-        };
-        const changes = requestData.changes || [];
-        
-        syncLogger.info('Received client notification request', {
-          clientId,
-          changeCount: changes.length,
-          connectionActive: this.isConnected(),
-          receivedLSN: requestData.lastLSN || 'not provided'
-        }, MODULE_NAME);
-
-        // If we don't have an active WebSocket connection, can't notify
-        if (!this.isConnected()) {
-          syncLogger.warn('Cannot notify client, no active connection', {
-            clientId
-          }, MODULE_NAME);
-          
-          return new Response(JSON.stringify({
-            success: false,
-            error: 'No active WebSocket connection for client'
-          }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-
-        // Get the LSN from the request if provided, otherwise fall back to state manager
-        // Extract from URL parameters first (for backward compatibility)
-        let lsnFromUrl = url.searchParams.get('lsn');
-        // If not in URL or is the default value, try the request body
-        if (!lsnFromUrl || lsnFromUrl === '0/0') {
-          lsnFromUrl = requestData.lastLSN || null;
-        }
-        
-        // Use the provided LSN or fall back to the state manager
-        const lsn = (lsnFromUrl && lsnFromUrl !== '0/0') 
-          ? lsnFromUrl 
-          : this.stateManager.getLSN() || '0/0';
-        
-        // Use the specialized function to send changes
-        const ctx = this.getContext();
-        
-        // Log LSN information for debugging
-        syncLogger.debug('Using LSN for sync', {
-          clientId,
-          providedLSN: lsn,
-          source: lsnFromUrl && lsnFromUrl !== '0/0' ? 'request' : 'state-manager'
-        }, MODULE_NAME);
-        
-        const result = await performLiveSync(
-          ctx,          // Context for logging/environment
-          clientId,     // Client ID
-          changes,      // The changes to send 
-          this,         // WebSocketHandler (this instance)
-          lsn           // LSN from request or state manager
-        );
-
-        if (result.success) {
-          syncLogger.info('Successfully notified client of changes', {
-            clientId,
-            changeCount: changes.length,
-            lsn: result.lsn
-          }, MODULE_NAME);
-
-          return new Response(JSON.stringify({
-            success: true,
-            notified: true,
-            lsn: result.lsn
-          }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        } else {
-          syncLogger.warn('Failed to notify client of some changes', {
-            clientId,
-            changeCount: changes.length
-          }, MODULE_NAME);
-          
-          return new Response(JSON.stringify({
-            success: false,
-            error: 'Failed to send some change notifications',
-            partialSuccess: true
-          }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-      } catch (error) {
-        syncLogger.error('Error handling client notification', {
-          clientId,
-          error: error instanceof Error ? error.message : String(error)
-        }, MODULE_NAME);
-        return new Response('Internal Server Error', { status: 500 });
-      }
-    }
-
-    // All other requests are not supported
-    return new Response('This endpoint only supports WebSocket connections', { 
-      status: 426, // Upgrade Required 
-      headers: { 'Upgrade': 'websocket' } 
+      
+      syncLogger.debug('Waiting for message', { 
+        type,
+        waitId,
+        timeout: timeoutMs
+      }, MODULE_NAME);
     });
   }
 } 
