@@ -29,10 +29,16 @@ export function compareLSN(lsn1: string, lsn2: string): number {
 /**
  * Deduplicate changes by keeping only the latest change for each record
  * Uses last-write-wins based on updated_at timestamp
+ * Also optimizes insert+update sequences into a single insert with latest data
  */
 export function deduplicateChanges(changes: TableChange[]): TableChange[] {
+  // Process into a map with the latest change for each record id
   const latestChanges = new Map<string, TableChange>();
+  
+  // Also track which tables+ids have inserts (for optimization)
+  const insertMap = new Map<string, TableChange>();
 
+  // First pass - find the latest change for each record
   for (const change of changes) {
     // Skip if no id in the change data
     if (!change.data?.id) {
@@ -42,15 +48,54 @@ export function deduplicateChanges(changes: TableChange[]): TableChange[] {
     const key = `${change.table}:${change.data.id}`;
     const existing = latestChanges.get(key);
     
+    // Keep track of inserts for later optimization
+    if (change.operation === 'insert') {
+      insertMap.set(key, change);
+    }
+    
     // Keep change if no existing one, or if this one is newer
     if (!existing || new Date(change.updated_at) >= new Date(existing.updated_at)) {
       latestChanges.set(key, change);
     }
   }
+  
+  // Second pass - optimize insert+update patterns
+  const result: TableChange[] = [];
+  
+  for (const [key, change] of latestChanges.entries()) {
+    // If this is an update and we previously saw an insert for this record
+    if (change.operation === 'update' && insertMap.has(key)) {
+      const insert = insertMap.get(key)!;
+      
+      // Skip if the insert is already the latest change (no optimization needed)
+      if (insert === change) {
+        result.push(change);
+        continue;
+      }
+      
+      // Create an optimized change that merges the insert and update
+      const optimizedChange: TableChange = {
+        table: change.table,
+        operation: 'insert', // Keep as insert but will use ON CONFLICT in DB
+        data: {
+          ...insert.data, // Base data from insert
+          ...change.data, // Overridden by update data
+          id: change.data.id,
+          client_id: change.data.client_id
+        },
+        updated_at: change.updated_at,
+        lsn: change.lsn // Keep the latest LSN
+      };
+      
+      result.push(optimizedChange);
+    } else {
+      // For all other cases, use the deduplicated change as is
+      result.push(change);
+    }
+  }
 
-  // Convert back to array and sort by LSN for consistency
-  return Array.from(latestChanges.values())
-    .sort((a, b) => compareLSN(a.lsn!, b.lsn!));
+  // Sort changes by LSN for consistency
+  return orderChangesByDomain(result.sort((a, b) => compareLSN(a.lsn!, b.lsn!)));
 }
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;

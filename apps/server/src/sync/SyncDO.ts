@@ -12,9 +12,11 @@
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
 import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation } from './server-changes';
+import { processClientChanges } from './client-changes';
 import type { 
   ServerMessage, 
   ClientMessage,
+  ClientChangesMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
@@ -342,6 +344,28 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     
     // Store the client's LSN
     await this.stateManager.updateClientLSN(clientId, clientLSN);
+    
+    // Register message handler for client changes
+    this.onMessage('clt_send_changes', async (message: ClientMessage) => {
+      syncLogger.info('Received client changes message', {
+        clientId: this.clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      
+      try {
+        // Process client changes
+        await processClientChanges(
+          message as ClientChangesMessage,
+          this.getContext(),
+          this
+        );
+      } catch (error) {
+        syncLogger.error('Error processing client changes', {
+          clientId: this.clientId,
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+      }
+    });
     
     // Get the current server LSN
     const serverLSN = await this.stateManager.getServerLSN();

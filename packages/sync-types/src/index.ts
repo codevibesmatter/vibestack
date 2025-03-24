@@ -34,6 +34,17 @@ export interface TableChange {
   updated_at: string;  // ISO timestamp of when the record was updated
 }
 
+/**
+ * Strongly typed record data for sync operations
+ * Represents the common fields expected in all records
+ */
+export interface RecordData {
+  id: string;
+  client_id: string;
+  updated_at: string;
+  [key: string]: unknown;  // Additional fields specific to each record type
+}
+
 // Export message types and interfaces
 export type {
   CltMessageType,

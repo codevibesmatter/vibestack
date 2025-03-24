@@ -71,108 +71,43 @@ export class ChangeProcessor {
   async processChanges(message: ClientChangesMessage): Promise<void> {
     const { clientId, changes } = message;
     
-    syncLogger.info(`Processing ${changes.length} changes for client ${clientId}`, {
-      changeCount: changes.length,
-      clientId,
-      messageId: message.messageId,
-      changeTypes: changes.map(c => c.operation).join(',')
-    }, MODULE_NAME);
+    syncLogger.info(`Processing ${changes.length} changes for client ${clientId}`);
 
     try {
       // Set statement timeout
       await this.setStatementTimeout();
-      syncLogger.debug(`Set statement timeout to ${this.config.database.statementTimeoutMs}ms`, {
-        clientId,
-        timeout: this.config.database.statementTimeoutMs
-      }, MODULE_NAME);
       
       // Extract change IDs for acknowledgment
       const changeIds = changes.map(change => (change.data as RecordData).id);
       
-      // Send received acknowledgment first - need to make sure this works
-      try {
-        syncLogger.info(`Preparing to send received acknowledgment for ${changeIds.length} changes`, {
-          clientId,
-          changeCount: changeIds.length
-        }, MODULE_NAME);
-        
-        await this.sendChangesReceived(clientId, changeIds);
-        syncLogger.info(`Sent received acknowledgment for ${changeIds.length} changes to client ${clientId}`, {
-          clientId,
-          changeCount: changeIds.length
-        }, MODULE_NAME);
-      } catch (ackError) {
-        syncLogger.error(`Failed to send received acknowledgment: ${ackError instanceof Error ? ackError.message : String(ackError)}`, {
-          clientId,
-          errorDetails: ackError instanceof Error ? ackError.stack : 'No stack trace'
-        }, MODULE_NAME);
-        // Continue processing even if acknowledgment fails
-      }
+      // Send received acknowledgment first
+      await this.sendChangesReceived(clientId, changeIds);
       
       // Deduplicate changes
-      syncLogger.debug(`Deduplicating ${changes.length} changes`, { clientId }, MODULE_NAME);
       const optimizedChanges = deduplicateChanges(changes);
       
       if (optimizedChanges.length < changes.length) {
-        syncLogger.info(`Optimized ${changes.length} changes to ${optimizedChanges.length}`, {
-          clientId,
-          originalCount: changes.length,
-          optimizedCount: optimizedChanges.length
-        }, MODULE_NAME);
+        syncLogger.info(`Optimized ${changes.length} changes to ${optimizedChanges.length}`);
       }
       
       // Process changes - no transaction needed as we're grouping by table/operation
       // and letting the database handle CRDT conflicts
-      syncLogger.debug(`Processing ${optimizedChanges.length} changes`, { clientId }, MODULE_NAME);
       const results = await this.processAllChanges(optimizedChanges);
       
       // Summarize results
       const summary = this.summarizeResults(results);
-      syncLogger.info(`Change processing results: ${summary.appliedCount} applied, ${summary.skippedCount} skipped`, {
-        clientId,
-        appliedCount: summary.appliedCount,
-        skippedCount: summary.skippedCount,
-        successful: summary.allSuccessful,
-        hasError: !!summary.lastError
-      }, MODULE_NAME);
       
       // Send applied acknowledgment
-      try {
-        syncLogger.info(`Preparing to send applied acknowledgment for ${changeIds.length} changes`, {
-          clientId,
-          changeCount: changeIds.length,
-          success: summary.allSuccessful
-        }, MODULE_NAME);
-        
-        await this.sendChangesApplied(
-          clientId, 
-          changeIds,
-          summary.allSuccessful,
-          summary.lastError
-        );
-        syncLogger.info(`Sent applied acknowledgment for ${changeIds.length} changes to client ${clientId}`, {
-          clientId,
-          changeCount: changeIds.length,
-          success: summary.allSuccessful
-        }, MODULE_NAME);
-      } catch (appliedError) {
-        syncLogger.error(`Failed to send applied acknowledgment: ${appliedError instanceof Error ? appliedError.message : String(appliedError)}`, {
-          clientId,
-          errorDetails: appliedError instanceof Error ? appliedError.stack : 'No stack trace'
-        }, MODULE_NAME);
-      }
+      await this.sendChangesApplied(
+        clientId, 
+        changeIds,
+        summary.allSuccessful,
+        summary.lastError
+      );
       
-      syncLogger.info(`Completed processing ${optimizedChanges.length} changes: ${summary.appliedCount} applied, ${summary.skippedCount} skipped`, {
-        clientId,
-        changeCount: optimizedChanges.length,
-        appliedCount: summary.appliedCount,
-        skippedCount: summary.skippedCount
-      }, MODULE_NAME);
+      syncLogger.info(`Processed ${optimizedChanges.length} changes: ${summary.appliedCount} applied, ${summary.skippedCount} skipped`);
     } catch (error) {
-      syncLogger.error(`Batch processing failed: ${error instanceof Error ? error.message : error}`, {
-        clientId,
-        errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-      }, MODULE_NAME);
+      syncLogger.error(`Batch processing failed: ${error instanceof Error ? error.message : error}`);
       
       // Send error response
       await this.sendError(clientId, error instanceof Error ? error : new Error(String(error)));
@@ -185,12 +120,6 @@ export class ChangeProcessor {
   private async processAllChanges(changes: TableChange[]): Promise<ExecutionResult[]> {
     // Group changes by table and operation
     const groups = this.groupChangesByTableAndOperation(changes);
-    syncLogger.debug(`Grouped ${changes.length} changes into ${groups.length} table/operation groups`, {
-      groupCount: groups.length,
-      tables: groups.map(g => g.table).join(','),
-      operations: groups.map(g => g.operation).join(',')
-    }, MODULE_NAME);
-    
     const results: ExecutionResult[] = [];
     const processingMap = new Map<string, boolean>(); // Track which changes were processed
     
@@ -202,12 +131,6 @@ export class ChangeProcessor {
     
     // Process each group
     for (const group of groups) {
-      syncLogger.debug(`Processing group: ${group.table}/${group.operation} with ${group.changes.length} changes`, {
-        table: group.table,
-        operation: group.operation,
-        changeCount: group.changes.length
-      }, MODULE_NAME);
-      
       try {
         let batchResults: any[] = [];
         
@@ -215,29 +138,16 @@ export class ChangeProcessor {
           case 'insert':
             // Use true batch insert for better performance
             if (group.changes.length > 1) {
-              syncLogger.debug(`Using batch insert for ${group.changes.length} ${group.table} records`, {
-                table: group.table,
-                count: group.changes.length
-              }, MODULE_NAME);
               batchResults = await this.executeBatchInsert(group.table, group.changes);
             } else {
-              syncLogger.debug(`Using single insert for ${group.table}`, { table: group.table }, MODULE_NAME);
               batchResults = await this.executeBatch(group.table, group.changes, this.executeInsert.bind(this));
             }
             break;
           case 'update':
             // We can use batch for updates too since we're already grouping by table
-            syncLogger.debug(`Using batch update for ${group.changes.length} ${group.table} records`, {
-              table: group.table,
-              count: group.changes.length
-            }, MODULE_NAME);
             batchResults = await this.executeBatch(group.table, group.changes, this.executeUpdate.bind(this));
             break;
           case 'delete':
-            syncLogger.debug(`Using batch delete for ${group.changes.length} ${group.table} records`, {
-              table: group.table,
-              count: group.changes.length
-            }, MODULE_NAME);
             batchResults = await this.executeBatch(
               group.table, 
               group.changes, 
@@ -247,13 +157,6 @@ export class ChangeProcessor {
         }
         
         // Mark successful changes
-        syncLogger.debug(`Batch operation results: ${batchResults.length} successful operations for ${group.table}/${group.operation}`, {
-          table: group.table,
-          operation: group.operation,
-          successCount: batchResults.length,
-          totalCount: group.changes.length
-        }, MODULE_NAME);
-        
         for (const result of batchResults) {
           if (result && result.id) {
             processingMap.set(result.id, true); // Mark as processed
@@ -263,19 +166,9 @@ export class ChangeProcessor {
       } catch (error) {
         syncLogger.error(`Group processing failed: ${group.table} ${group.operation}: ${
           error instanceof Error ? error.message : String(error)
-        }`, {
-          table: group.table,
-          operation: group.operation,
-          errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-        }, MODULE_NAME);
+        }`);
         
         // Fall back to individual processing
-        syncLogger.info(`Falling back to individual processing for ${group.table}/${group.operation}`, {
-          table: group.table,
-          operation: group.operation,
-          changeCount: group.changes.length
-        }, MODULE_NAME);
-        
         try {
           const individualResults = await this.processIndividually(
             group.table, 
@@ -284,13 +177,6 @@ export class ChangeProcessor {
           );
           
           // Mark successful individual changes
-          syncLogger.debug(`Individual operation results: ${individualResults.length} successful operations for ${group.table}/${group.operation}`, {
-            table: group.table, 
-            operation: group.operation,
-            successCount: individualResults.length,
-            totalCount: group.changes.length
-          }, MODULE_NAME);
-          
           for (const result of individualResults) {
             if (result && result.id) {
               processingMap.set(result.id, true); // Mark as processed
@@ -300,21 +186,15 @@ export class ChangeProcessor {
         } catch (individualError) {
           syncLogger.error(`Individual processing also failed: ${
             individualError instanceof Error ? individualError.message : String(individualError)
-          }`, {
-            table: group.table,
-            operation: group.operation,
-            errorDetails: individualError instanceof Error ? individualError.stack : 'No stack trace'
-          }, MODULE_NAME);
+          }`);
         }
       }
     }
     
     // Add results for skipped changes (likely CRDT conflicts)
-    let skippedCount = 0;
     for (const change of changes) {
       const data = change.data as RecordData;
       if (!processingMap.get(data.id)) {
-        skippedCount++;
         // This change was skipped - likely a database-level CRDT conflict
         results.push({
           success: true, // Not an error, just skipped
@@ -333,20 +213,6 @@ export class ChangeProcessor {
       }
     }
     
-    if (skippedCount > 0) {
-      syncLogger.info(`${skippedCount} changes were skipped due to conflicts`, { 
-        skippedCount,
-        totalCount: changes.length
-      }, MODULE_NAME);
-    }
-    
-    syncLogger.debug(`processAllChanges completed: ${results.length} total results`, {
-      resultCount: results.length,
-      successCount: results.filter(r => r.success && !r.skipped).length,
-      skippedCount: results.filter(r => r.skipped).length,
-      errorCount: results.filter(r => !r.success).length
-    }, MODULE_NAME);
-    
     return results;
   }
   
@@ -359,17 +225,7 @@ export class ChangeProcessor {
     executor: (table: string, data: RecordData) => Promise<any>
   ): Promise<any[]> {
     if (changes.length === 0) return [];
-    
-    syncLogger.debug(`Executing batch operation on ${table} with ${changes.length} changes`, {
-      table,
-      changeCount: changes.length
-    }, MODULE_NAME);
-    
-    if (changes.length === 1) {
-      syncLogger.debug(`Single record batch for ${table}`, { table }, MODULE_NAME);
-      const result = await executor(table, changes[0].data as RecordData);
-      return result ? [result] : [];
-    }
+    if (changes.length === 1) return [await executor(table, changes[0].data as RecordData)].filter(Boolean);
     
     const results: any[] = [];
     
@@ -377,47 +233,17 @@ export class ChangeProcessor {
     for (const change of changes) {
       try {
         const data = change.data as RecordData;
-        syncLogger.debug(`Executing operation on ${table} for ID ${data.id}`, {
-          table,
-          operation: change.operation,
-          id: data.id
-        }, MODULE_NAME);
-        
         const result = await executor(table, data);
         
         // Only add successful results (null results are CRDT conflicts)
-        if (result) {
-          syncLogger.debug(`Operation succeeded on ${table} for ID ${data.id}`, {
-            table,
-            operation: change.operation,
-            id: data.id
-          }, MODULE_NAME);
-          results.push(result);
-        } else {
-          syncLogger.debug(`Operation skipped on ${table} for ID ${data.id} (CRDT conflict)`, {
-            table,
-            operation: change.operation,
-            id: data.id
-          }, MODULE_NAME);
-        }
+        if (result) results.push(result);
       } catch (error) {
         // Log the error but continue processing other changes
         syncLogger.warn(`Error processing change ${table}:${change.operation} ${(change.data as RecordData).id}: ${
           error instanceof Error ? error.message : String(error)
-        }`, {
-          table,
-          operation: change.operation,
-          id: (change.data as RecordData).id,
-          errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-        }, MODULE_NAME);
+        }`);
       }
     }
-    
-    syncLogger.debug(`Completed batch operation on ${table}: ${results.length}/${changes.length} successful`, {
-      table,
-      successCount: results.length,
-      totalCount: changes.length
-    }, MODULE_NAME);
     
     return results;
   }
@@ -502,7 +328,6 @@ export class ChangeProcessor {
   private async executeInsert(table: string, data: RecordData): Promise<any> {
     // Validate data
     if (!data.id) {
-      syncLogger.error('Missing id in insert operation', { table }, MODULE_NAME);
       throw new ValidationError('Missing id in insert operation');
     }
     
@@ -527,46 +352,17 @@ export class ChangeProcessor {
       RETURNING *
     `;
 
-    syncLogger.debug(`Executing insert on ${table} for ID ${data.id}`, {
-      table,
-      id: data.id,
-      fields: fields.join(','),
-      timestamp: data.updated_at
-    }, MODULE_NAME);
-
     try {
-      syncLogger.debug(`Running SQL: ${query.replace(/\s+/g, ' ')}`, {
-        table,
-        id: data.id,
-        paramCount: values.length
-      }, MODULE_NAME);
-      
       const result = await this.client.query(query, values);
       
       // If no rows returned, it was likely rejected by the CRDT trigger
       if (result.rowCount === 0) {
-        syncLogger.info(`Insert rejected by CRDT rules for ${table} ${data.id}`, {
-          table,
-          id: data.id,
-          timestamp: data.updated_at
-        }, MODULE_NAME);
         // Just report as a conflict without extra fetch
         return null;
       }
       
-      syncLogger.debug(`Insert successful for ${table} ${data.id}`, {
-        table,
-        id: data.id,
-        rowCount: result.rowCount
-      }, MODULE_NAME);
-      
       return result.rows[0];
     } catch (error) {
-      syncLogger.error(`Insert failed for ${table} ${data.id}: ${error instanceof Error ? error.message : String(error)}`, {
-        table,
-        id: data.id, 
-        errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-      }, MODULE_NAME);
       throw new DatabaseError(
         error instanceof Error ? error.message : String(error),
         { table, operation: 'insert', id: data.id }
@@ -580,7 +376,6 @@ export class ChangeProcessor {
   private async executeUpdate(table: string, data: RecordData): Promise<any> {
     // Validate data
     if (!data.id) {
-      syncLogger.error('Missing id in update operation', { table }, MODULE_NAME);
       throw new ValidationError('Missing id in update operation');
     }
     
@@ -601,46 +396,17 @@ export class ChangeProcessor {
       RETURNING *
     `;
 
-    syncLogger.debug(`Executing update on ${table} for ID ${data.id}`, {
-      table,
-      id: data.id,
-      fields: fields.join(','),
-      timestamp: data.updated_at
-    }, MODULE_NAME);
-
     try {
-      syncLogger.debug(`Running SQL: ${query.replace(/\s+/g, ' ')}`, {
-        table,
-        id: data.id,
-        paramCount: values.length + 1
-      }, MODULE_NAME);
-      
       const result = await this.client.query(query, [...values, id]);
       
       // If no rows affected, the record doesn't exist or CRDT trigger rejected it
       if (result.rowCount === 0) {
-        syncLogger.info(`Update rejected for ${table} ${data.id} (record not found or CRDT conflict)`, {
-          table,
-          id: data.id,
-          timestamp: data.updated_at
-        }, MODULE_NAME);
         // Just return null, let caller handle it
         return null;
       }
       
-      syncLogger.debug(`Update successful for ${table} ${data.id}`, {
-        table,
-        id: data.id,
-        rowCount: result.rowCount
-      }, MODULE_NAME);
-      
       return result.rows[0];
     } catch (error) {
-      syncLogger.error(`Update failed for ${table} ${data.id}: ${error instanceof Error ? error.message : String(error)}`, {
-        table,
-        id: data.id,
-        errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-      }, MODULE_NAME);
       throw new DatabaseError(
         error instanceof Error ? error.message : String(error),
         { table, operation: 'update', id: data.id }
@@ -661,43 +427,10 @@ export class ChangeProcessor {
       RETURNING *
     `;
 
-    syncLogger.debug(`Executing delete on ${table} for ID ${id}`, {
-      table,
-      id,
-      timestamp
-    }, MODULE_NAME);
-
     try {
-      syncLogger.debug(`Running SQL: ${query.replace(/\s+/g, ' ')}`, {
-        table,
-        id,
-        timestamp
-      }, MODULE_NAME);
-      
       const result = await this.client.query(query, [id, timestamp]);
-      
-      if (result.rowCount === 0) {
-        syncLogger.info(`Delete skipped for ${table} ${id} (record not found or newer version exists)`, {
-          table,
-          id,
-          timestamp
-        }, MODULE_NAME);
-        return null;
-      }
-      
-      syncLogger.debug(`Delete successful for ${table} ${id}`, {
-        table,
-        id,
-        rowCount: result.rowCount
-      }, MODULE_NAME);
-      
       return result.rows[0] || null;
     } catch (error) {
-      syncLogger.error(`Delete failed for ${table} ${id}: ${error instanceof Error ? error.message : String(error)}`, {
-        table,
-        id,
-        errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-      }, MODULE_NAME);
       throw new DatabaseError(
         error instanceof Error ? error.message : String(error),
         { table, operation: 'delete', id }
@@ -759,13 +492,6 @@ export class ChangeProcessor {
    * Send acknowledgment that we received client changes
    */
   private async sendChangesReceived(clientId: string, changeIds: string[]): Promise<void> {
-    syncLogger.info(`Preparing to send changes received acknowledgment for client ${clientId} with ${changeIds.length} changes`, {
-      messageType: 'srv_changes_received',
-      clientId,
-      changeCount: changeIds.length,
-      changeIdSample: changeIds.slice(0, 3) // Sample first few IDs for debugging
-    }, MODULE_NAME);
-
     const message: ServerReceivedMessage = {
       type: 'srv_changes_received',
       messageId: `srv_${Date.now()}`,
@@ -774,34 +500,12 @@ export class ChangeProcessor {
       changeIds
     };
 
-    // Double check our message is properly formatted
-    syncLogger.debug(`Sending received acknowledgment: ${JSON.stringify(message)}`, {}, MODULE_NAME);
-
     try {
-      // Log WebSocket handler status before sending
-      syncLogger.info(`WebSocket handler before sending: ${this.messageHandler.isConnected() ? 'CONNECTED' : 'DISCONNECTED'}`, {
-        isConnected: this.messageHandler.isConnected(),
-        clientId,
-        messageType: 'srv_changes_received'
-      }, MODULE_NAME);
-      
-      // Make sure the message is sent properly
       await this.messageHandler.send(message);
-      
-      // Log success explicitly
-      syncLogger.info(`Successfully sent changes received acknowledgment for client ${clientId} with ${changeIds.length} changes`, {
-        clientId,
-        messageType: 'srv_changes_received',
-        changeCount: changeIds.length
-      }, MODULE_NAME);
     } catch (err) {
       syncLogger.error(`Failed to send received acknowledgment: ${
         err instanceof Error ? err.message : err
-      }`, {
-        clientId,
-        messageType: 'srv_changes_received',
-        errorDetails: err instanceof Error ? err.stack : 'No stack trace'
-      }, MODULE_NAME);
+      }`);
       throw err;
     }
   }
@@ -815,16 +519,6 @@ export class ChangeProcessor {
     success: boolean,
     error?: Error
   ): Promise<void> {
-    syncLogger.info(`Preparing to send changes applied acknowledgment for client ${clientId} with ${changeIds.length} changes`, {
-      messageType: 'srv_changes_applied',
-      clientId,
-      success,
-      changeCount: changeIds.length,
-      hasError: !!error,
-      errorMessage: error?.message,
-      changeIdSample: changeIds.slice(0, 3) // Sample first few IDs for debugging
-    }, MODULE_NAME);
-
     const message: ServerAppliedMessage = {
       type: 'srv_changes_applied',
       messageId: `srv_${Date.now()}`,
@@ -835,35 +529,12 @@ export class ChangeProcessor {
       error: error?.message
     };
 
-    // Double check our message is properly formatted
-    syncLogger.debug(`Sending applied acknowledgment: ${JSON.stringify(message)}`, {}, MODULE_NAME);
-
     try {
-      // Log WebSocket handler status before sending
-      syncLogger.info(`WebSocket handler before sending applied acknowledgment: ${this.messageHandler.isConnected() ? 'CONNECTED' : 'DISCONNECTED'}`, {
-        isConnected: this.messageHandler.isConnected(),
-        clientId,
-        messageType: 'srv_changes_applied' 
-      }, MODULE_NAME);
-      
-      // Make sure the message is sent properly
       await this.messageHandler.send(message);
-      
-      // Log success explicitly
-      syncLogger.info(`Successfully sent changes applied acknowledgment for client ${clientId} with ${changeIds.length} changes`, {
-        clientId,
-        messageType: 'srv_changes_applied',
-        changeCount: changeIds.length,
-        success
-      }, MODULE_NAME);
     } catch (err) {
       syncLogger.error(`Failed to send applied acknowledgment: ${
         err instanceof Error ? err.message : err
-      }`, {
-        clientId,
-        messageType: 'srv_changes_applied',
-        errorDetails: err instanceof Error ? err.stack : 'No stack trace'
-      }, MODULE_NAME);
+      }`);
       throw err;
     }
   }
@@ -902,17 +573,7 @@ export class ChangeProcessor {
    */
   private async executeBatchInsert(table: string, changes: TableChange[]): Promise<any[]> {
     if (changes.length === 0) return [];
-    if (changes.length === 1) {
-      syncLogger.debug(`Single record batch insert for ${table}, using standard insert`, {
-        table
-      }, MODULE_NAME);
-      return [await this.executeInsert(table, changes[0].data as RecordData)].filter(Boolean);
-    }
-    
-    syncLogger.debug(`Preparing batch insert for ${changes.length} records in ${table}`, {
-      table,
-      count: changes.length
-    }, MODULE_NAME);
+    if (changes.length === 1) return [await this.executeInsert(table, changes[0].data as RecordData)].filter(Boolean);
     
     // First determine the complete set of fields from all records
     const allFields = new Set<string>();
@@ -963,43 +624,15 @@ export class ChangeProcessor {
       RETURNING *
     `;
     
-    syncLogger.debug(`Running batch insert on ${table} for ${changes.length} records`, {
-      table,
-      count: changes.length,
-      paramCount: allValues.length
-    }, MODULE_NAME);
-    
     try {
-      syncLogger.debug(`Running SQL: ${query.replace(/\s+/g, ' ')}`, {
-        table,
-        recordCount: changes.length,
-        valueCount: allValues.length
-      }, MODULE_NAME);
-      
       const result = await this.client.query(query, allValues);
-      
-      syncLogger.debug(`Batch insert result for ${table}: ${result.rowCount}/${changes.length} rows affected`, {
-        table,
-        rowCount: result.rowCount,
-        expectedCount: changes.length
-      }, MODULE_NAME);
-      
       return result.rows;
     } catch (error) {
       syncLogger.error(`Batch insert failed for ${table} (${changes.length} records): ${
         error instanceof Error ? error.message : String(error)
-      }`, {
-        table,
-        count: changes.length,
-        errorDetails: error instanceof Error ? error.stack : 'No stack trace'
-      }, MODULE_NAME);
+      }`);
       
       // Fall back to individual inserts
-      syncLogger.info(`Falling back to individual inserts for ${table}`, {
-        table,
-        count: changes.length
-      }, MODULE_NAME);
-      
       return this.executeBatch(table, changes, this.executeInsert.bind(this));
     }
   }
