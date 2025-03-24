@@ -3,6 +3,7 @@ import type { TableChange } from '@repo/sync-types';
 import { replicationLogger } from '../middleware/logger';
 import type { Env } from '../types/env';
 import type { MinimalContext } from '../types/hono';
+import { compareLSN } from '../lib/sync-common';
 
 const MODULE_NAME = 'client-manager';
 
@@ -298,23 +299,10 @@ export class ClientManager {
   /**
    * Compare two LSNs (Logical Sequence Numbers)
    * Returns true if lsn1 > lsn2, false otherwise
+   * Uses the common compareLSN function for consistency
    */
   private compareLSNs(lsn1: string, lsn2: string): boolean {
-    if (lsn1 === lsn2) return false;
-    if (lsn2 === '0/0') return true;
-    if (lsn1 === '0/0') return false;
-    
-    // Parse LSNs (format: "X/Y")
-    const [major1, minor1] = lsn1.split('/').map(Number);
-    const [major2, minor2] = lsn2.split('/').map(Number);
-    
-    // Compare major parts
-    if (major1 !== major2) {
-      return major1 > major2;
-    }
-    
-    // If major parts are equal, compare minor parts
-    return minor1 > minor2;
+    return compareLSN(lsn1, lsn2) > 0;
   }
 
   /**

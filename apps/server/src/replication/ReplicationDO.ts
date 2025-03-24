@@ -10,20 +10,19 @@ import type {
 } from '../types/cloudflare';
 import type { ReplicationConfig, ReplicationMetrics } from './types';
 import { DEFAULT_REPLICATION_CONFIG } from './types';
-import { ClientManager } from './client-manager';
 import { replicationLogger } from '../middleware/logger';
 import { PollingManager } from './polling';
 import { getDBClient } from '../lib/db';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 import { AppBindings, createMinimalContext, MinimalContext } from '../types/hono';
 import { StateManager } from './state-manager';
+import { getActiveClients, hasActiveClients } from './process-changes';
 
 const MODULE_NAME = 'DO';
 
 export class ReplicationDO implements DurableObject {
   private durableObjectState: DurableObjectState;
   private env: Env;
-  private clientManager: ClientManager;
   private pollingManager: PollingManager;
   private stateManager: StateManager;
   private metrics: ReplicationMetrics;
@@ -35,7 +34,6 @@ export class ReplicationDO implements DurableObject {
     this.env = env;
     
     // Initialize managers
-    this.clientManager = new ClientManager(env);
     this.stateManager = new StateManager(state, this.config);
     
     // Log wake-up - constructor is called when DO wakes from hibernation
@@ -47,13 +45,13 @@ export class ReplicationDO implements DurableObject {
           lastActiveAt: new Date(lastActive).toISOString(),
           hibernationSecs: Math.round(hibernationDuration / 1000)
         }, MODULE_NAME);
-      } else {
-        replicationLogger.info('DO starting', {}, MODULE_NAME);
       }
-      // Update last active timestamp
+      
+      // Record wake-up time
       await state.storage.put(ReplicationDO.LAST_ACTIVE_KEY, Date.now());
     });
-
+    
+    // Initialize metrics
     this.metrics = {
       changes: {
         processed: 0,
@@ -64,7 +62,8 @@ export class ReplicationDO implements DurableObject {
         totalNotificationsSent: 0
       }
     };
-
+    
+    // Create execution context
     const executionCtx: ExecutionContext = {
       waitUntil: (promise: Promise<any>) => this.durableObjectState.waitUntil(promise),
       passThroughOnException: () => {},
@@ -75,11 +74,11 @@ export class ReplicationDO implements DurableObject {
     const ctx = createMinimalContext(env, executionCtx);
     
     this.pollingManager = new PollingManager(
-      this.clientManager,
-      this.stateManager,
+      this.durableObjectState,
       this.config,
       ctx,
-      this.durableObjectState
+      this.env,
+      this.stateManager
     );
     
     // Start polling immediately on construction
@@ -164,11 +163,11 @@ export class ReplicationDO implements DurableObject {
       // Initialize polling manager if not already done
       if (!this.pollingManager) {
         this.pollingManager = new PollingManager(
-          this.clientManager,
-          this.stateManager,
+          this.durableObjectState,
           this.config,
           c,
-          this.durableObjectState
+          this.env,
+          this.stateManager
         );
       }
       
@@ -353,17 +352,37 @@ export class ReplicationDO implements DurableObject {
   }
 
   /**
-   * Get list of clients via ClientManager
+   * Handle client listing request
    */
   private async handleClients(): Promise<Response> {
+    const c = this.getContext();
+    
     try {
-      const clients = await this.clientManager.listClients();
-      return Response.json(clients);
+      const clients = await getActiveClients(this.env);
+      
+      return new Response(JSON.stringify({
+        success: true,
+        clients
+      }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
     } catch (error) {
-      replicationLogger.error('Client listing failed', {
+      replicationLogger.error('Failed to list clients', {
         error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
-      return Response.json({ error: 'Failed to get clients' }, { status: 500 });
+      
+      return new Response(JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      }), {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
     }
   }
 

@@ -4,6 +4,7 @@ import { replicationLogger } from '../middleware/logger';
 import { getDBClient } from '../lib/db';
 import type { ReplicationConfig } from './types';
 import { getDomainTables } from './types';
+import { compareLSN } from '../lib/sync-common';
 
 const MODULE_NAME = 'state-manager';
 
@@ -34,23 +35,10 @@ export class StateManager {
   /**
    * Compare two LSNs
    * @returns -1 if lsn1 < lsn2, 0 if equal, 1 if lsn1 > lsn2
+   * Delegates to the common compareLSN function for consistency
    */
   public compareLSN(lsn1: string, lsn2: string): number {
-    if (lsn1 === lsn2) return 0;
-    if (lsn1 === '0/0') return -1;
-    if (lsn2 === '0/0') return 1;
-    
-    // Parse LSNs (format: "X/Y")
-    const [major1, minor1] = lsn1.split('/').map(Number);
-    const [major2, minor2] = lsn2.split('/').map(Number);
-    
-    // Compare major parts
-    if (major1 !== major2) {
-      return major1 > major2 ? 1 : -1;
-    }
-    
-    // Compare minor parts
-    return minor1 > minor2 ? 1 : -1;
+    return compareLSN(lsn1, lsn2);
   }
 
   /**

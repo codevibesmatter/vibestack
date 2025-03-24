@@ -6,10 +6,10 @@ import { getDBClient, sql } from '../lib/db';
 import type { MinimalContext } from '../types/hono';
 import type { TableChange } from '@repo/sync-types';
 import { processWALChanges, processAndConsumeWALChanges } from './process-changes';
-import { ClientManager } from './client-manager';
 import { StateManager } from './state-manager';
 import type { DurableObjectState } from '../types/cloudflare';
 import type { WALData } from '../types/wal';
+import { compareLSN } from '../lib/sync-common';
 
 const MODULE_NAME = 'polling';
 
@@ -19,17 +19,10 @@ export const ACTIVE_POLL_INTERVAL = 1000; // 1 second
 /**
  * Compare two LSNs
  * Returns true if first LSN is greater than second
+ * Uses the common compareLSN function for consistency
  */
 function compareLSNs(lsn1: string, lsn2: string): boolean {
-  // Split into x/y components and parse as hex
-  const [x1, y1] = lsn1.split('/').map(n => parseInt(n, 16));
-  const [x2, y2] = lsn2.split('/').map(n => parseInt(n, 16));
-  
-  // Compare x first, then y if x is equal
-  if (x1 !== x2) {
-    return x1 > x2;
-  }
-  return y1 > y2;
+  return compareLSN(lsn1, lsn2) > 0;
 }
 
 export class PollingManager {
@@ -39,11 +32,11 @@ export class PollingManager {
   private initialPollResolve: (() => void) | null = null;
 
   constructor(
-    private readonly clientManager: ClientManager,
-    private readonly stateManager: StateManager,
+    private readonly state: DurableObjectState,
     private readonly config: ReplicationConfig,
     private readonly c: MinimalContext,
-    private readonly state: DurableObjectState
+    private readonly env: Env,
+    private readonly stateManager: StateManager
   ) {
     // Initialize first poll promise
     this.initialPollPromise = new Promise<void>((resolve) => {
@@ -75,7 +68,7 @@ export class PollingManager {
         // Process and consume WAL changes before marking initial poll as complete
         const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
           changes,
-          this.clientManager,
+          this.env,
           this.c,
           this.stateManager,
           this.config.slot
@@ -134,7 +127,7 @@ export class PollingManager {
         // Let the changes module handle processing, storage, and LSN advancement
         const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
           changes,
-          this.clientManager,
+          this.env,
           this.c,
           this.stateManager,
           this.config.slot

@@ -1,11 +1,11 @@
 import type { TableChange } from '@repo/sync-types';
-import { ClientManager } from './client-manager';
 import { replicationLogger } from '../middleware/logger';
 import type { MinimalContext } from '../types/hono';
 import type { WALData, PostgresWALMessage } from '../types/wal';
 import { sql } from '../lib/db';
 import { StateManager } from './state-manager';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
+import type { Env } from '../types/env';
 
 /**
  * Process Changes Module
@@ -29,7 +29,8 @@ import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
  * 
  * 4. CLIENT NOTIFICATION
  *    - After storage and LSN advancement, connected clients are notified
- *    - The ClientManager broadcasts changes to relevant clients
+ *    - Active clients are queried directly from KV storage
+ *    - Changes are broadcast to relevant clients
  * 
  * KEY PRINCIPLES:
  * - Changes are validated early in the pipeline
@@ -44,6 +45,15 @@ import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
  */
 
 const MODULE_NAME = 'process-changes';
+
+/**
+ * Client state persisted in KV storage
+ */
+export interface ClientState {
+  clientId: string;
+  active: boolean;
+  lastSeen: number;
+}
 
 /**
  * Check if a table should be tracked for replication
@@ -316,11 +326,76 @@ export async function consumeWALAndUpdateLSN(
 }
 
 /**
- * Broadcasts changes to connected clients via the client manager.
- * This is separated from storage to maintain clear responsibilities.
+ * Get all active clients directly from KV storage
+ * Filters out inactive and stale clients
+ */
+export async function getActiveClients(env: Env, timeout = 10 * 60 * 1000): Promise<ClientState[]> {
+  try {
+    const { keys } = await env.CLIENT_REGISTRY.list({ prefix: 'client:' });
+    const activeClients: ClientState[] = [];
+    const now = Date.now();
+    
+    for (const key of keys) {
+      const value = await env.CLIENT_REGISTRY.get(key.name);
+      if (!value) continue;
+      
+      try {
+        const state = JSON.parse(value);
+        const clientId = key.name.replace('client:', '');
+        const lastSeen = state.lastSeen || 0;
+        const timeSinceLastSeen = now - lastSeen;
+        
+        // Only include active, non-stale clients
+        if (state.active && timeSinceLastSeen <= timeout) {
+          activeClients.push({
+            clientId,
+            active: true,
+            lastSeen
+          });
+        }
+      } catch (err) {
+        replicationLogger.error('Client parse error', {
+          key: key.name,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_NAME);
+      }
+    }
+    
+    replicationLogger.debug('Active clients retrieved', { 
+      count: activeClients.length 
+    }, MODULE_NAME);
+    
+    return activeClients;
+  } catch (error) {
+    replicationLogger.error('Client retrieval failed', {
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
+    return [];
+  }
+}
+
+/**
+ * Check if there are any active clients
+ * Fast path to avoid unnecessary processing when no clients are connected
+ */
+export async function hasActiveClients(env: Env): Promise<boolean> {
+  try {
+    const activeClients = await getActiveClients(env);
+    return activeClients.length > 0;
+  } catch (error) {
+    replicationLogger.error('Active clients check failed', {
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
+    return false;
+  }
+}
+
+/**
+ * Broadcasts changes to connected clients directly
+ * Uses SyncDO for each active client
  */
 export async function broadcastChangesToClients(
-  clientManager: ClientManager,
+  env: Env,
   changes: TableChange[]
 ): Promise<boolean> {
   if (changes.length === 0) {
@@ -337,8 +412,64 @@ export async function broadcastChangesToClients(
       tables: tables.length > 0 ? tables : []
     }, MODULE_NAME);
     
-    await clientManager.broadcastChanges(changes);
-    return true;
+    // Get active clients directly from KV
+    const activeClients = await getActiveClients(env);
+    
+    if (activeClients.length === 0) {
+      replicationLogger.info('No active clients, skipping broadcast', {}, MODULE_NAME);
+      return true;
+    }
+    
+    replicationLogger.info('Notifying clients', {
+      clientCount: activeClients.length, 
+      changeCount: changes.length
+    }, MODULE_NAME);
+    
+    let successCount = 0;
+    let failCount = 0;
+    
+    // Notify each active client
+    for (const client of activeClients) {
+      try {
+        // Get the SyncDO instance for this client
+        const id = env.SYNC.idFromName(`client:${client.clientId}`);
+        const syncDO = env.SYNC.get(id);
+        
+        // Create the URL with required parameters
+        const url = new URL('http://internal/new-changes');
+        url.searchParams.set('clientId', client.clientId);
+        url.searchParams.set('lsn', '0/0'); // Default value
+        
+        const response = await syncDO.fetch(url.toString(), {
+          method: 'POST',
+          body: JSON.stringify({ changes })
+        });
+        
+        if (response.ok) {
+          successCount++;
+        } else {
+          failCount++;
+          replicationLogger.warn('Client notification failed', {
+            clientId: client.clientId,
+            status: response.status
+          }, MODULE_NAME);
+        }
+      } catch (err) {
+        failCount++;
+        replicationLogger.error('Client notification error', {
+          clientId: client.clientId,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_NAME);
+      }
+    }
+    
+    replicationLogger.info('Broadcast complete', {
+      totalClients: activeClients.length,
+      successful: successCount,
+      failed: failCount
+    }, MODULE_NAME);
+    
+    return successCount > 0; // Return true if at least one client was notified
   } catch (error) {
     replicationLogger.error('Broadcast failed', {
       error: error instanceof Error ? error.message : String(error)
@@ -385,7 +516,7 @@ export async function processWALChanges(
  */
 export async function processAndConsumeWALChanges(
   peekedChanges: WALData[],
-  clientManager: ClientManager,
+  env: Env,
   context: MinimalContext,
   stateManager: StateManager,
   slotName: string
@@ -415,7 +546,7 @@ export async function processAndConsumeWALChanges(
   // ====== STEP 3: NOTIFY CLIENTS ======
   // Broadcast changes to clients if there are any valid changes
   if (tableChanges.length > 0) {
-    await broadcastChangesToClients(clientManager, tableChanges);
+    await broadcastChangesToClients(env, tableChanges);
   }
   
   return { 
