@@ -14,9 +14,12 @@ type EntityClass = typeof Task | typeof Project | typeof User | typeof Comment;
 /**
  * Generate a single change for testing
  */
-export async function generateSingleChange(entityClass: EntityClass): Promise<TableChange> {
+export async function generateSingleChange(entityClass: EntityClass, clientId: string): Promise<TableChange> {
   const tableName = entityClass.name.toLowerCase() + 's';
   const data = await generateFakeData(entityClass);
+  
+  // Add client_id to the data
+  data.client_id = clientId;
 
   return {
     table: tableName,
@@ -29,12 +32,16 @@ export async function generateSingleChange(entityClass: EntityClass): Promise<Ta
 /**
  * Generate multiple changes for testing
  */
-export async function generateBulkChanges(entityClass: EntityClass, count: number): Promise<TableChange[]> {
+export async function generateBulkChanges(entityClass: EntityClass, count: number, clientId: string): Promise<TableChange[]> {
   const changes: TableChange[] = [];
   const tableName = entityClass.name.toLowerCase() + 's';
 
   for (let i = 0; i < count; i++) {
     const data = await generateFakeData(entityClass);
+    
+    // Add client_id to the data
+    data.client_id = clientId;
+    
     changes.push({
       table: tableName,
       operation: 'insert',

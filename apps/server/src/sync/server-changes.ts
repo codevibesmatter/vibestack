@@ -334,19 +334,42 @@ export async function handleNewChanges(
   messageHandler: WebSocketHandler
 ): Promise<boolean> {
   try {
+    // Filter out changes that originated from this client
+    const originalCount = changes.length;
+    const filteredChanges = changes.filter(change => {
+      // Access client_id from change.data if it exists
+      return !change.data?.client_id || change.data.client_id !== clientId;
+    });
+    
+    // Log filtered changes
+    if (filteredChanges.length !== originalCount) {
+      syncLogger.debug('Filtered out client\'s own changes', {
+        clientId,
+        before: originalCount,
+        after: filteredChanges.length,
+        filtered: originalCount - filteredChanges.length
+      }, MODULE_NAME);
+    }
+    
+    // Skip if no changes after filtering
+    if (filteredChanges.length === 0) {
+      syncLogger.info('No changes to send after filtering', { clientId }, MODULE_NAME);
+      return true;
+    }
+    
     // Send changes to client
-    const success = await sendChanges(changes, lastLSN, clientId, messageHandler);
+    const success = await sendChanges(filteredChanges, lastLSN, clientId, messageHandler);
     
     if (success) {
       syncLogger.info('Changes sent successfully', {
         clientId,
-        count: changes.length,
+        count: filteredChanges.length,
         lastLSN
       }, MODULE_NAME);
     } else {
       syncLogger.error('Changes send failed', {
         clientId,
-        count: changes.length,
+        count: filteredChanges.length,
         lastLSN
       }, MODULE_NAME);
     }
@@ -437,6 +460,23 @@ export async function sendLiveChanges(
       syncLogger.debug('Deduplicated changes', {
         before: changes.length,
         after: orderedChanges.length
+      }, MODULE_TAG);
+    }
+    
+    // Filter out changes that originated from this client
+    const originalCount = orderedChanges.length;
+    orderedChanges = orderedChanges.filter(change => {
+      // Access client_id from change.data if it exists
+      return !change.data?.client_id || change.data.client_id !== clientId;
+    });
+    
+    // Log filtered changes
+    if (orderedChanges.length !== originalCount) {
+      syncLogger.debug('Filtered out client\'s own changes', {
+        clientId,
+        before: originalCount,
+        after: orderedChanges.length,
+        filtered: originalCount - orderedChanges.length
       }, MODULE_TAG);
     }
     

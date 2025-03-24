@@ -97,6 +97,27 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     syncLogger.debug('SyncDO constructed', {
       syncId: this.syncId
     }, MODULE_NAME);
+    
+    // Register message handler for client changes
+    this.onMessage('clt_send_changes', async (message: ClientMessage) => {
+      syncLogger.info('Received client changes', {
+        type: message.type,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      
+      try {
+        // Process client changes
+        await processClientChanges(
+          message as ClientChangesMessage,
+          this.getContext(),
+          this
+        );
+      } catch (error) {
+        syncLogger.error('Error processing client changes', {
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+      }
+    });
   }
 
   /**
@@ -272,7 +293,8 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     try {
       const message = JSON.parse(event.data as string) as ClientMessage;
       
-      syncLogger.debug('Received client message', {
+      // Minimized logging
+      syncLogger.debug('Message received', {
         type: message.type,
         messageId: message.messageId
       }, MODULE_NAME);
@@ -292,16 +314,15 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         try {
           await handler(message);
         } catch (handlerError) {
-          syncLogger.error('Error in message handler', {
+          syncLogger.error('Handler error', {
             type: message.type,
             error: handlerError instanceof Error ? handlerError.message : String(handlerError)
           }, MODULE_NAME);
         }
       }
     } catch (error) {
-      syncLogger.error('Error processing message', {
-        error: error instanceof Error ? error.message : String(error),
-        data: typeof event.data === 'string' ? event.data.substring(0, 100) : 'non-string data'
+      syncLogger.error('Message parse error', {
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
     }
   }
@@ -345,27 +366,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     // Store the client's LSN
     await this.stateManager.updateClientLSN(clientId, clientLSN);
     
-    // Register message handler for client changes
-    this.onMessage('clt_send_changes', async (message: ClientMessage) => {
-      syncLogger.info('Received client changes message', {
-        clientId: this.clientId,
-        messageId: message.messageId
-      }, MODULE_NAME);
-      
-      try {
-        // Process client changes
-        await processClientChanges(
-          message as ClientChangesMessage,
-          this.getContext(),
-          this
-        );
-      } catch (error) {
-        syncLogger.error('Error processing client changes', {
-          clientId: this.clientId,
-          error: error instanceof Error ? error.message : String(error)
-        }, MODULE_NAME);
-      }
-    });
+    // Message handler for client changes is already registered in the constructor
     
     // Get the current server LSN
     const serverLSN = await this.stateManager.getServerLSN();
@@ -687,18 +688,58 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    * Send a message to the client using type-safe interface
    */
   async send(message: ServerMessage): Promise<void> {
-    if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
-      syncLogger.debug('Sent message to client:', {
+    try {
+      if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
+        // Minimal logging for acknowledgment messages
+        if (message.type === 'srv_changes_received' || message.type === 'srv_changes_applied') {
+          syncLogger.info(`Sending ${message.type}`, {
+            type: message.type,
+            messageId: message.messageId
+          }, MODULE_NAME);
+        }
+        
+        // Use try-catch specifically for the send operation
+        try {
+          this.webSocket.send(JSON.stringify(message));
+          
+          // Only log type and messageId on success
+          syncLogger.debug('Sent message', {
+            type: message.type,
+            messageId: message.messageId
+          }, MODULE_NAME);
+        } catch (sendError) {
+          // Log specific send error with minimal info
+          syncLogger.error(`Error sending message`, {
+            type: message.type,
+            messageId: message.messageId,
+            error: sendError instanceof Error ? sendError.message : String(sendError)
+          }, MODULE_NAME);
+          throw sendError; // Re-throw for caller to handle
+        }
+      } else {
+        // WebSocket not available or not open
+        syncLogger.warn('Cannot send message, WebSocket not open', {
+          type: message.type,
+          messageId: message.messageId,
+          readyState: this.webSocket?.readyState
+        }, MODULE_NAME);
+        
+        // For acknowledgments, this is a critical error
+        if (message.type === 'srv_changes_received' || message.type === 'srv_changes_applied') {
+          syncLogger.error(`Failed to send acknowledgment`, {
+            type: message.type,
+            messageId: message.messageId
+          }, MODULE_NAME);
+          throw new Error(`Cannot send acknowledgment - WebSocket not open (state: ${this.webSocket?.readyState})`);
+        }
+      }
+    } catch (error) {
+      // Catch-all for any other errors
+      syncLogger.error(`Unexpected error in send method: ${error instanceof Error ? error.message : String(error)}`, {
         type: message.type,
-        messageId: message.messageId
+        error: error instanceof Error ? error.stack : String(error)
       }, MODULE_NAME);
-      this.webSocket.send(JSON.stringify(message));
-    } else {
-      syncLogger.warn('Cannot send message, WebSocket not open:', {
-        type: message.type,
-        messageId: message.messageId,
-        connected: this.webSocket?.readyState === WS_READY_STATE.OPEN
-      }, MODULE_NAME);
+      throw error; // Re-throw for caller to handle
     }
   }
   

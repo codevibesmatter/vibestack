@@ -45,6 +45,21 @@ export interface RecordData {
   [key: string]: unknown;  // Additional fields specific to each record type
 }
 
+/**
+ * Result of executing a client change
+ */
+export interface ExecutionResult {
+  success: boolean;
+  error?: {
+    code: string;
+    message: string;
+    details?: any;
+  };
+  data?: any;
+  isConflict?: boolean;
+  skipped?: boolean;
+}
+
 // Export message types and interfaces
 export type {
   CltMessageType,
