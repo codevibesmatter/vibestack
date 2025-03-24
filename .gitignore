@@ -55,7 +55,7 @@ logs
 .stylelintcache
 
 # Test state
-.lsn-state.json
+.sync-test.lsn.json
 
 # Documentation
 docs/
