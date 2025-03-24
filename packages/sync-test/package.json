@@ -7,22 +7,24 @@
     "build": "tsc",
     "clean": "rm -rf dist",
     "prebuild": "pnpm clean",
-    "pretest": "pnpm build",
-    "test": "node dist/scenarios/initial-sync.js",
-    "test:initial": "node dist/scenarios/initial-sync.js",
-    "test:catchup": "node dist/scenarios/catchup-sync.js",
-    "test:changes": "node dist/scenarios/client-changes.js",
-    "test:all": "pnpm test:initial && pnpm test:catchup && pnpm test:changes",
-    "dev": "ts-node src/index.ts",
-    "watch": "tsc --watch"
+    "test": "tsx src/scenarios/initial-sync.ts",
+    "test:initial": "tsx src/scenarios/initial-sync.ts",
+    "test:catchup": "tsx src/scenarios/catchup-sync.ts",
+    "test:changes": "tsx src/scenarios/client-changes.ts",
+    "test:live": "tsx src/scenarios/live-sync.ts",
+    "test:all": "pnpm test:initial && pnpm test:catchup && pnpm test:changes && pnpm test:live",
+    "dev": "tsx src/index.ts",
+    "watch": "tsx --watch src/index.ts"
   },
   "dependencies": {
     "@faker-js/faker": "^8.4.1",
     "@neondatabase/serverless": "^0.7.2",
     "@repo/dataforge": "workspace:*",
     "@repo/sync-types": "workspace:*",
+    "@types/node-fetch": "^2.6.12",
     "dotenv": "^16.4.7",
     "inquirer": "^9.2.14",
+    "node-fetch": "^3.3.2",
     "typeorm": "^0.3.20",
     "uuid": "^9.0.1",
     "ws": "^8.16.0"
@@ -33,6 +35,7 @@
     "@types/uuid": "^9.0.8",
     "@types/ws": "^8.5.10",
     "ts-node": "^10.9.2",
+    "tsx": "^4.19.3",
     "typescript": "^5.3.3"
   }
 }

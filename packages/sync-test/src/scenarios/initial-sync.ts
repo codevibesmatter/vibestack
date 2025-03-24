@@ -16,6 +16,7 @@ import type {
 import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
+import { fileURLToPath } from 'url';
 
 /**
  * Testing class for initial sync scenario
@@ -531,7 +532,7 @@ async function testInitialSync() {
     await tester.disconnect(1000, 'Test complete');
     
     // Only exit with success if we've reached this point without errors
-    if (process.argv[1] === new URL(import.meta.url).pathname) {
+    if (process.argv[1] === fileURLToPath(import.meta.url)) {
       console.log('Exiting with success code');
       process.exit(0);
     }
@@ -539,6 +540,6 @@ async function testInitialSync() {
 }
 
 // Run the test if this is the main module
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   testInitialSync();
 } 

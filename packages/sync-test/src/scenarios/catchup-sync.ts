@@ -16,6 +16,8 @@ import fs from 'fs';
 import path from 'path';
 import { config } from 'dotenv';
 import { neon } from '@neondatabase/serverless';
+import fetch from 'node-fetch';
+import { fileURLToPath } from 'url';
 
 // Load environment variables from .env file
 config();
@@ -146,6 +148,45 @@ function compareLSN(lsn1: string, lsn2: string): number {
   if (minor1 < minor2) return -1;
   if (minor1 > minor2) return 1;
   return 0;
+}
+
+/**
+ * Call the replication initialization endpoint before connecting to WebSocket
+ * This ensures the replication system is ready to process changes
+ */
+async function initializeReplication(): Promise<boolean> {
+  try {
+    // Convert the WebSocket URL to the base HTTP URL
+    const wsUrl = new URL(DEFAULT_CONFIG.wsUrl);
+    const baseUrl = `http${wsUrl.protocol === 'wss:' ? 's' : ''}://${wsUrl.host}`;
+    const initUrl = `${baseUrl}/api/replication/init`;
+    
+    console.log(`Initializing replication system via HTTP: ${initUrl}`);
+    
+    const response = await fetch(initUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!response.ok) {
+      console.error(`Failed to initialize replication: ${response.status} ${response.statusText}`);
+      return false;
+    }
+    
+    const result = await response.json();
+    console.log('Replication initialization successful:', result);
+    
+    // Allow some time for the replication system to start
+    console.log('Waiting for replication system to start...');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    return true;
+  } catch (error) {
+    console.error('Error initializing replication:', error);
+    return false;
+  }
 }
 
 /**
@@ -289,6 +330,13 @@ async function testCatchupSync() {
     // Wait for changes to be processed
     console.log('Waiting for changes to be processed...');
     await new Promise(resolve => setTimeout(resolve, DEFAULT_CONFIG.changeWaitTime));
+    
+    // Initialize replication system via HTTP before connecting
+    console.log('Initializing replication system...');
+    const initSuccess = await initializeReplication();
+    if (!initSuccess) {
+      console.warn('Replication initialization failed. Proceeding anyway, but sync may not work correctly.');
+    }
     
     // Read the LSN file again to ensure we have the most recent value before connecting
     const updatedLsnInfo = getLSNInfoFromFile();
@@ -574,7 +622,7 @@ async function testCatchupSync() {
 }
 
 // Run the test if this is the main module
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   testCatchupSync()
     .then(() => {
       console.log('Test completed successfully');

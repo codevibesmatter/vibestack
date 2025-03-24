@@ -1,6 +1,7 @@
 import { SyncTester } from '../test-sync.js';
 import { DEFAULT_CONFIG } from '../config.js';
 import type { SrvMessageType, CltMessageType, TableChange } from '@repo/sync-types';
+import { fileURLToPath } from 'url';
 
 interface ServerMessage {
   type: SrvMessageType;
@@ -82,7 +83,7 @@ async function testClientChanges() {
 }
 
 // Run the test if this is the main module
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   testClientChanges().catch(error => {
     console.error('Test failed:', error);
     process.exit(1);
