@@ -164,7 +164,7 @@ async function initializeReplication(): Promise<boolean> {
     console.log(`Initializing replication system via HTTP: ${initUrl}`);
     
     const response = await fetch(initUrl, {
-      method: 'POST',
+      method: 'GET',
       headers: {
         'Content-Type': 'application/json'
       }

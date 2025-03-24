@@ -53,58 +53,29 @@ export class PollingManager {
 
   /**
    * Start polling for changes
+   * Simply marks as initialized and starts sequential polling
    */
   public async startPolling(): Promise<void> {
     try {
-      // Do initial poll to catch up on changes
-      const changes = await this.pollForChanges();
+      // Mark polling as initialized - no initial poll
+      replicationLogger.info('Starting polling process', {}, MODULE_NAME);
       
-      // Process any changes found during initial poll
-      if (changes && changes.length > 0) {
-        replicationLogger.info('Processing changes from initial poll', {
-          count: changes.length
-        }, MODULE_NAME);
-        
-        // Process and consume WAL changes before marking initial poll as complete
-        const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
-          changes,
-          this.env,
-          this.c,
-          this.stateManager,
-          this.config.slot
-        );
-        
-        replicationLogger.info('Initial poll change processing completed', {
-          success,
-          storedChanges,
-          consumedChanges,
-          changeCount: changes.length
-        }, MODULE_NAME);
-        
-        if (!success) {
-          replicationLogger.warn('Initial poll processing had issues, but continuing', {
-            storedChanges,
-            consumedChanges
-          }, MODULE_NAME);
-        }
-      } else {
-        replicationLogger.info('No changes found in initial poll', {}, MODULE_NAME);
-      }
-      
-      // Mark first poll complete and resolve promise
+      // Mark initialized and resolve the initialization promise
       this.hasCompletedFirstPoll = true;
       if (this.initialPollResolve) {
         this.initialPollResolve();
       }
 
-      // Start continuous polling regardless of client state
+      // Start sequential polling immediately
       if (!this.pollingInterval) {
-        replicationLogger.debug('Starting continuous polling', {
+        replicationLogger.debug('Starting sequential polling', {
           pollInterval: ACTIVE_POLL_INTERVAL
         }, MODULE_NAME);
         
-        // Start polling interval - simplified to only poll for changes without client checks
-        this.pollingInterval = setInterval(() => this.pollAndProcess(), ACTIVE_POLL_INTERVAL);
+        // Start the polling cycle
+        this.startSequentialPolling();
+      } else {
+        replicationLogger.debug('Sequential polling already started', {}, MODULE_NAME);
       }
     } catch (err) {
       replicationLogger.error('Start polling error', {
@@ -112,6 +83,43 @@ export class PollingManager {
       }, MODULE_NAME);
       throw err;
     }
+  }
+
+  /**
+   * Start sequential polling that ensures only one poll cycle runs at a time
+   */
+  private startSequentialPolling(): void {
+    // Store timeout ID
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    
+    // Define the polling function
+    const poll = async () => {
+      try {
+        // Run the poll and process operation
+        await this.pollAndProcess();
+      } catch (error) {
+        replicationLogger.error('Sequential polling error', {
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+      } finally {
+        // Schedule the next poll after this one completes
+        // Add a small delay to ensure we don't hammer the database
+        timeoutId = setTimeout(poll, ACTIVE_POLL_INTERVAL);
+      }
+    };
+    
+    // Start the first poll with a small delay
+    timeoutId = setTimeout(poll, 500); // Start with a small delay to allow initialization to complete
+    
+    // Store the timeout in pollingInterval for cleanup
+    this.pollingInterval = {
+      unref: () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+      }
+    } as any; // Cast to any to satisfy the type
   }
 
   /**
@@ -124,25 +132,43 @@ export class PollingManager {
       
       // Process changes if any were found
       if (changes && changes.length > 0) {
-        // Let the changes module handle processing, storage, and LSN advancement
-        const { success, storedChanges, consumedChanges } = await processAndConsumeWALChanges(
-          changes,
-          this.env,
-          this.c,
-          this.stateManager,
-          this.config.slot
-        );
-        
-        replicationLogger.info('Completed WAL change processing cycle', {
-          success,
-          storedChanges,
-          consumedChanges,
-          changeCount: changes.length
-        }, MODULE_NAME);
+        try {
+          // Let the changes module handle processing, storage, and LSN advancement
+          const { success, storedChanges, consumedChanges, changeCount } = await processAndConsumeWALChanges(
+            changes,
+            this.env,
+            this.c,
+            this.stateManager,
+            this.config.slot
+          );
+          
+          replicationLogger.info('Completed WAL change processing cycle', {
+            success,
+            storedChanges,
+            consumedChanges,
+            changeCount: changeCount ?? changes.length
+          }, MODULE_NAME);
+        } catch (processError) {
+          const errorMsg = processError instanceof Error ? processError.message : String(processError);
+          
+          // Check for replication slot errors in processing
+          if (errorMsg.includes('replication slot') && errorMsg.includes('is active for PID')) {
+            replicationLogger.warn('Replication slot in use during change processing, will retry next cycle', {
+              error: errorMsg,
+              slot: this.config.slot
+            }, MODULE_NAME);
+          } else {
+            replicationLogger.error('Error processing WAL changes', {
+              error: errorMsg
+            }, MODULE_NAME);
+          }
+        }
       }
     } catch (err) {
+      // Should only get here for non-slot errors since slot errors now return null
+      const errorMsg = err instanceof Error ? err.message : String(err);
       replicationLogger.error('Poll cycle error', {
-        error: err instanceof Error ? err.message : String(err)
+        error: errorMsg
       }, MODULE_NAME);
     }
   }
@@ -152,7 +178,11 @@ export class PollingManager {
    */
   public stopPolling(): void {
     if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
+      if (typeof this.pollingInterval === 'object' && 'unref' in this.pollingInterval) {
+        (this.pollingInterval as any).unref();
+      } else {
+        clearInterval(this.pollingInterval);
+      }
       this.pollingInterval = null;
       replicationLogger.debug('Polling stopped', {}, MODULE_NAME);
     }
@@ -162,10 +192,15 @@ export class PollingManager {
    * Poll for new changes without advancing the LSN
    */
   private async pollForChanges(): Promise<WALData[] | null> {
+    const client = getDBClient(this.c);
+    
     try {
       // Get current LSN from state manager
       const currentLSN = await this.stateManager.getLSN();
 
+      // Connect to the database
+      await client.connect();
+      
       // Use peek_changes which doesn't consume/advance the WAL
       const query = `
         SELECT data, lsn, xid 
@@ -180,11 +215,11 @@ export class PollingManager {
         LIMIT 100;
       `;
       
-      // Use sql helper which manages connections automatically
-      const rows = await sql(this.c, query, [this.config.slot, currentLSN]);
+      // Execute the query
+      const result = await client.query(query, [this.config.slot, currentLSN]);
       
       // Map changes to our format
-      const newChanges = rows.map(row => ({
+      const newChanges = result.rows.map(row => ({
         data: row.data as string,
         lsn: row.lsn as string,
         xid: row.xid as string
@@ -208,10 +243,35 @@ export class PollingManager {
       
       return null;
     } catch (err) {
-      replicationLogger.error('Polling error', {
-        error: err instanceof Error ? err.message : String(err)
-      }, MODULE_NAME);
-      throw err;
+      // Check for replication slot errors
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      
+      if (errorMsg.includes('replication slot') && errorMsg.includes('is active for PID')) {
+        replicationLogger.warn('Replication slot in use by another process during poll', {
+          error: errorMsg,
+          slot: this.config.slot
+        }, MODULE_NAME);
+        
+        // Don't throw for slot in use - just return null to continue polling
+        return null;
+      } else {
+        replicationLogger.error('Polling error', {
+          error: errorMsg
+        }, MODULE_NAME);
+        
+        // Still throw for other errors
+        throw err;
+      }
+    } finally {
+      // Ensure connection is always closed
+      try {
+        await client.end();
+      } catch (closeError) {
+        replicationLogger.error('Error closing database connection after polling', {
+          error: closeError instanceof Error ? closeError.message : String(closeError),
+          slot: this.config.slot
+        }, MODULE_NAME);
+      }
     }
   }
 } 

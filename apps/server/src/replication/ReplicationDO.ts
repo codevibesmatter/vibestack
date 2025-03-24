@@ -63,15 +63,12 @@ export class ReplicationDO implements DurableObject {
       }
     };
     
-    // Create execution context
-    const executionCtx: ExecutionContext = {
+    // Create initial context and polling manager
+    const ctx = createMinimalContext(env, {
       waitUntil: (promise: Promise<any>) => this.durableObjectState.waitUntil(promise),
       passThroughOnException: () => {},
       props: undefined
-    };
-    
-    // Create initial context
-    const ctx = createMinimalContext(env, executionCtx);
+    });
     
     this.pollingManager = new PollingManager(
       this.durableObjectState,
@@ -81,19 +78,16 @@ export class ReplicationDO implements DurableObject {
       this.stateManager
     );
     
-    // Start polling immediately on construction
-    this.durableObjectState.waitUntil(this.initializeReplication(true));
+    // DO NOT check slot or start polling in constructor
+    // This will be handled by explicit initializeReplication call via API
   }
 
   private getContext(): MinimalContext {
-    const executionCtx: ExecutionContext = {
+    return createMinimalContext(this.env, {
       waitUntil: (promise: Promise<any>) => this.durableObjectState.waitUntil(promise),
       passThroughOnException: () => {},
-      // Required by ExecutionContext but not used in our case
       props: undefined
-    };
-
-    return createMinimalContext(this.env, executionCtx);
+    });
   }
 
   /**
@@ -128,8 +122,6 @@ export class ReplicationDO implements DurableObject {
           return this.handleStatus();
         case '/clients':
           return this.handleClients();
-        case '/wait-for-initial-poll':
-          return this.handleWaitForInitialPoll();
         case '/lsn':
           return this.handleLSN();
       }
@@ -140,8 +132,6 @@ export class ReplicationDO implements DurableObject {
       const internalPath = path === '/lsn' ? '/lsn' : path.replace('/internal', '');
       
       switch (internalPath) {
-        case '/wait-for-initial-poll':
-          return this.handleWaitForInitialPoll();
         case '/lsn':
           return this.handleLSN();
       }
@@ -153,52 +143,26 @@ export class ReplicationDO implements DurableObject {
 
   /**
    * Core initialization logic for the replication system
+   * Only checks if the slot exists, doesn't start polling
    */
-  private async initializeReplication(forceInit: boolean = false): Promise<{success: boolean, error?: string, slotStatus?: any}> {
+  private async initializeReplication(): Promise<{success: boolean, error?: string, slotStatus?: any}> {
     try {
-      // Check if we're already initialized, unless forcing init
-      if (!forceInit && this.pollingManager?.hasCompletedFirstPoll) {
-        replicationLogger.info('Replication already initialized', {}, MODULE_NAME);
-        const c = this.getContext();
-        const slotStatus = await this.stateManager.checkSlotStatus(c);
-        return {
-          success: true,
-          slotStatus
-        };
-      }
-
-      // High level lifecycle event
-      replicationLogger.info('Starting replication', {}, MODULE_NAME);
-      
-      // Let the modules handle their own logging
+      // Check if slot exists or create it if needed
+      replicationLogger.info('Starting replication slot check', {}, MODULE_NAME);
       const c = this.getContext();
       const slotStatus = await this.stateManager.checkSlotStatus(c);
       
-      // Initialize polling manager if not already done
-      if (!this.pollingManager) {
-        this.pollingManager = new PollingManager(
-          this.durableObjectState,
-          this.config,
-          c,
-          this.env,
-          this.stateManager
-        );
-      }
-      
-      // Start polling and wait for initial poll to complete
-      await this.pollingManager.startPolling();
-      await this.pollingManager.waitForInitialPoll();
+      replicationLogger.info('Replication slot check completed', {
+        slotExists: slotStatus.exists
+      }, MODULE_NAME);
 
-      // Even if we entered hibernation, initialization was successful
       return {
-        success: true,
+        success: true, 
         slotStatus
       };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      replicationLogger.error('Replication start failed', { error: errorMessage }, MODULE_NAME);
-      
-      this.pollingManager.stopPolling();
+      replicationLogger.error('Replication slot check failed', { error: errorMessage }, MODULE_NAME);
       
       return {
         success: false,
@@ -209,21 +173,30 @@ export class ReplicationDO implements DurableObject {
 
   /**
    * Initialize the replication system - HTTP endpoint handler
+   * First checks slot, then starts polling
    */
   private async handleInit(): Promise<Response> {
     try {
-      // Start initialization
-      const result = await this.initializeReplication();
-      if (!result.success) {
-        return new Response(JSON.stringify(result), {
+      // Step 1: Check the slot exists
+      const initResult = await this.initializeReplication();
+      if (!initResult.success) {
+        return new Response(JSON.stringify(initResult), {
           status: 500,
           headers: { 'Content-Type': 'application/json' }
         });
       }
+      
+      // Step 2: Start the polling process
+      replicationLogger.info('Triggering polling process from API', {}, MODULE_NAME);
+      
+      // Start polling in the background - don't await
+      // We use waitUntil to ensure the DO stays alive to complete this
+      this.durableObjectState.waitUntil(this.pollingManager.startPolling());
 
       return new Response(JSON.stringify({
         success: true,
-        slotStatus: result.slotStatus
+        slotStatus: initResult.slotStatus,
+        pollingStarted: true
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
@@ -396,45 +369,6 @@ export class ReplicationDO implements DurableObject {
         headers: {
           'Content-Type': 'application/json'
         }
-      });
-    }
-  }
-
-  /**
-   * Wait for initial poll to complete
-   */
-  private async handleWaitForInitialPoll(): Promise<Response> {
-    try {
-      if (!this.pollingManager) {
-        return new Response(JSON.stringify({
-          success: false,
-          error: 'Polling manager not initialized'
-        }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      replicationLogger.debug('Waiting for initial poll to complete', {}, MODULE_NAME);
-      await this.pollingManager.waitForInitialPoll();
-      replicationLogger.info('Initial poll completed', {}, MODULE_NAME);
-      
-      return new Response(JSON.stringify({
-        success: true,
-        message: 'Initial poll completed'
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Wait for initial poll error', { error: errorMessage }, MODULE_NAME);
-      return new Response(JSON.stringify({
-        success: false,
-        error: errorMessage
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
       });
     }
   }

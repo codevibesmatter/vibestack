@@ -6,7 +6,7 @@ import { syncLogger } from '../middleware/logger';
 import { createMinimalContext } from '../types/hono';
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
-import { performCatchupSync, sendChanges } from './server-changes';
+import { performCatchupSync, performLiveSync } from './server-changes';
 import { 
   ServerMessage,
   ClientMessage,
@@ -67,7 +67,7 @@ export class SyncDO implements DurableObject {
   }
 
   /**
-   * Initialize replication if needed and wait for initial poll
+   * Initialize replication if needed
    */
   private async init() {
     try {
@@ -79,14 +79,7 @@ export class SyncDO implements DurableObject {
         throw new Error(`Failed to start replication: ${response.statusText}`);
       }
       
-      // Wait for initial poll to complete
-      const waitResponse = await replication.fetch(new Request('http://internal/api/replication/wait-for-initial-poll'));
-      
-      if (!waitResponse.ok) {
-        throw new Error(`Failed to wait for initial poll: ${waitResponse.statusText}`);
-      }
-      
-      syncLogger.info('Replication initialization and initial poll completed', {
+      syncLogger.info('Replication initialization completed', {
         syncId: this.syncId
       }, MODULE_NAME);
     } catch (err) {
@@ -484,13 +477,17 @@ export class SyncDO implements DurableObject {
         }
 
         // Parse the request body to get the changes
-        const requestData = await request.json() as { changes: TableChange[] };
+        const requestData = await request.json() as { 
+          changes: TableChange[],
+          lastLSN?: string 
+        };
         const changes = requestData.changes || [];
         
         syncLogger.info('Received client notification request', {
           clientId,
           changeCount: changes.length,
-          connectionActive: this.isConnected()
+          connectionActive: this.isConnected(),
+          receivedLSN: requestData.lastLSN || 'not provided'
         }, MODULE_NAME);
 
         // If we don't have an active WebSocket connection, can't notify
@@ -508,28 +505,48 @@ export class SyncDO implements DurableObject {
           });
         }
 
-        // Get the current LSN from the state manager
-        const currentLSN = this.stateManager.getLSN() || '0/0';
+        // Get the LSN from the request if provided, otherwise fall back to state manager
+        // Extract from URL parameters first (for backward compatibility)
+        let lsnFromUrl = url.searchParams.get('lsn');
+        // If not in URL or is the default value, try the request body
+        if (!lsnFromUrl || lsnFromUrl === '0/0') {
+          lsnFromUrl = requestData.lastLSN || null;
+        }
+        
+        // Use the provided LSN or fall back to the state manager
+        const lsn = (lsnFromUrl && lsnFromUrl !== '0/0') 
+          ? lsnFromUrl 
+          : this.stateManager.getLSN() || '0/0';
         
         // Use the specialized function to send changes
-        const success = await sendChanges(
-          changes,      // The changes to send
-          currentLSN,   // The current LSN (with default if null)
-          clientId,     // The client ID
-          this          // The WebSocketHandler implementation (this SyncDO instance)
+        const ctx = this.getContext();
+        
+        // Log LSN information for debugging
+        syncLogger.debug('Using LSN for sync', {
+          clientId,
+          providedLSN: lsn,
+          source: lsnFromUrl && lsnFromUrl !== '0/0' ? 'request' : 'state-manager'
+        }, MODULE_NAME);
+        
+        const result = await performLiveSync(
+          ctx,          // Context for logging/environment
+          clientId,     // Client ID
+          changes,      // The changes to send 
+          this,         // WebSocketHandler (this instance)
+          lsn           // LSN from request or state manager
         );
 
-        if (success) {
+        if (result.success) {
           syncLogger.info('Successfully notified client of changes', {
             clientId,
             changeCount: changes.length,
-            lsn: currentLSN
+            lsn: result.lsn
           }, MODULE_NAME);
 
           return new Response(JSON.stringify({
             success: true,
             notified: true,
-            lsn: currentLSN
+            lsn: result.lsn
           }), {
             status: 200,
             headers: { 'Content-Type': 'application/json' }

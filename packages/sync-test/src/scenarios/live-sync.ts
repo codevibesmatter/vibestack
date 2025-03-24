@@ -93,7 +93,7 @@ async function initializeReplication(): Promise<boolean> {
     console.log(`Initializing replication system via HTTP: ${initUrl}`);
     
     const response = await fetch(initUrl, {
-      method: 'POST',
+      method: 'GET',
       headers: {
         'Content-Type': 'application/json'
       }
@@ -171,7 +171,8 @@ async function testLiveSync(): Promise<number> {
     syncCompletedMessages: 0,
     totalChangesReceived: 0,
     finalLSN: startLSN,
-    clientId: clientId
+    clientId: clientId,
+    testCompletedSuccessfully: false  // Default to false and set to true only when all changes are created
   };
   
   // Setup sync tester with default config
@@ -183,7 +184,7 @@ async function testLiveSync(): Promise<number> {
   
   // Setup timeouts
   const timeoutDuration = 30000; // 30 seconds
-  const testDuration = 60000;    // 60 seconds
+  const testDuration = 30000;    // 30 seconds - shortened since we only need 3 changes max
   
   // Log message receipt
   const logMessageReceipt = (type: string) => {
@@ -265,6 +266,9 @@ async function testLiveSync(): Promise<number> {
   
   let running = true;
   let changeInterval: NodeJS.Timeout;
+  // Track number of changes created
+  let changesCreated = 0;
+  const maxChanges = 3; // Limit to 3 changes total
 
   // Create a promise that resolves when the test is complete
   const testFinished = new Promise<void>((resolve) => {
@@ -272,12 +276,24 @@ async function testLiveSync(): Promise<number> {
     changeInterval = setInterval(async () => {
       if (!running) return;
       
+      // Stop after maxChanges created
+      if (changesCreated >= maxChanges) {
+        console.log(`Created ${maxChanges} changes, stopping test early...`);
+        running = false;
+        clearInterval(changeInterval);
+        // Mark test as completed successfully
+        stats.testCompletedSuccessfully = true;
+        resolve();
+        return;
+      }
+      
       try {
         // Create a single change in the database
-        console.log('Creating a new database change...');
+        console.log(`Creating database change ${changesCreated + 1}/${maxChanges}...`);
         // Create a random insert operation for testing
         await createServerChange(sql as any, Task, 'insert');
-        console.log('Database change created successfully');
+        changesCreated++;
+        console.log(`Database change ${changesCreated}/${maxChanges} created successfully`);
         
         // Log message count after each change to monitor for notifications
         console.log(`Current message count: ${stats.totalMessages}`);
@@ -309,8 +325,12 @@ async function testLiveSync(): Promise<number> {
     
     // Set a timeout to end the test
     setTimeout(() => {
+      console.log(`Test duration reached with ${changesCreated} changes created.`);
+      console.log(`TIMEOUT: Test failed to create all ${maxChanges} changes in the allotted time.`);
       running = false;
       clearInterval(changeInterval);
+      // Test timed out without completing all changes
+      stats.testCompletedSuccessfully = false;
       resolve();
     }, testDuration);
   });
@@ -334,8 +354,17 @@ async function testLiveSync(): Promise<number> {
   console.log(`- Final LSN: ${stats.finalLSN}`);
   
   // Save the final LSN and client ID for future tests
-  console.log(`Saving LSN to file: ${stats.finalLSN}`);
-  saveLSNInfoToFile(stats.finalLSN, stats.clientId);
+  console.log(`Final LSN before saving: ${stats.finalLSN}`);
+  
+  // Only save the LSN if it's a valid value and not 0/0
+  // This prevents overwriting a valid LSN with a default value
+  if (stats.finalLSN && stats.finalLSN !== '0/0') {
+    console.log(`Saving LSN to file: ${stats.finalLSN}`);
+    saveLSNInfoToFile(stats.finalLSN, stats.clientId);
+  } else {
+    console.log(`Not saving invalid LSN: ${stats.finalLSN}`);
+    console.log('This would reset the stored LSN value. Keeping the previous value.');
+  }
   
   console.log('\nLive Sync Results:');
   console.log('--------------------');
@@ -348,15 +377,23 @@ async function testLiveSync(): Promise<number> {
   
   // Success criteria
   const lsnAdvanced = stats.finalLSN !== startLSN;
+  const receivedAllChanges = stats.totalChangesReceived >= changesCreated;
+  
   console.log(`Success: ${lsnAdvanced ? 'LSN advanced' : 'No LSN advancement'} from ${startLSN} to ${stats.finalLSN}`);
   console.log(`Success: ${changesReceived ? 'Received changes during live sync' : 'No changes received'}`);
+  console.log(`Success: ${receivedAllChanges ? `Received all ${changesCreated} created changes` : `Missing some changes (received ${stats.totalChangesReceived}/${changesCreated})`}`);
+  console.log(`Success: ${stats.testCompletedSuccessfully ? 'Test completed all changes' : 'Test timed out before creating all changes'}`);
+  
+  // Overall test success - now factors in whether the test completed all changes or timed out
+  const testSucceeded = lsnAdvanced && changesReceived && receivedAllChanges && stats.testCompletedSuccessfully;
+  console.log(`\nOverall Test Result: ${testSucceeded ? 'SUCCESS ✅' : 'FAILURE ❌'}`);
   
   console.log('Closing database connection...');
   // Don't actually need to close neon client
   console.log('Database connection closed');
   
-  console.log('Test completed successfully');
-  return 0;
+  console.log('Test completed, checking results...');
+  return testSucceeded ? 0 : 1; // Return non-zero exit code if test failed
 }
 
 // Run the live sync test if this file is executed directly
