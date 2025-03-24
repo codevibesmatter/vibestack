@@ -6,11 +6,12 @@ import { syncLogger } from '../middleware/logger';
 import { createMinimalContext } from '../types/hono';
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
-import { performCatchupSync } from './server-changes';
+import { performCatchupSync, sendChanges } from './server-changes';
 import { 
   ServerMessage,
   ClientMessage,
   CltMessageType,
+  ServerChangesMessage,
 } from '@repo/sync-types';
 
 // Add type for message handler function
@@ -471,6 +472,90 @@ export class SyncDO implements DurableObject {
       }), {
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+
+    // Handle the /new-changes endpoint for client notifications
+    if (url.pathname === '/new-changes') {
+      try {
+        // Ensure we have a client ID
+        if (!clientId) {
+          syncLogger.error('Client ID missing in notification request', undefined, MODULE_NAME);
+          return new Response('Missing clientId parameter', { status: 400 });
+        }
+
+        // Parse the request body to get the changes
+        const requestData = await request.json() as { changes: TableChange[] };
+        const changes = requestData.changes || [];
+        
+        syncLogger.info('Received client notification request', {
+          clientId,
+          changeCount: changes.length,
+          connectionActive: this.isConnected()
+        }, MODULE_NAME);
+
+        // If we don't have an active WebSocket connection, can't notify
+        if (!this.isConnected()) {
+          syncLogger.warn('Cannot notify client, no active connection', {
+            clientId
+          }, MODULE_NAME);
+          
+          return new Response(JSON.stringify({
+            success: false,
+            error: 'No active WebSocket connection for client'
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        // Get the current LSN from the state manager
+        const currentLSN = this.stateManager.getLSN() || '0/0';
+        
+        // Use the specialized function to send changes
+        const success = await sendChanges(
+          changes,      // The changes to send
+          currentLSN,   // The current LSN (with default if null)
+          clientId,     // The client ID
+          this          // The WebSocketHandler implementation (this SyncDO instance)
+        );
+
+        if (success) {
+          syncLogger.info('Successfully notified client of changes', {
+            clientId,
+            changeCount: changes.length,
+            lsn: currentLSN
+          }, MODULE_NAME);
+
+          return new Response(JSON.stringify({
+            success: true,
+            notified: true,
+            lsn: currentLSN
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } else {
+          syncLogger.warn('Failed to notify client of some changes', {
+            clientId,
+            changeCount: changes.length
+          }, MODULE_NAME);
+          
+          return new Response(JSON.stringify({
+            success: false,
+            error: 'Failed to send some change notifications',
+            partialSuccess: true
+          }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+      } catch (error) {
+        syncLogger.error('Error handling client notification', {
+          clientId,
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+        return new Response('Internal Server Error', { status: 500 });
+      }
     }
 
     // All other requests are not supported

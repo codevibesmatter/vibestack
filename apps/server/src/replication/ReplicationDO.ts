@@ -130,6 +130,20 @@ export class ReplicationDO implements DurableObject {
           return this.handleClients();
         case '/wait-for-initial-poll':
           return this.handleWaitForInitialPoll();
+        case '/lsn':
+          return this.handleLSN();
+      }
+    }
+
+    // Handle internal endpoints (accessed by other DOs)
+    if (path.startsWith('/internal') || path === '/lsn') {
+      const internalPath = path === '/lsn' ? '/lsn' : path.replace('/internal', '');
+      
+      switch (internalPath) {
+        case '/wait-for-initial-poll':
+          return this.handleWaitForInitialPoll();
+        case '/lsn':
+          return this.handleLSN();
       }
     }
 
@@ -418,6 +432,35 @@ export class ReplicationDO implements DurableObject {
       return new Response(JSON.stringify({
         success: false,
         error: errorMessage
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  /**
+   * Get current LSN - HTTP endpoint handler
+   */
+  private async handleLSN(): Promise<Response> {
+    try {
+      const currentLSN = await this.stateManager.getLSN();
+      
+      return new Response(JSON.stringify({
+        success: true,
+        lsn: currentLSN
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      replicationLogger.error('LSN fetch error', { error: errorMessage }, MODULE_NAME);
+      
+      return new Response(JSON.stringify({
+        success: false,
+        error: errorMessage,
+        lsn: '0/0' // Default fallback
       }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
