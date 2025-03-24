@@ -168,7 +168,7 @@ async function testLiveSync(): Promise<number> {
     totalMessages: 0,
     changesMessages: 0,
     lsnUpdateMessages: 0,
-    syncCompletedMessages: 0,
+    syncCompletedMessages: 0, // Keep for backward compatibility
     totalChangesReceived: 0,
     finalLSN: startLSN,
     clientId: clientId,
@@ -180,7 +180,7 @@ async function testLiveSync(): Promise<number> {
   
   // Track various message types
   let changesReceived = false;
-  let syncCompleted = false;
+  // We no longer use syncCompleted - using LSN updates instead
   
   // Setup timeouts
   const timeoutDuration = 30000; // 30 seconds
@@ -231,18 +231,17 @@ async function testLiveSync(): Promise<number> {
         break;
         
       case 'srv_sync_completed':
+        // Keep for backward compatibility with older server versions
         const syncMsg = message as ServerSyncCompletedMessage;
         logMessageReceipt(message.type);
         stats.syncCompletedMessages++;
         
-        console.log(`Received sync completed message: startLSN=${syncMsg.startLSN}, finalLSN=${syncMsg.finalLSN}, changes=${syncMsg.changeCount}, success=${syncMsg.success}`);
+        console.log(`Received sync completed message: ${syncMsg.startLSN ? `startLSN=${syncMsg.startLSN}, ` : ''}finalLSN=${syncMsg.finalLSN}, changes=${syncMsg.changeCount}, success=${syncMsg.success}`);
         
         if (syncMsg.finalLSN) {
           stats.finalLSN = syncMsg.finalLSN;
           console.log(`Using final LSN from sync completed message: ${stats.finalLSN}`);
         }
-        
-        syncCompleted = true;
         break;
         
       default:

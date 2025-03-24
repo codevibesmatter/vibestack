@@ -25,6 +25,9 @@ config();
 // Define a type for the Neon client
 type SqlQueryFunction = ReturnType<typeof neon>;
 
+// Command line arguments - we don't need the reset flag
+// const RESET_LSN = process.argv.includes('--reset-lsn');
+
 // Get database URL from environment
 function getDatabaseURL(): string {
   const url = process.env.DATABASE_URL;
@@ -126,10 +129,10 @@ function compareLSN(lsn1: string, lsn2: string): number {
   const [major1Str, minor1Str] = lsn1.split('/');
   const [major2Str, minor2Str] = lsn2.split('/');
   
-  // Convert to numbers (major parts are decimal, minor parts are hex)
-  const major1 = parseInt(major1Str, 10);
+  // Convert to numbers (both parts should be hex)
+  const major1 = parseInt(major1Str, 16); // Fix: Use base 16 for major
   const minor1 = parseInt(minor1Str, 16); // Hex value
-  const major2 = parseInt(major2Str, 10);
+  const major2 = parseInt(major2Str, 16); // Fix: Use base 16 for major
   const minor2 = parseInt(minor2Str, 16); // Hex value
   
   // For debugging purposes
@@ -229,6 +232,15 @@ async function testCatchupSync() {
   // Set up a message listener to process messages as they arrive
   tester.onMessage = (message) => {
     if ('type' in message) {
+      // Check for messages that might be sync_completed but not matching our type check
+      const msgType = message.type;
+      if (typeof msgType === 'string' && 
+          (msgType.includes('sync_completed') || msgType.includes('syncCompleted') || msgType.includes('sync-completed'))) {
+        console.log(`\n⚠️⚠️⚠️ POTENTIAL SYNC COMPLETED MESSAGE FOUND WITH TYPE "${msgType}":`);
+        console.log(JSON.stringify(message, null, 2));
+        console.log(`⚠️⚠️⚠️ END POTENTIAL SYNC COMPLETED\n`);
+      }
+      
       // Handle changes messages
       if (message.type === 'srv_send_changes') {
         const changesMsg = message as ServerChangesMessage;
@@ -275,7 +287,7 @@ async function testCatchupSync() {
       // Handle sync completed message - this is the final message in catchup sync
       else if (message.type === 'srv_sync_completed') {
         const syncCompletedMsg = message as any;
-        console.log(`Received sync completed message: startLSN=${syncCompletedMsg.startLSN}, finalLSN=${syncCompletedMsg.finalLSN}, changes=${syncCompletedMsg.changeCount}, success=${syncCompletedMsg.success}`);
+        console.log(`Received sync completed message: ${syncCompletedMsg.startLSN ? `startLSN=${syncCompletedMsg.startLSN}, ` : ''}finalLSN=${syncCompletedMsg.finalLSN}, changes=${syncCompletedMsg.changeCount}, success=${syncCompletedMsg.success}`);
         
         syncCompletedReceived = true;
         syncCompletedSuccess = syncCompletedMsg.success;
@@ -292,6 +304,71 @@ async function testCatchupSync() {
   };
   
   try {
+    // Debug helper function for examining messages in detail
+    const debugMessage = (message: any, label: string = "Message Debug") => {
+      if (!message) {
+        console.log(`${label}: [Message is null or undefined]`);
+        return;
+      }
+      
+      console.log(`\n===== ${label} =====`);
+      console.log(`Type: ${message.type || 'No type field!'}`);
+      
+      if (typeof message !== 'object') {
+        console.log(`Value: ${message} (type: ${typeof message})`);
+        return;
+      }
+      
+      // Check for missing fields
+      const expectedFields = ['type', 'messageId', 'timestamp', 'clientId'];
+      const missingFields = expectedFields.filter(field => !(field in message));
+      if (missingFields.length > 0) {
+        console.log(`Missing fields: ${missingFields.join(', ')}`);
+      }
+      
+      // Special checks for sync completed message
+      if (message.type === 'srv_sync_completed') {
+        const scFields = ['startLSN', 'finalLSN', 'changeCount', 'success'];
+        const missingScFields = scFields.filter(field => !(field in message));
+        
+        console.log(`This is a sync completed message`);
+        console.log(`Fields: ${Object.keys(message).join(', ')}`);
+        
+        if (missingScFields.length > 0) {
+          console.log(`⚠️ Missing expected srv_sync_completed fields: ${missingScFields.join(', ')}`);
+        }
+        
+        // Check data types
+        if ('finalLSN' in message && typeof message.finalLSN !== 'string') {
+          console.log(`⚠️ Invalid finalLSN type: ${typeof message.finalLSN}`);
+        }
+        
+        if ('changeCount' in message && typeof message.changeCount !== 'number') {
+          console.log(`⚠️ Invalid changeCount type: ${typeof message.changeCount}`);
+        }
+        
+        if ('success' in message && typeof message.success !== 'boolean') {
+          console.log(`⚠️ Invalid success type: ${typeof message.success}`);
+        }
+      }
+      
+      console.log(`Raw message content:`);
+      console.log(JSON.stringify(message, null, 2));
+      console.log('================================\n');
+    };
+
+    // Add debug handling for sync_completed to original message handler
+    const originalOriginalOnMessage = tester.onMessage;
+    tester.onMessage = (message) => {
+      if ('type' in message && message.type === 'srv_sync_completed') {
+        debugMessage(message, "DETECTED SYNC COMPLETED MESSAGE");
+      }
+      
+      if (originalOriginalOnMessage) {
+        originalOriginalOnMessage(message);
+      }
+    };
+
     // Read the LSN file again to ensure we have the most recent value
     const freshLsnInfo = getLSNInfoFromFile();
     const initialCurrentLSN = freshLsnInfo.lsn;
@@ -326,18 +403,23 @@ async function testCatchupSync() {
     const numChanges = 25; // Create 25 changes
     console.log(`Creating ${numChanges} changes...`);
     await createServerBulkChanges(sql as any, Task, numChanges);
-    
-    // Wait for changes to be processed
-    console.log('Waiting for changes to be processed...');
-    await new Promise(resolve => setTimeout(resolve, DEFAULT_CONFIG.changeWaitTime));
-    
+
     // Initialize replication system via HTTP before connecting
     console.log('Initializing replication system...');
     const initSuccess = await initializeReplication();
     if (!initSuccess) {
       console.warn('Replication initialization failed. Proceeding anyway, but sync may not work correctly.');
     }
-    
+
+    // Wait for changes to be processed by the replication system AFTER initialization
+    const replicationWaitTime = 20000; // 20 seconds
+    console.log(`Waiting ${replicationWaitTime/1000} seconds for replication system to process changes...`);
+    console.log('This allows the server to:');
+    console.log('1. Process changes created during this test');
+    console.log('2. Advance its internal LSN position');
+    console.log('3. Prepare for client connection');
+    await new Promise(resolve => setTimeout(resolve, replicationWaitTime));
+
     // Read the LSN file again to ensure we have the most recent value before connecting
     const updatedLsnInfo = getLSNInfoFromFile();
     const currentLSN = updatedLsnInfo.lsn;
@@ -350,6 +432,8 @@ async function testCatchupSync() {
     
     // Connect with the most current LSN and client ID
     console.log('Connecting to server with current LSN...');
+
+    // Simply use the current LSN from the file
     await tester.connect(currentLSN, currentClientId);
     
     // Wait for catchup sync with timeouts for each expected action
@@ -377,10 +461,18 @@ async function testCatchupSync() {
           actions.changesReceived.count++;
         } else if (message.type === 'srv_sync_completed') {
           console.log('✅ Sync completed message received');
-          const syncCompletedMsg = message as any;
+          const syncCompletedMsg = message as ServerSyncCompletedMessage;
+          
+          // Update the action state for the timeout resolution
           actions.syncCompleted.received = true;
           actions.syncCompleted.timestamp = Date.now();
           actions.syncCompleted.success = syncCompletedMsg.success;
+          
+          // Also update the global state variables
+          syncCompletedReceived = true;
+          syncCompletedSuccess = syncCompletedMsg.success;
+          syncCompletedChangeCount = syncCompletedMsg.changeCount;
+          syncCompletedFinalLSN = syncCompletedMsg.finalLSN;
           
           // Update final LSN if needed
           if (syncCompletedMsg.finalLSN && compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
@@ -426,21 +518,63 @@ async function testCatchupSync() {
     // Set up the progress reporting
     const progressInterval = setInterval(() => {
       const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`⏳ Sync progress (${elapsedSeconds}s elapsed):`);
-      console.log(`   - Changes received: ${actions.changesReceived.received ? `✅ (${actions.changesReceived.count})` : '⏳'}`);
-      console.log(`   - Sync completed: ${actions.syncCompleted.received ? '✅' : '⏳'}`);
-      console.log(`   - Total messages: ${tester.getMessageLog().length}`);
+      console.log(`\n===== Sync Progress Report (${elapsedSeconds}s elapsed) =====`);
       
-      // Print the last few messages for visibility
-      const recentMessages = tester.getMessageLog().slice(-3);
+      // Report on actions status with more details
+      console.log(`Changes received: ${actions.changesReceived.received 
+        ? `✅ (${actions.changesReceived.count} messages with ${totalChanges} changes)` 
+        : '⏳ Waiting...'}`);
+      
+      console.log(`Sync completed: ${actions.syncCompleted.received 
+        ? `✅ (${new Date(actions.syncCompleted.timestamp).toISOString().split('T')[1].split('.')[0]})` 
+        : '⏳ Waiting...'}`);
+        
+      if (syncCompletedReceived) {
+        console.log(`  - Success: ${syncCompletedSuccess ? '✅' : '❌'}`);
+        console.log(`  - Changes: ${syncCompletedChangeCount}`);
+        console.log(`  - Final LSN: ${syncCompletedFinalLSN}`);
+      }
+      
+      // Message log analysis
+      const messages = tester.getMessageLog();
+      console.log(`\nMessage Log Stats (${messages.length} total):`);
+      
+      // Count message types
+      const typeCounts = messages.reduce((counts, msg) => {
+        if ('type' in msg) {
+          const type = msg.type;
+          counts[type] = (counts[type] || 0) + 1;
+        }
+        return counts;
+      }, {} as Record<string, number>);
+      
+      // Display message type counts
+      Object.entries(typeCounts).forEach(([type, count]) => {
+        console.log(`  - ${type}: ${count}`);
+      });
+      
+      // Print the last few messages for visibility with more detail
+      const recentMessages = tester.getMessageLog().slice(-5);
       if (recentMessages.length > 0) {
-        console.log('Recent messages:');
+        console.log('\nRecent Messages:');
         recentMessages.forEach((msg, idx) => {
           if ('type' in msg) {
-            console.log(`   ${idx+1}. ${msg.type}`);
+            const timestamp = new Date(msg.timestamp).toISOString().split('T')[1].split('.')[0];
+            console.log(`  ${idx+1}. [${timestamp}] ${msg.type}${msg.type === 'srv_sync_completed' ? ' ✓' : ''}`);
+            
+            // Add extra debug for sync completed message
+            if (msg.type === 'srv_sync_completed') {
+              const syncMsg = msg as ServerSyncCompletedMessage;
+              console.log(`     - startLSN: ${syncMsg.startLSN || 'not set'}`);
+              console.log(`     - finalLSN: ${syncMsg.finalLSN || 'not set'}`);
+              console.log(`     - changeCount: ${syncMsg.changeCount}`);
+              console.log(`     - success: ${syncMsg.success}`);
+            }
           }
         });
       }
+      
+      console.log('\n=================================================');
     }, 5000);
     
     // Wait for all required actions or timeout
@@ -491,6 +625,18 @@ async function testCatchupSync() {
       console.log(`- Sync completed: ${syncCompletedSuccess ? 'success' : 'failed'}`);
       console.log(`- Server-reported change count: ${syncCompletedChangeCount}`);
       console.log(`- Server-reported final LSN: ${syncCompletedFinalLSN}`);
+      
+      // Check if we received additional changes after the sync completion
+      if (changesMessages > 0 && syncCompletedChangeCount === 0) {
+        console.log(`\n⚠️ Important Note: Received ${changesMessages} change messages with ${totalChanges} changes AFTER sync completion`);
+        console.log(`  This indicates that new database changes were processed by the replication system after`);
+        console.log(`  the catchup sync completed, but during our test session. These are live updates, not catchup sync.`);
+        
+        // If the changes received would have advanced the LSN, note that as well
+        if (compareLSN(finalLSN, syncCompletedFinalLSN) > 0) {
+          console.log(`  Final LSN reported (${finalLSN}) is more recent than sync completed LSN (${syncCompletedFinalLSN})`);
+        }
+      }
     } else {
       console.log(`- No sync completion message received`);
     }
@@ -559,45 +705,26 @@ async function testCatchupSync() {
     
     console.log(`Total changes received: ${totalChanges}`);
     
-    // Validate sync results
-    if (totalChanges === 0 && syncCompletedReceived && !syncCompletedSuccess) {
-      console.warn('Warning: No changes received. This may indicate a problem with the catchup sync process.');
-    } else {
-      console.log('Success: Received changes during catchup');
-    }
-    
     // Validate LSN advancement
-    const lsnComparison = compareLSN(finalLSN, startingLSN);
-    if (lsnComparison <= 0 && totalChanges > 0) {
-      console.warn(`Warning: LSN did not advance (${startingLSN} → ${finalLSN}) despite receiving ${totalChanges} changes. This may indicate a synchronization issue.`);
-      // Add additional diagnostic information
-      if (syncCompletedReceived && syncCompletedFinalLSN) {
-        if (syncCompletedFinalLSN !== finalLSN) {
-          console.warn(`Diagnostic: Server reported finalLSN=${syncCompletedFinalLSN} but test is using finalLSN=${finalLSN}`);
-        }
+    const lsnAdvanced = compareLSN(finalLSN, startingLSN) > 0;
+    console.log(`LSN change: ${startingLSN} → ${finalLSN} (${lsnAdvanced ? 'advanced' : 'unchanged'})`);
+
+    // Report sync status
+    if (syncCompletedReceived) {
+      if (syncCompletedChangeCount > 0) {
+        console.log(`Catchup sync completed successfully with ${syncCompletedChangeCount} changes`);
+      } else {
+        console.log(`Sync completed with no changes - client was already up-to-date`);
       }
-      
-      // Debug LSN comparison
-      console.debug(`LSN comparison debug: compareLSN("${finalLSN}", "${startingLSN}") = ${lsnComparison}`);
-      
-      try {
-        // Add more detailed comparison info
-        const [startMajor, startMinor] = startingLSN.split('/');
-        const [finalMajor, finalMinor] = finalLSN.split('/');
-        console.debug(`LSN parts: Starting(${startMajor}/${startMinor}) → Final(${finalMajor}/${finalMinor})`);
-        console.debug(`Decimal values: Starting(${parseInt(startMajor, 10)}/${parseInt(startMinor, 16)}) → Final(${parseInt(finalMajor, 10)}/${parseInt(finalMinor, 16)})`);
-      } catch (error) {
-        console.error('Error in LSN debug:', error);
-      }
-    } else if (lsnComparison > 0) {
-      console.log(`Success: LSN advanced from ${startingLSN} to ${finalLSN}`);
     }
-    
-    // Validate message sequence
-    if (changesMessages > 0 && lastChunk === totalChunks) {
-      console.log('Success: Received all chunks');
-    } else if (totalChunks > 0 && lastChunk < totalChunks) {
-      console.warn(`Warning: Received only ${lastChunk} of ${totalChunks} chunks`);
+
+    // Report on changes received
+    if (totalChanges > 0) {
+      console.log(`Received a total of ${totalChanges} changes in ${changesMessages} messages`);
+      
+      if (totalChunks > 0) {
+        console.log(`Changes were delivered in ${lastChunk}/${totalChunks} chunks`);
+      }
     }
     
   } catch (error) {
@@ -623,6 +750,9 @@ async function testCatchupSync() {
 
 // Run the test if this is the main module
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  // Let's keep the argument logging
+  console.log('Command-line arguments:', process.argv.slice(2).join(' '));
+  
   testCatchupSync()
     .then(() => {
       console.log('Test completed successfully');

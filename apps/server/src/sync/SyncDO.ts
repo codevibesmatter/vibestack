@@ -186,30 +186,34 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     server.accept();
     this.setupWebSocketEventHandlers(server);
     
-    // Determine sync strategy and perform sync
-    try {
-      // Replication is now handled at worker level
-      syncLogger.info('Determining sync strategy for client', {
-        clientId,
-        lsn: clientLSN
-      }, MODULE_NAME);
-      
-      const strategy = await this.determineSyncStrategy(clientId, clientLSN);
-      await this.performSync(strategy, clientId, clientLSN);
-    } catch (error) {
-      syncLogger.error('WebSocket initialization error', {
-        clientId,
-        lsn: clientLSN,
-        error: error instanceof Error ? error.message : String(error)
-      }, MODULE_NAME);
-      
-      // Close WebSocket on error
-      if (server.readyState === WS_READY_STATE.OPEN) {
-        server.close(1011, 'Internal Server Error');
-      }
-    }
+    // Store the client LSN for use after connection is established
+    const finalClientId = clientId;
+    const finalClientLSN = clientLSN;
     
-    // Return the client WebSocket
+    // Start sync process AFTER connection is fully established
+    this.state.waitUntil((async () => {
+      try {
+        // Wait a moment to ensure WebSocket connection is established
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+        // Determine sync strategy and perform sync
+        const { strategy, serverLSN } = await this.determineSyncStrategy(finalClientId, finalClientLSN);
+        await this.performSync({ strategy, serverLSN }, finalClientId, finalClientLSN);
+      } catch (error) {
+        syncLogger.error('WebSocket sync error', {
+          clientId: finalClientId,
+          lsn: finalClientLSN,
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
+        
+        // Close WebSocket on error
+        if (server.readyState === WS_READY_STATE.OPEN) {
+          server.close(1011, 'Internal Server Error');
+        }
+      }
+    })());
+    
+    // Return the client WebSocket IMMEDIATELY to establish the connection
     return new Response(null, {
       status: 101,
       webSocket: client
@@ -332,7 +336,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
   private async determineSyncStrategy(
     clientId: string, 
     clientLSN: string
-  ): Promise<SyncStrategy> {
+  ): Promise<{ strategy: SyncStrategy, serverLSN: string }> {
     // Register the client
     await this.stateManager.registerClient(clientId);
     
@@ -353,7 +357,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       syncLogger.info('Client needs initial sync', {
         clientId
       }, MODULE_NAME);
-      return SyncStrategy.INITIAL;
+      return { strategy: SyncStrategy.INITIAL, serverLSN };
     }
     
     // If client LSN is behind server LSN, client needs catchup sync
@@ -363,7 +367,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         clientLSN,
         serverLSN
       }, MODULE_NAME);
-      return SyncStrategy.CATCHUP;
+      return { strategy: SyncStrategy.CATCHUP, serverLSN };
     }
     
     // Client is up to date
@@ -371,14 +375,14 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       clientId,
       lsn: clientLSN
     }, MODULE_NAME);
-    return SyncStrategy.LIVE;
+    return { strategy: SyncStrategy.LIVE, serverLSN };
   }
   
   /**
    * Perform the appropriate sync based on determined strategy
    */
   private async performSync(
-    strategy: SyncStrategy,
+    { strategy, serverLSN }: { strategy: SyncStrategy, serverLSN: string },
     clientId: string,
     lsn: string
   ): Promise<void> {
@@ -405,18 +409,21 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       case SyncStrategy.CATCHUP:
         syncLogger.info('Starting catchup sync', { 
           clientId, 
-          startLSN: lsn 
+          clientLSN: lsn,
+          serverLSN
         }, MODULE_NAME);
         
         // Update sync state
         await this.stateManager.updateClientSyncState(clientId, 'catchup');
         
-        // Perform catchup sync
+        // Perform catchup sync with both LSNs
         await performCatchupSync(
           context,
           clientId,
-          lsn,
-          this  // WebSocketHandler - we implement this interface now
+          lsn,           // Client LSN
+          serverLSN,     // Server LSN - already retrieved by determineSyncStrategy
+          this,          // WebSocketHandler
+          this.stateManager
         );
         
         // After catchup, update client state to live

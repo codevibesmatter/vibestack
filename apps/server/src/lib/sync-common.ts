@@ -12,10 +12,10 @@ export function compareLSN(lsn1: string, lsn2: string): number {
   const [major1Str, minor1Str] = lsn1.split('/');
   const [major2Str, minor2Str] = lsn2.split('/');
   
-  // Convert to numbers
-  const major1 = parseInt(major1Str, 10);
+  // Convert to numbers correctly (both parts are hex)
+  const major1 = parseInt(major1Str, 16); // Fix: Use base 16 for major
   const minor1 = parseInt(minor1Str, 16); // Hex value
-  const major2 = parseInt(major2Str, 10);
+  const major2 = parseInt(major2Str, 16); // Fix: Use base 16 for major
   const minor2 = parseInt(minor2Str, 16); // Hex value
   
   // Compare parts

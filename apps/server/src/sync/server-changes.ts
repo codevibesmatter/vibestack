@@ -12,9 +12,15 @@ import type { WebSocketHandler } from './types';
 import { SERVER_TABLE_HIERARCHY } from '@repo/dataforge/server-entities';
 import { getDBClient } from '../lib/db';
 import { compareLSN, deduplicateChanges, orderChangesByDomain as baseOrderChangesByDomain } from '../lib/sync-common';
+import { sql } from '../lib/db';
+import type { SyncStateManager } from './state-manager';
 
 // Constants for chunking
-const DEFAULT_CHUNK_SIZE = 100;
+// 500 is a good balance between batch size and message size
+// - Large enough to avoid excessive chunking for normal-sized sync operations
+// - Small enough to prevent memory pressure or timeout issues
+// - Matches the page size used in database queries for consistency
+const DEFAULT_CHUNK_SIZE = 500;
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
@@ -80,35 +86,6 @@ export async function sendChanges(
 }
 
 /**
- * Get current server LSN from the Replication DO
- */
-async function getCurrentServerLSN(context: MinimalContext): Promise<string> {
-  try {
-    // Use the environment to get the Replication DO
-    const env = context.env;
-    const id = env.REPLICATION.idFromName('system');
-    const replicationDO = env.REPLICATION.get(id);
-    
-    // Call the LSN endpoint on the Replication DO using the standard API path
-    const response = await replicationDO.fetch('http://internal/api/replication/lsn');
-    
-    if (!response.ok) {
-      throw new Error(`Failed to fetch LSN: ${response.status}`);
-    }
-    
-    const data = await response.json() as { lsn: string };
-    return data.lsn || '0/0';
-  } catch (error) {
-    syncLogger.error('Error fetching current LSN', {
-      error: error instanceof Error ? error.message : String(error)
-    }, MODULE_NAME);
-    
-    // Fallback to a default value
-    return '0/0';
-  }
-}
-
-/**
  * Create a successful catchup sync completion message
  */
 export function createCatchupSyncCompletion(
@@ -157,175 +134,160 @@ export function createCatchupSyncError(
 export async function performCatchupSync(
   context: MinimalContext,
   clientId: string,
-  startLSN: string,
-  messageHandler: WebSocketHandler
+  clientLSN: string,
+  serverLSN: string, // Add serverLSN parameter to avoid redundant LSN fetching
+  messageHandler: WebSocketHandler,
+  stateManager: SyncStateManager
 ): Promise<void> {
   syncLogger.info('Catchup sync started', {
     clientId,
-    startLSN
+    clientLSN,
+    serverLSN
   }, MODULE_NAME);
 
   let changeCount = 0; // Track total changes sent for reporting
+  let finalLSN = clientLSN; // This will track the final LSN after changes
   
   try {
-    // Get current server LSN from the Replication DO at the start of sync
-    const initialServerLSN = await getCurrentServerLSN(context);
-    let finalLSN = startLSN; // This will track the final LSN after changes
+    // SyncDO has already determined that client needs catchup sync
+    // We can immediately start fetching changes
+    syncLogger.info('Retrieving changes from history', {
+      clientLSN,
+      serverLSN
+    }, MODULE_NAME);
     
-    // If client is behind, use the change_history table to get changes
-    if (compareLSN(startLSN, initialServerLSN) < 0) {
-      syncLogger.info('Client is behind server, retrieving changes from history', {
-        clientLSN: startLSN,
-        serverLSN: initialServerLSN
-      }, MODULE_NAME);
+    try {
+      const client = getDBClient(context);
+      await client.connect();
       
       try {
-        const client = getDBClient(context);
-        await client.connect();
+        // Set a timeout for the query to avoid WebSocket connection timeout
+        // - 20 second query timeout is shorter than typical WebSocket timeout of 30s
+        // - This prevents the database from holding a transaction open too long
+        await client.query('SET statement_timeout = 20000'); // 20 seconds timeout
         
-        try {
-          // Paginate through the changes to avoid memory issues
-          const pageSize = 500;
-          let offset = 0;
-          let hasMoreChanges = true;
-          let allChanges: TableChange[] = [];
-          
-          while (hasMoreChanges) {
-            // Query changes from history table using proper LSN comparison
-            // Be careful with casting - pg_lsn() expects text input
-            const result = await client.query(`
-              SELECT lsn, table_name, operation, data 
-              FROM change_history 
-              WHERE lsn::pg_lsn > $1::pg_lsn AND lsn::pg_lsn <= $2::pg_lsn
-              ORDER BY lsn::pg_lsn ASC
-              LIMIT $3 OFFSET $4
-            `, [startLSN, initialServerLSN, pageSize, offset]);
-            
-            // Log query performance
-            syncLogger.debug('Retrieved changes from history', {
-              startLSN,
-              serverLSN: initialServerLSN,
-              limit: pageSize,
-              offset,
-              resultCount: result.rows.length
+        // Paginate through the changes to avoid memory issues
+        const pageSize = 500;
+        let lastSeenLSN = clientLSN; // Start from client LSN
+        let hasMoreChanges = true;
+        let allChanges: TableChange[] = [];
+        
+        // Track query start time
+        const queryStartTime = Date.now();
+        
+        while (hasMoreChanges) {
+          // Check elapsed time and break if getting close to WebSocket timeout
+          // - 25 second timeout is a safety margin before WebSocket typically closes at 30s
+          // - This allows time to process any changes already retrieved before connection closes
+          if (Date.now() - queryStartTime > 25000) { // 25 seconds
+            syncLogger.warn('Query taking too long, stopping pagination to avoid WebSocket timeout', {
+              clientId,
+              timeElapsed: Date.now() - queryStartTime,
+              changesRetrieved: allChanges.length
             }, MODULE_NAME);
-            
-            // Convert to TableChange format
-            const changes: TableChange[] = result.rows.map(row => ({
-              table: row.table_name,
-              operation: row.operation,
-              data: row.data,
-              lsn: row.lsn,
-              updated_at: row.data?.updated_at || new Date().toISOString()
-            }));
-            
-            // Add to our collection
-            allChanges = allChanges.concat(changes);
-            
-            // Update paging logic
-            hasMoreChanges = changes.length === pageSize;
-            offset += pageSize;
-            
-            // Update the last seen LSN if we have rows
-            if (changes.length > 0) {
-              const lastChangeLSN = changes[changes.length - 1].lsn || startLSN;
-              finalLSN = compareLSN(lastChangeLSN, finalLSN) > 0 ? lastChangeLSN : finalLSN;
-            }
+            break;
           }
           
-          // If we found changes, process and send them
-          if (allChanges.length > 0) {
-            // Sort by LSN (this should already be sorted, but just to be sure)
-            allChanges.sort((a, b) => {
-              return compareLSN(a.lsn || '0/0', b.lsn || '0/0');
-            });
-            
-            // Deduplicate changes to avoid processing duplicates
-            const deduplicatedChanges = deduplicateChanges(allChanges);
-            
-            // Log deduplication results
-            syncLogger.info('Deduplicated historical changes', {
-              clientId,
-              originalCount: allChanges.length,
-              deduplicatedCount: deduplicatedChanges.length,
-              reduction: allChanges.length - deduplicatedChanges.length
-            }, MODULE_NAME);
-            
-            // Order changes based on domain hierarchy
-            const orderedChanges = baseOrderChangesByDomain(deduplicatedChanges);
-            await sendChanges(orderedChanges, finalLSN, clientId, messageHandler);
-            
-            // Update the change count for final reporting
-            changeCount = orderedChanges.length;
-            
-            syncLogger.info('Sent historical changes to client', {
-              clientId,
-              changeCount,
-              finalLSN
-            }, MODULE_NAME);
-          } else {
-            syncLogger.info('No historical changes found', {
-              clientId,
-              startLSN,
-              serverLSN: initialServerLSN
-            }, MODULE_NAME);
+          // Query changes from history table using proper LSN comparison
+          // Using keyset pagination for better performance than OFFSET on large datasets
+          const queryStart = Date.now();
+          const result = await client.query(`
+            SELECT lsn, table_name, operation, data 
+            FROM change_history 
+            WHERE 
+              lsn::pg_lsn > $1::pg_lsn AND 
+              lsn::pg_lsn <= $2::pg_lsn
+            ORDER BY lsn::pg_lsn ASC
+            LIMIT $3
+          `, [lastSeenLSN, serverLSN, pageSize]);
+          const queryDuration = Date.now() - queryStart;
+          
+          // Log query performance
+          syncLogger.debug('Retrieved changes from history', {
+            lastSeenLSN,
+            serverLSN,
+            limit: pageSize,
+            resultCount: result.rows.length,
+            queryDuration
+          }, MODULE_NAME);
+          
+          // Convert to TableChange format
+          const changes: TableChange[] = result.rows.map(row => ({
+            table: row.table_name,
+            operation: row.operation,
+            data: row.data,
+            lsn: row.lsn,
+            updated_at: row.data?.updated_at || new Date().toISOString()
+          }));
+          
+          // Add to our collection
+          allChanges = allChanges.concat(changes);
+          
+          // Update paging logic - if we got fewer rows than pageSize, we're done
+          hasMoreChanges = changes.length === pageSize;
+          
+          // Update the last seen LSN if we have rows - use for next page query
+          if (changes.length > 0) {
+            lastSeenLSN = changes[changes.length - 1].lsn || lastSeenLSN;
+            finalLSN = compareLSN(lastSeenLSN, finalLSN) > 0 ? lastSeenLSN : finalLSN;
           }
-        } finally {
-          await client.end();
         }
-      } catch (historyError) {
-        // Log the error but continue with sync process
-        syncLogger.error('Failed to retrieve historical changes', {
-          clientId,
-          error: historyError instanceof Error ? historyError.message : String(historyError)
-        }, MODULE_NAME);
+        
+        // If we found changes, process and send them
+        if (allChanges.length > 0) {
+          // Sort by LSN (this should already be sorted, but just to be sure)
+          allChanges.sort((a, b) => {
+            return compareLSN(a.lsn || '0/0', b.lsn || '0/0');
+          });
+          
+          // Deduplicate changes to avoid processing duplicates
+          const deduplicatedChanges = deduplicateChanges(allChanges);
+          
+          // Log deduplication results
+          syncLogger.info('Deduplicated historical changes', {
+            clientId,
+            originalCount: allChanges.length,
+            deduplicatedCount: deduplicatedChanges.length,
+            reduction: allChanges.length - deduplicatedChanges.length
+          }, MODULE_NAME);
+          
+          // Order changes based on domain hierarchy
+          const orderedChanges = baseOrderChangesByDomain(deduplicatedChanges);
+          await sendChanges(orderedChanges, finalLSN, clientId, messageHandler);
+          
+          // Update the change count for final reporting
+          changeCount = orderedChanges.length;
+          
+          syncLogger.info('Sent historical changes to client', {
+            clientId,
+            changeCount,
+            finalLSN
+          }, MODULE_NAME);
+        } else {
+          syncLogger.info('No historical changes found', {
+            clientId,
+            clientLSN,
+            serverLSN
+          }, MODULE_NAME);
+        }
+      } finally {
+        await client.end();
       }
-    } else {
-      // Client is already up to date
-      syncLogger.info('Client LSN is current with server', {
-        clientLSN: startLSN,
-        serverLSN: initialServerLSN
+    } catch (historyError) {
+      // Log the error but continue with sync process
+      syncLogger.error('Failed to retrieve historical changes', {
+        clientId,
+        error: historyError instanceof Error ? historyError.message : String(historyError)
       }, MODULE_NAME);
     }
     
-    // Check for new changes that may have occurred during sync
-    const finalServerLSN = await getCurrentServerLSN(context);
+    // No need to check for new changes during sync - that will be handled by the
+    // live sync process after catchup completes
     
-    if (compareLSN(initialServerLSN, finalServerLSN) < 0) {
-      // New changes were detected during the sync
-      syncLogger.info('New changes detected during catchup sync, restarting catchup process', {
-        clientId,
-        initialServerLSN,
-        finalServerLSN,
-        completedUpTo: finalLSN
-      }, MODULE_NAME);
-      
-      // Send a sync completed message for this batch before restarting
-      const syncCompletedMsg = createCatchupSyncCompletion(
-        clientId,
-        startLSN,
-        finalLSN,
-        changeCount
-      );
-      
-      await messageHandler.send(syncCompletedMsg);
-      
-      // Restart catchup sync from the final LSN we reached
-      await performCatchupSync(
-        context,
-        clientId,
-        finalLSN,
-        messageHandler
-      );
-      
-      // We've restarted the sync, so return from this call
-      return;
-    }
-    
-    // No new changes detected, complete the sync normally
+    // Complete the sync
     const syncCompletedMsg = createCatchupSyncCompletion(
       clientId,
-      startLSN,
+      clientLSN,
       finalLSN,
       changeCount
     );
@@ -334,21 +296,21 @@ export async function performCatchupSync(
     
     syncLogger.info('Catchup sync completed', {
       clientId,
-      startLSN,
+      clientLSN,
       finalLSN,
       changeCount
     }, MODULE_NAME);
   } catch (error) {
     syncLogger.error('Catchup sync failed', {
       clientId,
-      startLSN,
+      clientLSN,
       error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     
     // Send a sync completed message with error information
     const syncCompletedMsg = createCatchupSyncError(
       clientId,
-      startLSN,
+      clientLSN,
       error instanceof Error ? error : String(error)
     );
     
@@ -356,7 +318,7 @@ export async function performCatchupSync(
     
     syncLogger.error('Catchup sync failed, completion message sent', {
       clientId,
-      startLSN,
+      clientLSN,
       error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
   }

@@ -212,7 +212,7 @@ export class PollingManager {
           'include-timestamp', 'true'
         )
         WHERE lsn > $2::pg_lsn
-        LIMIT 100;
+        LIMIT 500;
       `;
       
       // Execute the query
