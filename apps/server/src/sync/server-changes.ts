@@ -367,13 +367,20 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
 /**
  * Process live changes for a client
  * This handles real-time notifications for clients with active connections
+ * @param context The context object
+ * @param clientId The client ID
+ * @param changes The changes to process
+ * @param messageHandler The WebSocket handler
+ * @param providedLSN Optional LSN that overrides the LSN from changes
+ * @returns An object with success status and the LSN used
  */
 export async function performLiveSync(
   context: MinimalContext,
   clientId: string,
   changes: TableChange[],
-  messageHandler: WebSocketHandler
-): Promise<boolean> {
+  messageHandler: WebSocketHandler,
+  providedLSN?: string
+): Promise<{ success: boolean; lsn: string }> {
   const MODULE_TAG = `${MODULE_NAME}:live-sync`;
   
   // Start tracking time for performance monitoring
@@ -383,13 +390,14 @@ export async function performLiveSync(
     syncLogger.info('Live sync started', { 
       clientId, 
       changeCount: changes.length,
-      tables: [...new Set(changes.map(c => c.table))].join(',')
+      tables: [...new Set(changes.map(c => c.table))].join(','),
+      providedLSN: providedLSN || 'not provided'
     }, MODULE_TAG);
     
     // Skip if no changes
     if (!changes.length) {
       syncLogger.info('No changes to send', { clientId }, MODULE_TAG);
-      return true;
+      return { success: true, lsn: providedLSN || '0/0' };
     }
     
     // Process the changes (deduplicate and order them)
@@ -407,16 +415,27 @@ export async function performLiveSync(
     // Order by domain tables hierarchy to ensure consistency
     orderedChanges = baseOrderChangesByDomain(orderedChanges);
     
-    // Extract the LSN from the last change in the ordered list
-    // Ensure it's a string by providing a default if undefined
-    const currentLSN: string = orderedChanges.length > 0 && orderedChanges[orderedChanges.length - 1].lsn
-      ? String(orderedChanges[orderedChanges.length - 1].lsn)
-      : '0/0';
+    // Use provided LSN if available, otherwise extract from changes
+    let currentLSN: string;
     
-    syncLogger.debug('Using LSN from changes', { 
-      clientId, 
-      lsn: currentLSN 
-    }, MODULE_TAG);
+    if (providedLSN) {
+      currentLSN = providedLSN;
+      syncLogger.debug('Using provided LSN', { 
+        clientId, 
+        lsn: currentLSN 
+      }, MODULE_TAG);
+    } else {
+      // Extract the LSN from the last change in the ordered list
+      // Ensure it's a string by providing a default if undefined
+      currentLSN = orderedChanges.length > 0 && orderedChanges[orderedChanges.length - 1].lsn
+        ? String(orderedChanges[orderedChanges.length - 1].lsn)
+        : '0/0';
+      
+      syncLogger.debug('Using LSN from changes', { 
+        clientId, 
+        lsn: currentLSN 
+      }, MODULE_TAG);
+    }
     
     // Send changes to the client
     syncLogger.info('Sending live changes', {
@@ -438,7 +457,7 @@ export async function performLiveSync(
         clientId,
         count: orderedChanges.length
       }, MODULE_TAG);
-      return false;
+      return { success: false, lsn: '0/0' };
     }
     
     // Send a sync completed message to notify the client of completed live sync
@@ -469,33 +488,13 @@ export async function performLiveSync(
       // We still consider this a success since the changes were delivered
     }
     
-    // Update client state with LSN update message
-    const lsnUpdateMessage: ServerLSNUpdateMessage = {
-      type: 'srv_lsn_update',
-      messageId: `srv_${Date.now()}_lsn_update`,
-      timestamp: Date.now(),
-      clientId,
-      lsn: currentLSN
-    };
-    
-    try {
-      await messageHandler.send(lsnUpdateMessage);
-      syncLogger.debug('Sent LSN update', { clientId, lsn: currentLSN }, MODULE_TAG);
-    } catch (error) {
-      syncLogger.warn('Error sending LSN update', {
-        clientId,
-        error: error instanceof Error ? error.message : String(error) 
-      }, MODULE_TAG);
-      // Non-critical error, we still proceed
-    }
-    
-    return true;
+    return { success: true, lsn: currentLSN };
   } catch (error) {
     syncLogger.error('Live sync failed', {
       clientId,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined
     }, MODULE_TAG);
-    return false;
+    return { success: false, lsn: '0/0' };
   }
 } 
