@@ -2,6 +2,8 @@ import type { TableChange } from './table-changes';
 
 export type SrvMessageType = 
   | 'srv_send_changes'      // Server sends changes from WAL
+  | 'srv_catchup_changes'   // Server sends changes during catchup sync
+  | 'srv_live_changes'      // Server sends changes during live sync
   | 'srv_init_start'       // Server starts initial sync
   | 'srv_init_changes'     // Server sends initial sync table data
   | 'srv_init_complete'    // Server signals initial sync is complete
@@ -21,7 +23,8 @@ export type CltMessageType =
   | 'clt_changes_received'  // Client acknowledges receipt of changes
   | 'clt_changes_applied'   // Client signals changes were applied
   | 'clt_init_received'    // Client acknowledges receipt of initial sync data
-  | 'clt_init_processed';  // Client signals initial sync data was processed
+  | 'clt_init_processed'   // Client signals initial sync data was processed
+  | 'clt_catchup_received'; // Client acknowledges receipt of catchup sync chunk
 
 // Base message interface for all messages
 export interface BaseMessage {
@@ -36,13 +39,21 @@ export interface ServerMessage extends BaseMessage {
 }
 
 export interface ServerChangesMessage extends ServerMessage {
-  type: 'srv_send_changes';
+  type: 'srv_send_changes' | 'srv_catchup_changes' | 'srv_live_changes';
   changes: TableChange[];
   lastLSN: string;
   sequence?: {
     chunk: number;
     total: number;
   };
+}
+
+export interface ServerCatchupChangesMessage extends ServerChangesMessage {
+  type: 'srv_catchup_changes';
+}
+
+export interface ServerLiveChangesMessage extends ServerChangesMessage {
+  type: 'srv_live_changes';
 }
 
 export interface ServerInitChangesMessage extends ServerMessage {
@@ -134,6 +145,12 @@ export interface ClientInitReceivedMessage extends ClientMessage {
 
 export interface ClientInitProcessedMessage extends ClientMessage {
   type: 'clt_init_processed';
+}
+
+export interface ClientCatchupReceivedMessage extends ClientMessage {
+  type: 'clt_catchup_received';
+  chunk: number;
+  lsn: string;  // The last LSN processed in this chunk
 }
 
 // Union types for all messages

@@ -336,9 +336,11 @@ export async function performInitialSync(
     // Send sync complete message and wait for client acknowledgment
     await sendInitialSyncComplete(context, clientId, finalLSN, messageHandler);
 
-    // Update client's LSN and state in a single operation
+    // Store the client's LSN internally without sending additional messages
     await stateManager.updateClientLSN(clientId, finalLSN);
-    await stateManager.updateClientSyncState(clientId, 'live');
+    
+    // Note: We no longer send srv_state_change, srv_lsn_update, or srv_sync_completed messages
+    // Those were determined to be unnecessary for the initial sync flow
   } catch (error) {
     syncLogger.error('Initial sync error', { 
       clientId, 

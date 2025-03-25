@@ -7,7 +7,7 @@ This document outlines the complete sync flow between client and server, includi
 Client connects to WebSocket endpoint:
 ```typescript
 // Client -> Server
-WebSocket('/api/sync/ws/*')
+WebSocket('/api/sync')
 Parameters:
   - clientId: string
   - lsn: string  // Client's last known LSN
@@ -15,7 +15,7 @@ Parameters:
 
 Server:
 - Routes to SyncDO
-- Establishes hibernatable WebSocket connection
+- Establishes hibernatable WebSocket connection through protocol upgrade
 - Registers client in state manager with LSN
 - Determines sync flow based on LSN:
   1. If LSN is '0/0': triggers Initial Sync flow
@@ -82,55 +82,68 @@ Sequence:
    }
    ```
 
-4. Transition Logic:
-   - Compare `serverLSN` from `srv_init_start` with `serverLSN` from `srv_init_complete`
-   - If they match: 
-     - No changes occurred during initial sync
-     - Server -> Client: `srv_state_change` with state='live'
-   - If they differ:
-     - Changes occurred during initial sync
-     - Begin Catchup Sync flow from `srv_init_complete.serverLSN`
-
-Note: The sequence tracking enables sync recovery and progress monitoring. The server tracks chunk delivery per table and sends the completion message once all tables are synced. If a connection drops, the sync can be resumed from the last acknowledged chunk of the last acknowledged table.
+4. Client acknowledges init completion:
+   Client -> Server: `clt_init_processed`
+   ```typescript
+   {
+     type: 'clt_init_processed',
+     messageId: string,
+     timestamp: number,
+     clientId: string
+   }
+   ```
 
 ## 3. Catchup Sync
 
 Triggered when client has valid LSN but is behind server LSN.
 
-1. Server begins WAL replay from client's LSN
-2. Server -> Client: `srv_state_change`
+1. Server sends changes in chunks:
+   Server -> Client: `srv_catchup_changes`
    ```typescript
    {
-     type: 'srv_state_change',
-     state: 'catchup',
-     lsn: string,  // Client's LSN where catchup starts
-     messageId: string,
-     timestamp: number,
-     clientId: string
-   }
-   ```
-
-3. Server sends changes in chunks:
-   Server -> Client: `srv_send_changes`
-   ```typescript
-   {
-     type: 'srv_send_changes',
+     type: 'srv_catchup_changes',
      changes: TableChange[],
      lastLSN: string,
-     sequence?: { chunk: number, total: number },
+     sequence: { chunk: number, total: number }, // Indicates chunk position
      messageId: string,
      timestamp: number,
      clientId: string
    }
    ```
 
-4. After catching up:
-   Server -> Client: `srv_state_change`
+2. Client acknowledges each chunk:
+   Client -> Server: `clt_catchup_received`
    ```typescript
    {
-     type: 'srv_state_change',
-     state: 'live',
-     lsn: string,  // Current server LSN
+     type: 'clt_catchup_received',
+     chunk: number,     // The chunk number being acknowledged
+     lsn: string,       // Last LSN processed in this chunk
+     messageId: string,
+     timestamp: number,
+     clientId: string
+   }
+   ```
+
+   Notes on chunking and flow control:
+   - Changes are retrieved from the database in pages (typically 500 records)
+   - Before sending to client, changes are:
+     1. Deduplicated to avoid redundant updates
+     2. Ordered based on domain hierarchy
+     3. Split into chunks (DEFAULT_CHUNK_SIZE = 500)
+   - Each chunk includes a sequence object that indicates progress
+   - The server waits for client acknowledgment before sending the next chunk
+   - This provides flow control, preventing slower clients from being overwhelmed
+
+3. After catching up, server sends completion message:
+   Server -> Client: `srv_sync_completed`
+   ```typescript
+   {
+     type: 'srv_sync_completed',
+     startLSN: string,    // LSN where sync started
+     finalLSN: string,    // LSN at sync completion
+     changeCount: number, // Total changes sent
+     success: boolean,    // Success status
+     error?: string,      // Error message if failed
      messageId: string,
      timestamp: number,
      clientId: string
@@ -147,10 +160,10 @@ Server polls WAL for changes and processes them:
    - Creates/Updates: Parents before children
    - Deletes: Children before parents
 
-2. Server -> Client: `srv_send_changes`
+2. Server -> Client: `srv_live_changes`
    ```typescript
    {
-     type: 'srv_send_changes',
+     type: 'srv_live_changes',
      changes: TableChange[],
      lastLSN: string,
      sequence?: { chunk: number, total: number },
@@ -160,7 +173,7 @@ Server polls WAL for changes and processes them:
    }
    ```
 
-3. Client -> Server: `clt_changes_received`
+3. Client -> Server: `clt_changes_received` (acknowledgment)
    ```typescript
    {
      type: 'clt_changes_received',
@@ -185,24 +198,34 @@ Server polls WAL for changes and processes them:
    }
    ```
 
-2. Server processes each change:
-   - Executes against database (insert/update/delete)
-   - Handles CRDT conflicts
-   - Records failed changes in history table
-
-3. Server -> Client (Success): `srv_send_changes` (empty changes array)
+2. Server acknowledgment of receipt (immediate):
+   Server -> Client: `srv_changes_received`
    ```typescript
    {
-     type: 'srv_send_changes',
-     changes: [],
-     lastLSN: '0/0',
+     type: 'srv_changes_received',
+     changeIds: string[],
      messageId: string,
      timestamp: number,
      clientId: string
    }
    ```
 
-   Server -> Client (Error): `srv_error`
+3. Server processes changes and sends application status:
+   Server -> Client: `srv_changes_applied`
+   ```typescript
+   {
+     type: 'srv_changes_applied',
+     appliedChanges: string[],
+     success: boolean,
+     error?: string,
+     messageId: string,
+     timestamp: number,
+     clientId: string
+   }
+   ```
+
+   On error (may be sent in addition):
+   Server -> Client: `srv_error`
    ```typescript
    {
      type: 'srv_error',
@@ -247,30 +270,29 @@ Server -> Client: `srv_error`
   type: 'srv_error',
   messageId: string,
   timestamp: number,
-  clientId: string
+  clientId: string,
+  error?: string       // Optional error message
 }
 ```
 
-Client -> Server: `clt_error`
-```typescript
-{
-  type: 'clt_error',
-  messageId: string,
-  timestamp: number,
-  clientId: string
-}
-```
+## 7. Complete Message Type Summary
 
-## 7. State Changes
+### Server Messages
+- `srv_init_start` - Initial sync process starting
+- `srv_init_changes` - Initial sync table data chunks
+- `srv_init_complete` - Initial sync process complete
+- `srv_catchup_changes` - Changes being sent to client during catchup sync
+- `srv_live_changes` - Changes being sent to client during live sync
+- `srv_changes_received` - Acknowledgment of client changes received
+- `srv_changes_applied` - Notification that client changes were applied
+- `srv_sync_completed` - Notification that catchup sync process is complete
+- `srv_error` - Error message
+- `srv_heartbeat` - Server heartbeat response
 
-Server -> Client: `srv_state_change`
-```typescript
-{
-  type: 'srv_state_change',
-  state: 'initial' | 'catchup' | 'live',
-  lsn: string,
-  messageId: string,
-  timestamp: number,
-  clientId: string
-}
-``` 
+### Client Messages
+- `clt_init_received` - Acknowledgment of table chunk receipt
+- `clt_init_processed` - Notification that initial sync is processed
+- `clt_catchup_received` - Acknowledgment of catchup sync chunk receipt
+- `clt_send_changes` - Client sending changes to server
+- `clt_changes_received` - Acknowledgment of server changes
+- `clt_heartbeat` - Client heartbeat 

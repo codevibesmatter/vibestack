@@ -18,6 +18,7 @@ import { config } from 'dotenv';
 import { neon } from '@neondatabase/serverless';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
+import WebSocket from 'ws';
 
 // Load environment variables from .env file
 config();
@@ -242,11 +243,11 @@ async function testCatchupSync() {
       }
       
       // Handle changes messages
-      if (message.type === 'srv_send_changes') {
+      if (message.type === 'srv_catchup_changes' as any) {
         const changesMsg = message as ServerChangesMessage;
         changesMessages++;
         
-        console.log(`Received srv_send_changes message #${changesMessages}`);
+        console.log(`Received srv_catchup_changes message #${changesMessages}`);
         
         if (changesMsg.changes) {
           totalChanges += changesMsg.changes.length;
@@ -266,6 +267,77 @@ async function testCatchupSync() {
               finalLSN = changesMsg.lastLSN;
               console.log(`  Updated finalLSN from changes message: ${finalLSN}`);
             }
+          }
+          
+          // Send chunk acknowledgment - new part to actually implement flow control
+          try {
+            const ackMessage: any = {
+              type: 'clt_catchup_received',
+              messageId: `clt_ack_${Date.now()}`,
+              timestamp: Date.now(),
+              clientId: tester.getClientId(),
+              chunk: changesMsg.sequence?.chunk || 1,
+              lsn: changesMsg.lastLSN || finalLSN
+            };
+            
+            // Send the acknowledgment
+            tester.sendMessage(ackMessage).then(() => {
+              console.log(`  ✅ Sent acknowledgment for chunk ${ackMessage.chunk} with LSN ${ackMessage.lsn}`);
+            }).catch(err => {
+              console.error(`  ❌ Failed to send acknowledgment:`, err);
+            });
+          } catch (ackError) {
+            console.error(`  ❌ Error creating acknowledgment:`, ackError);
+          }
+        }
+      }
+      
+      // Legacy handling for 'srv_send_changes' during transition period 
+      else if (message.type === 'srv_send_changes' as any) {
+        const changesMsg = message as ServerChangesMessage;
+        changesMessages++;
+        
+        console.log(`Received srv_send_changes message #${changesMessages} (legacy message type)`);
+        console.log(`  ⚠️ DEPRECATED: This message type has been replaced with 'srv_catchup_changes' for catchup sync`);
+        
+        if (changesMsg.changes) {
+          totalChanges += changesMsg.changes.length;
+          console.log(`  Contains ${changesMsg.changes.length} changes`);
+          
+          // Same tracking as above...
+          if (changesMsg.sequence) {
+            lastChunk = changesMsg.sequence.chunk;
+            totalChunks = changesMsg.sequence.total;
+            console.log(`  Chunk ${lastChunk}/${totalChunks}`);
+          }
+          
+          if (changesMsg.lastLSN) {
+            console.log(`  Has lastLSN: ${changesMsg.lastLSN}`);
+            if (compareLSN(changesMsg.lastLSN, finalLSN) > 0) {
+              finalLSN = changesMsg.lastLSN;
+              console.log(`  Updated finalLSN from changes message: ${finalLSN}`);
+            }
+          }
+          
+          // Send chunk acknowledgment for legacy message type too
+          try {
+            const ackMessage: any = {
+              type: 'clt_catchup_received',
+              messageId: `clt_ack_${Date.now()}`,
+              timestamp: Date.now(),
+              clientId: tester.getClientId(),
+              chunk: changesMsg.sequence?.chunk || 1,
+              lsn: changesMsg.lastLSN || finalLSN
+            };
+            
+            // Send the acknowledgment
+            tester.sendMessage(ackMessage).then(() => {
+              console.log(`  ✅ Sent acknowledgment for chunk ${ackMessage.chunk} with LSN ${ackMessage.lsn}`);
+            }).catch(err => {
+              console.error(`  ❌ Failed to send acknowledgment:`, err);
+            });
+          } catch (ackError) {
+            console.error(`  ❌ Error creating acknowledgment:`, ackError);
           }
         }
       }
@@ -454,7 +526,7 @@ async function testCatchupSync() {
       }
       
       if ('type' in message) {
-        if (message.type === 'srv_send_changes') {
+        if ((message.type as string) === 'srv_catchup_changes' || (message.type as string) === 'srv_send_changes') {
           console.log('✅ Changes message received');
           actions.changesReceived.received = true;
           actions.changesReceived.timestamp = Date.now();

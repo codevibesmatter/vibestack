@@ -1,6 +1,6 @@
 import type { 
   TableChange,
-  SrvMessageType,
+  ServerMessage,
   ServerChangesMessage,
   ServerStateChangeMessage,
   ServerLSNUpdateMessage,
@@ -27,9 +27,9 @@ type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 const MODULE_NAME = 'server-changes';
 
 /**
- * Send changes to client using the message handler with chunking support
+ * Send catchup changes to client using the message handler with chunking support and flow control
  */
-export async function sendChanges(
+export async function sendCatchupChanges(
   changes: TableChange[],
   lastLSN: string,
   clientId: string,
@@ -49,7 +49,7 @@ export async function sendChanges(
     const chunkChanges = changes.slice(start, end);
 
     const message: ServerChangesMessage = {
-      type: 'srv_send_changes',
+      type: 'srv_catchup_changes',
       messageId: `srv_${Date.now()}_${i}`,
       timestamp: Date.now(),
       clientId,
@@ -60,9 +60,41 @@ export async function sendChanges(
 
     try {
       await messageHandler.send(message);
+      
+      // Wait for client acknowledgment (flow control for catchup sync)
+      syncLogger.debug('Waiting for chunk acknowledgment', {
+        clientId,
+        chunk: i + 1,
+        total: chunks
+      }, MODULE_NAME);
+      
+      try {
+        // Wait for client to acknowledge this specific chunk
+        await messageHandler.waitForMessage(
+          'clt_catchup_received',
+          (msg) => msg.chunk === i + 1,
+          30000 // 30 second timeout
+        );
+        
+        syncLogger.debug('Received chunk acknowledgment', {
+          clientId,
+          chunk: i + 1,
+          total: chunks
+        }, MODULE_NAME);
+      } catch (ackError) {
+        syncLogger.error('Failed to receive chunk acknowledgment', {
+          clientId,
+          chunk: i + 1,
+          total: chunks,
+          error: ackError instanceof Error ? ackError.message : String(ackError)
+        }, MODULE_NAME);
+        success.push(false);
+        continue; // Skip to next chunk
+      }
+      
       success.push(true);
       
-      syncLogger.info('Sent changes chunk', {
+      syncLogger.info('Sent catchup changes chunk', {
         clientId,
         chunk: i + 1,
         total: chunks,
@@ -72,7 +104,7 @@ export async function sendChanges(
       }, MODULE_NAME);
     } catch (err) {
       success.push(false);
-      syncLogger.error('Chunk send failed', {
+      syncLogger.error('Catchup chunk send failed', {
         clientId,
         chunk: i + 1,
         total: chunks,
@@ -192,7 +224,7 @@ export async function performCatchupSync(
           // Using keyset pagination for better performance than OFFSET on large datasets
           const queryStart = Date.now();
           const result = await client.query(`
-            SELECT lsn, table_name, operation, data 
+            SELECT lsn, table_name, operation, data, timestamp 
             FROM change_history 
             WHERE 
               lsn::pg_lsn > $1::pg_lsn AND 
@@ -217,7 +249,7 @@ export async function performCatchupSync(
             operation: row.operation,
             data: row.data,
             lsn: row.lsn,
-            updated_at: row.data?.updated_at || new Date().toISOString()
+            updated_at: row.timestamp || new Date().toISOString()
           }));
           
           // Add to our collection
@@ -253,18 +285,26 @@ export async function performCatchupSync(
           
           // Order changes based on domain hierarchy
           const orderedChanges = baseOrderChangesByDomain(deduplicatedChanges);
-          await sendChanges(orderedChanges, finalLSN, clientId, messageHandler);
+          
+          // Send changes with flow control - wait for acknowledgment after each chunk
+          await sendCatchupChanges(
+            orderedChanges, 
+            finalLSN, 
+            clientId, 
+            messageHandler
+          );
           
           // Update the change count for final reporting
           changeCount = orderedChanges.length;
           
-          syncLogger.info('Sent historical changes to client', {
+          // Log at debug level instead of info to reduce noise
+          syncLogger.debug('Sent historical changes to client', {
             clientId,
             changeCount,
             finalLSN
           }, MODULE_NAME);
         } else {
-          syncLogger.info('No historical changes found', {
+          syncLogger.debug('No historical changes found', {
             clientId,
             clientLSN,
             serverLSN
@@ -325,66 +365,6 @@ export async function performCatchupSync(
 }
 
 /**
- * Handle new changes from replication
- */
-export async function handleNewChanges(
-  changes: TableChange[],
-  lastLSN: string,
-  clientId: string,
-  messageHandler: WebSocketHandler
-): Promise<boolean> {
-  try {
-    // Filter out changes that originated from this client
-    const originalCount = changes.length;
-    const filteredChanges = changes.filter(change => {
-      // Access client_id from change.data if it exists
-      return !change.data?.client_id || change.data.client_id !== clientId;
-    });
-    
-    // Log filtered changes
-    if (filteredChanges.length !== originalCount) {
-      syncLogger.debug('Filtered out client\'s own changes', {
-        clientId,
-        before: originalCount,
-        after: filteredChanges.length,
-        filtered: originalCount - filteredChanges.length
-      }, MODULE_NAME);
-    }
-    
-    // Skip if no changes after filtering
-    if (filteredChanges.length === 0) {
-      syncLogger.info('No changes to send after filtering', { clientId }, MODULE_NAME);
-      return true;
-    }
-    
-    // Send changes to client
-    const success = await sendChanges(filteredChanges, lastLSN, clientId, messageHandler);
-    
-    if (success) {
-      syncLogger.info('Changes sent successfully', {
-        clientId,
-        count: filteredChanges.length,
-        lastLSN
-      }, MODULE_NAME);
-    } else {
-      syncLogger.error('Changes send failed', {
-        clientId,
-        count: filteredChanges.length,
-        lastLSN
-      }, MODULE_NAME);
-    }
-    
-    return success;
-  } catch (err) {
-    syncLogger.error('Changes handling error', {
-      clientId,
-      error: err instanceof Error ? err.message : String(err)
-    }, MODULE_NAME);
-    return false;
-  }
-}
-
-/**
  * Order changes based on table hierarchy and operation type with logging
  * Wrapper around the core orderChangesByDomain function
  */
@@ -416,14 +396,7 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
 }
 
 /**
- * Send live changes to a client
- * This handles real-time notifications for clients with active connections
- * @param context The context object
- * @param clientId The client ID
- * @param changes The changes to process
- * @param messageHandler The WebSocket handler
- * @param providedLSN Optional LSN that overrides the LSN from changes
- * @returns An object with success status and the LSN used
+ * Send live changes to client without waiting for acknowledgment
  */
 export async function sendLiveChanges(
   context: MinimalContext,
@@ -481,7 +454,7 @@ export async function sendLiveChanges(
     }
     
     // Order by domain tables hierarchy to ensure consistency
-    orderedChanges = baseOrderChangesByDomain(orderedChanges);
+    orderedChanges = orderChangesByDomain(orderedChanges);
     
     // Use provided LSN if available, otherwise extract from changes
     let currentLSN: string;
@@ -512,13 +485,48 @@ export async function sendLiveChanges(
       lsn: currentLSN
     }, MODULE_TAG);
     
-    // Use the sendChanges function to handle the actual sending
-    const sendSuccess = await sendChanges(
-      orderedChanges,
-      currentLSN,
-      clientId,
-      messageHandler
-    );
+    // Calculate chunks
+    const chunks = Math.ceil(orderedChanges.length / DEFAULT_CHUNK_SIZE);
+    const chunkSuccess: boolean[] = [];
+
+    for (let i = 0; i < chunks; i++) {
+      const start = i * DEFAULT_CHUNK_SIZE;
+      const end = Math.min(start + DEFAULT_CHUNK_SIZE, orderedChanges.length);
+      const chunkChanges = orderedChanges.slice(start, end);
+
+      const message: ServerChangesMessage = {
+        type: 'srv_live_changes',
+        messageId: `srv_${Date.now()}_${i}`,
+        timestamp: Date.now(),
+        clientId,
+        changes: chunkChanges,
+        lastLSN: i === chunks - 1 ? currentLSN : chunkChanges[chunkChanges.length - 1].lsn!,
+        sequence: { chunk: i + 1, total: chunks }
+      };
+
+      try {
+        await messageHandler.send(message);
+        chunkSuccess.push(true);
+        
+        syncLogger.info('Sent live changes chunk', {
+          clientId,
+          chunk: i + 1,
+          total: chunks,
+          count: chunkChanges.length,
+          lastLSN: message.lastLSN
+        }, MODULE_TAG);
+      } catch (err) {
+        chunkSuccess.push(false);
+        syncLogger.error('Live chunk send failed', {
+          clientId,
+          chunk: i + 1,
+          total: chunks,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_TAG);
+      }
+    }
+    
+    const sendSuccess = chunkSuccess.every(s => s);
     
     if (!sendSuccess) {
       syncLogger.error('Failed to send live changes', { 

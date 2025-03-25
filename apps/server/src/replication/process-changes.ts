@@ -248,11 +248,10 @@ export async function storeChangesInHistory(
       
       const query = `
         INSERT INTO change_history 
-          (table_name, operation, data, lsn, updated_at) 
+          (table_name, operation, data, lsn, timestamp) 
         VALUES 
           ${values}
-        ON CONFLICT (lsn, table_name, (data->>'id'))
-        DO NOTHING;
+        ON CONFLICT DO NOTHING;
       `;
       
       await client.query(query, params);
@@ -261,8 +260,8 @@ export async function storeChangesInHistory(
     // Commit transaction
     await client.query('COMMIT');
     
-    // Only log the final result once
-    replicationLogger.info('Changes stored', { 
+    // Only log the final result once at debug level instead of info to reduce noise
+    replicationLogger.debug('Changes stored', { 
       count: changes.length, 
       operations: operationCounts,
       tables: Array.from(tables),
@@ -315,8 +314,8 @@ export async function consumeWALChanges(
     const result = await client.query(consumeQuery, [slotName, lastLSN]);
     const consumedCount = result.rows.length;
     
-    // Single concise log with LSN transition
-    replicationLogger.info('WAL changes consumed', {
+    // Single concise log with LSN transition at debug level to reduce noise
+    replicationLogger.debug('WAL changes consumed', {
       count: consumedCount,
       lsn: `${currentLSN} → ${lastLSN}`,
       slot: slotName
@@ -425,8 +424,8 @@ export async function broadcastChangesToClients(
     // Get active clients to notify about changes
     const activeClients = await getActiveClients(env);
     
-    // Only log once at the end for results
-    replicationLogger.info('Notifying clients', {
+    // Only log once at debug level to reduce noise
+    replicationLogger.debug('Notifying clients', {
       clientCount: activeClients.length,
       changeCount: changes.length,
       lastLSN
@@ -465,8 +464,8 @@ export async function broadcastChangesToClients(
       }
     }
     
-    // Log final broadcast result
-    replicationLogger.info('Broadcast complete', {
+    // Log final broadcast result at debug level
+    replicationLogger.debug('Broadcast complete', {
       totalClients: activeClients.length,
       notifiedCount,
       lastLSN
@@ -591,7 +590,7 @@ export async function processAndConsumeWALChanges(
     // This ensures we don't reprocess changes even if WAL consumption fails
     try {
       await stateManager.setLSN(lastLSN);
-      replicationLogger.info('Updated LSN after successful domain table change storage', {
+      replicationLogger.debug('Updated LSN after successful domain table change storage', {
         lsn: lastLSN,
         changeCount: tableChanges.length
       }, MODULE_NAME);

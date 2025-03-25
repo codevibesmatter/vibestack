@@ -410,7 +410,8 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         break;
         
       case SyncStrategy.CATCHUP:
-        // Update sync state
+        // Update client's sync state in storage (this just updates internal state
+        // and doesn't send any WebSocket messages)
         await this.stateManager.updateClientSyncState(clientId, 'catchup');
         
         // Perform catchup sync with both LSNs

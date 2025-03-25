@@ -196,13 +196,14 @@ async function testLiveSync(): Promise<number> {
     stats.totalMessages++;
     
     // Handle different message types
-    switch (message.type) {
-      case 'srv_send_changes':
+    const msgType = message.type as string;
+    switch (msgType) {
+      case 'srv_live_changes':
         const changesMsg = message as ServerChangesMessage;
-        logMessageReceipt(message.type);
+        logMessageReceipt(msgType);
         stats.changesMessages++;
         
-        console.log(`Received srv_send_changes message #${stats.changesMessages}`);
+        console.log(`Received srv_live_changes message #${stats.changesMessages}`);
         console.log(`  Contains ${changesMsg.changes.length} changes`);
         
         // Check if sequence information is available
@@ -216,6 +217,30 @@ async function testLiveSync(): Promise<number> {
         }
         
         stats.totalChangesReceived += changesMsg.changes.length;
+        changesReceived = true;
+        break;
+        
+      // Legacy handling for old message type during transition
+      case 'srv_send_changes':
+        const legacyChangesMsg = message as ServerChangesMessage;
+        logMessageReceipt(msgType);
+        stats.changesMessages++;
+        
+        console.log(`Received srv_send_changes message #${stats.changesMessages} (legacy message type)`);
+        console.log(`  ⚠️ DEPRECATED: This message type has been replaced with 'srv_live_changes' for live sync`);
+        console.log(`  Contains ${legacyChangesMsg.changes.length} changes`);
+        
+        // Check if sequence information is available
+        if (legacyChangesMsg.sequence) {
+          console.log(`  Chunk ${legacyChangesMsg.sequence.chunk}/${legacyChangesMsg.sequence.total}`);
+        }
+        
+        if (legacyChangesMsg.lastLSN) {
+          console.log(`  Has lastLSN: ${legacyChangesMsg.lastLSN}`);
+          stats.finalLSN = legacyChangesMsg.lastLSN;
+        }
+        
+        stats.totalChangesReceived += legacyChangesMsg.changes.length;
         changesReceived = true;
         break;
         
@@ -347,7 +372,8 @@ async function testLiveSync(): Promise<number> {
   // Analyze results
   console.log('\nMessage Analysis Summary:');
   console.log(`- Total messages received: ${stats.totalMessages}`);
-  console.log(`- Found ${stats.changesMessages} srv_send_changes messages with ${stats.totalChangesReceived} total changes`);
+  console.log(`- Found ${stats.changesMessages} changes messages with ${stats.totalChangesReceived} total changes`);
+  console.log(`  (Both 'srv_live_changes' and legacy 'srv_send_changes' are counted)`);
   console.log(`- LSN updates: ${stats.lsnUpdateMessages}`);
   console.log(`- Sync completions: ${stats.syncCompletedMessages}`);
   console.log(`- Final LSN: ${stats.finalLSN}`);
