@@ -1,5 +1,7 @@
 import { DEFAULT_CONFIG } from './config.js';
 import { SyncTester } from './test-sync.js';
+// Export seed functionality
+export * from './seed/index.js';
 
 async function runSyncTest(): Promise<void> {
   console.log('Starting sync test with configuration:', {

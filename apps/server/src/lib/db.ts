@@ -193,6 +193,8 @@ export async function fetchDomainTableData(c: Context<{ Bindings: Env }> | Minim
 export async function checkDatabaseHealth(c: Context<{ Bindings: Env }> | MinimalContext): Promise<{
   healthy: boolean;
   latency: number;
+  tables?: Array<{ name: string; rowCount: number }>;
+  tableCount?: number;
   error?: string;
 }> {
   const start = Date.now();
@@ -202,9 +204,35 @@ export async function checkDatabaseHealth(c: Context<{ Bindings: Env }> | Minima
     await client.connect();
     await client.query('SELECT 1');
     
+    // Get table information
+    const tablesResult = await client.query<{ tablename: string }>(`
+      SELECT tablename 
+      FROM pg_tables 
+      WHERE schemaname = 'public'
+      ORDER BY tablename;
+    `);
+    
+    const tables = [];
+    
+    // Get row count for each table
+    for (const { tablename } of tablesResult.rows) {
+      const countResult = await client.query<{ count: number }>(`
+        SELECT COUNT(*) as count FROM "${tablename}";
+      `);
+      
+      const rowCount = Number(countResult.rows[0]?.count || 0);
+      
+      tables.push({
+        name: tablename,
+        rowCount
+      });
+    }
+    
     return {
       healthy: true,
-      latency: Date.now() - start
+      latency: Date.now() - start,
+      tables,
+      tableCount: tables.length
     };
   } catch (error) {
     return {
