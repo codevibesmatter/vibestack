@@ -247,12 +247,8 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
       updated_at: new Date()
     });
     
-    // Log progress during data generation
-    if (i === 0 || (i + 1) % progressInterval === 0 || i + 1 === config.userCount) {
-      process.stdout.write(`\r  Generating: ${formatProgress(i + 1, config.userCount, userStartTime)}`);
-    }
+    // Skip progress logging during generation
   }
-  console.log(); // New line after generation phase
   
   // Insert users in batches
   console.log(`  Inserting ${users.length} users into database...`);
@@ -281,11 +277,11 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
     userCount += chunk.length;
     
     // Update progress after each chunk
-    process.stdout.write(`\r  Inserting: ${formatProgress(userCount, users.length, insertStartTime)}`);
+    process.stdout.write(`\r  ${formatProgress(userCount, users.length, insertStartTime)}`);
   }
   
   // Final progress update
-  process.stdout.write(`\r  Inserted: ${formatProgress(userCount, users.length, insertStartTime)}  \n`);
+  process.stdout.write(`\r  ${formatProgress(userCount, users.length, insertStartTime)}  \n`);
   
   entityTimings.users = Date.now() - userStartTime;
   console.log(`✅ Created ${userCount} users in ${formatTime(entityTimings.users)}`);
@@ -326,15 +322,9 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
       
       projectProgressCount++;
       
-      // Log progress at intervals or for the last item
-      if (projectProgressCount === 1 || 
-          projectProgressCount % progressInterval === 0 || 
-          projectProgressCount === estimatedProjectCount) {
-        process.stdout.write(`\r  Generating: ${formatProgress(projectProgressCount, estimatedProjectCount, projectStartTime)}`);
-      }
+      // Skip progress logging during generation
     }
   }
-  console.log(); // New line after generation phase
   
   // Insert projects in batches
   console.log(`  Inserting ${projects.length} projects into database...`);
@@ -364,11 +354,11 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
     projectCount += chunk.length;
     
     // Update progress after each chunk
-    process.stdout.write(`\r  Inserting: ${formatProgress(projectCount, projects.length, projectInsertStartTime)}`);
+    process.stdout.write(`\r  ${formatProgress(projectCount, projects.length, projectInsertStartTime)}`);
   }
   
   // Final progress update
-  process.stdout.write(`\r  Inserted: ${formatProgress(projectCount, projects.length, projectInsertStartTime)}  \n`);
+  process.stdout.write(`\r  ${formatProgress(projectCount, projects.length, projectInsertStartTime)}  \n`);
   
   entityTimings.projects = Date.now() - projectStartTime;
   console.log(`✅ Created ${projectCount} projects in ${formatTime(entityTimings.projects)}`);
@@ -426,15 +416,9 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
       
       taskProgressCount++;
       
-      // Log progress at intervals or for the last item
-      if (taskProgressCount === 1 || 
-          taskProgressCount % (progressInterval * 2) === 0 || 
-          taskProgressCount === estimatedTaskCount) {
-        process.stdout.write(`\r  Generating: ${formatProgress(taskProgressCount, estimatedTaskCount, taskStartTime)}`);
-      }
+      // Skip progress logging during generation
     }
   }
-  console.log(); // New line after generation phase
   
   // Insert tasks in batches
   console.log(`  Inserting ${tasks.length} tasks into database...`);
@@ -471,11 +455,11 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
     taskCount += chunk.length;
     
     // Update progress after each chunk
-    process.stdout.write(`\r  Inserting: ${formatProgress(taskCount, tasks.length, taskInsertStartTime)}`);
+    process.stdout.write(`\r  ${formatProgress(taskCount, tasks.length, taskInsertStartTime)}`);
   }
   
   // Final progress update
-  process.stdout.write(`\r  Inserted: ${formatProgress(taskCount, tasks.length, taskInsertStartTime)}  \n`);
+  process.stdout.write(`\r  ${formatProgress(taskCount, tasks.length, taskInsertStartTime)}  \n`);
   
   entityTimings.tasks = Date.now() - taskStartTime;
   console.log(`✅ Created ${taskCount} tasks in ${formatTime(entityTimings.tasks)}`);
@@ -520,12 +504,7 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
       
       commentProgressCount++;
       
-      // Log progress at intervals
-      if (commentProgressCount === 1 || 
-          commentProgressCount % (progressInterval * 5) === 0 || 
-          commentProgressCount === estimatedCommentCount) {
-        process.stdout.write(`\r  Generating: ${formatProgress(commentProgressCount, estimatedCommentCount, commentStartTime)}`);
-      }
+      // Skip progress logging during generation
     }
     
     // Add some replies to comments (30% chance per comment)
@@ -548,11 +527,7 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
         
         commentProgressCount++;
         
-        // Log progress at intervals (less frequently for replies)
-        if (commentProgressCount % (progressInterval * 10) === 0 || 
-            commentProgressCount === estimatedCommentCount) {
-          process.stdout.write(`\r  Generating: ${formatProgress(commentProgressCount, estimatedCommentCount, commentStartTime)}`);
-        }
+        // Skip progress logging during generation
       }
     }
   }
@@ -585,11 +560,11 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
     commentCount += chunk.length;
     
     // Update progress after each chunk
-    process.stdout.write(`\r  Inserting: ${formatProgress(commentCount, comments.length, commentInsertStartTime)}`);
+    process.stdout.write(`\r  ${formatProgress(commentCount, comments.length, commentInsertStartTime)}`);
   }
   
   // Final progress update
-  process.stdout.write(`\r  Inserted: ${formatProgress(commentCount, comments.length, commentInsertStartTime)}  \n`);
+  process.stdout.write(`\r  ${formatProgress(commentCount, comments.length, commentInsertStartTime)}  \n`);
   
   entityTimings.comments = Date.now() - commentStartTime;
   console.log(`✅ Created ${commentCount} comments in ${formatTime(entityTimings.comments)}`);
