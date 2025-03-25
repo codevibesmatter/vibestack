@@ -57,14 +57,6 @@ export class ChangeProcessor {
   async processChanges(message: ClientChangesMessage): Promise<void> {
     const { clientId, changes } = message;
     
-    // Single log at start
-    syncLogger.info(`Processing ${changes.length} changes for client ${clientId}`, {
-      clientId,
-      messageId: message.messageId,
-      changeCount: changes.length,
-      timestamp: new Date().toISOString()
-    }, MODULE_NAME);
-
     try {
       // Set statement timeout
       await this.setStatementTimeout();
@@ -78,8 +70,7 @@ export class ChangeProcessor {
       } catch (ackError) {
         syncLogger.error(`Failed to send received acknowledgment for client ${clientId}`, {
           clientId,
-          error: ackError instanceof Error ? ackError.message : String(ackError),
-          timestamp: new Date().toISOString()
+          error: ackError instanceof Error ? ackError.message : String(ackError)
         }, MODULE_NAME);
         // Continue processing even if acknowledgment fails
       }
@@ -105,8 +96,7 @@ export class ChangeProcessor {
       } catch (appliedError) {
         syncLogger.error(`Failed to send applied acknowledgment for client ${clientId}`, {
           clientId,
-          error: appliedError instanceof Error ? appliedError.message : String(appliedError),
-          timestamp: new Date().toISOString()
+          error: appliedError instanceof Error ? appliedError.message : String(appliedError)
         }, MODULE_NAME);
       }
       
@@ -115,14 +105,12 @@ export class ChangeProcessor {
         clientId,
         appliedCount: summary.appliedCount,
         skippedCount: summary.skippedCount,
-        success: summary.allSuccessful,
-        timestamp: new Date().toISOString()
+        success: summary.allSuccessful
       }, MODULE_NAME);
     } catch (error) {
       syncLogger.error(`Processing failed for client ${clientId}`, {
         clientId,
-        error: error instanceof Error ? error.message : String(error),
-        timestamp: new Date().toISOString()
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       
       // Send error response
@@ -131,8 +119,7 @@ export class ChangeProcessor {
       } catch (errorSendError) {
         syncLogger.error(`Failed to send error message to client ${clientId}`, {
           clientId,
-          error: errorSendError instanceof Error ? errorSendError.message : String(errorSendError),
-          timestamp: new Date().toISOString()
+          error: errorSendError instanceof Error ? errorSendError.message : String(errorSendError)
         }, MODULE_NAME);
       }
       
@@ -144,19 +131,10 @@ export class ChangeProcessor {
    * Process all changes, grouped by table and operation
    */
   private async processAllChanges(changes: TableChange[]): Promise<ExecutionResult[]> {
-    syncLogger.info(`Processing ${changes.length} changes in batches`, {
-      timestamp: new Date().toISOString()
-    }, MODULE_NAME);
-    
     // Group changes by table and operation
     const groups = this.groupChangesByTableAndOperation(changes);
     const results: ExecutionResult[] = [];
     const processingMap = new Map<string, boolean>(); // Track which changes were processed
-    
-    syncLogger.info(`Grouped into ${groups.length} operation groups`, {
-      groups: groups.map(g => `${g.table}:${g.operation}:${g.changes.length}`),
-      timestamp: new Date().toISOString()
-    }, MODULE_NAME);
     
     // Track all changes by ID for conflict detection
     for (const change of changes) {
@@ -166,10 +144,6 @@ export class ChangeProcessor {
     
     // Process each group
     for (const group of groups) {
-      syncLogger.info(`Processing group ${group.table}:${group.operation} with ${group.changes.length} changes`, {
-        timestamp: new Date().toISOString()
-      }, MODULE_NAME);
-      
       try {
         let batchResults: any[] = [];
         
@@ -206,25 +180,16 @@ export class ChangeProcessor {
         syncLogger.error(`Group processing failed: ${group.table} ${group.operation}: ${
           error instanceof Error ? error.message : String(error)
         }`, {
-          error: error instanceof Error ? error.stack : String(error),
-          timestamp: new Date().toISOString()
+          error: error instanceof Error ? error.stack : String(error)
         }, MODULE_NAME);
         
         // Fall back to individual processing
         try {
-          syncLogger.info(`Falling back to individual processing for ${group.table}:${group.operation}`, {
-            timestamp: new Date().toISOString()
-          }, MODULE_NAME);
-          
           const individualResults = await this.processIndividually(
             group.table, 
             group.changes, 
             group.operation
           );
-          
-          syncLogger.info(`Individual processing complete for ${group.table}:${group.operation}, got ${individualResults.length} results`, {
-            timestamp: new Date().toISOString()
-          }, MODULE_NAME);
           
           // Mark successful individual changes
           for (const result of individualResults) {
@@ -237,8 +202,7 @@ export class ChangeProcessor {
           syncLogger.error(`Individual processing also failed: ${
             individualError instanceof Error ? individualError.message : String(individualError)
           }`, {
-            error: individualError instanceof Error ? individualError.stack : String(individualError),
-            timestamp: new Date().toISOString()
+            error: individualError instanceof Error ? individualError.stack : String(individualError)
           }, MODULE_NAME);
         }
       }
@@ -267,10 +231,6 @@ export class ChangeProcessor {
         });
       }
     }
-    
-    syncLogger.info(`All changes processed: ${results.length - skippedCount} successful, ${skippedCount} skipped`, {
-      timestamp: new Date().toISOString()
-    }, MODULE_NAME);
     
     return results;
   }

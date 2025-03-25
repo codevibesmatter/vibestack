@@ -68,14 +68,8 @@ export class PollingManager {
 
       // Start sequential polling immediately
       if (!this.pollingInterval) {
-        replicationLogger.debug('Starting sequential polling', {
-          pollInterval: ACTIVE_POLL_INTERVAL
-        }, MODULE_NAME);
-        
         // Start the polling cycle
         this.startSequentialPolling();
-      } else {
-        replicationLogger.debug('Sequential polling already started', {}, MODULE_NAME);
       }
     } catch (err) {
       replicationLogger.error('Start polling error', {
@@ -184,7 +178,6 @@ export class PollingManager {
         clearInterval(this.pollingInterval);
       }
       this.pollingInterval = null;
-      replicationLogger.debug('Polling stopped', {}, MODULE_NAME);
     }
   }
 
@@ -234,11 +227,6 @@ export class PollingManager {
         }, MODULE_NAME);
         
         return newChanges;
-      } else if (!this.hasCompletedFirstPoll) {
-        // Only log no changes during initial poll
-        replicationLogger.debug('No changes in initial poll', {
-          currentLSN
-        }, MODULE_NAME);
       }
       
       return null;

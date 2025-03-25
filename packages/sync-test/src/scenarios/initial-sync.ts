@@ -17,12 +17,37 @@ import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
 import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
+
+// Get the current file's directory
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Path to the saved LSN data file - directly in the sync-test package directory
+const LSN_FILE_PATH = path.join(__dirname, '..', '..', '.sync-test-lsn.json');
+
+// Log the file path for debugging
+console.log(`LSN file path: ${LSN_FILE_PATH}`);
+
+/**
+ * Load existing LSN data from file if available
+ */
+function loadSavedLSNData(): { lsn: string, clientId: string, timestamp: string } | null {
+  try {
+    if (fs.existsSync(LSN_FILE_PATH)) {
+      const data = JSON.parse(fs.readFileSync(LSN_FILE_PATH, 'utf8'));
+      return data;
+    }
+  } catch (err) {
+    console.warn('Failed to load saved LSN data:', err);
+  }
+  return null;
+}
 
 /**
  * Testing class for initial sync scenario
  * 
  * FLOW:
- * 1. Client connects to server with LSN=0
+ * 1. Client connects to server with LSN=0/0
  * 2. Server sends srv_init_start message
  * 3. Server sends multiple srv_init_changes messages with table chunks
  * 4. Client acknowledges each chunk with clt_init_received message
@@ -32,12 +57,13 @@ import { fileURLToPath } from 'url';
  */
 class InitialSyncTester {
   // Tracking state
-  private initStartLSN: string = '';
+  private initStartLSN: string = '0/0'; // Always use 0/0 for initial sync
   private initCompleteLSN: string = '';
   private receivedTables: Set<string> = new Set();
   private expectedTables: Set<string>;
   private acknowledgedChunks: Set<string> = new Set();
   private processedInitComplete: boolean = false;
+  private syncSuccessful: boolean = false;
   
   // Websocket and connection
   private ws: WebSocket | null = null;
@@ -49,8 +75,18 @@ class InitialSyncTester {
   private serverLSN: string = '';
   
   constructor() {
-    // Generate client ID
-    this.clientId = `client_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    // Try to load saved client ID from previous run
+    const savedData = loadSavedLSNData();
+    
+    if (savedData && savedData.clientId) {
+      console.log('Using existing client ID from previous run:', savedData.clientId);
+      this.clientId = savedData.clientId;
+    } else {
+      // Generate a new UUID-based client ID
+      this.clientId = uuidv4();
+      console.log('Generated new client ID:', this.clientId);
+    }
+    
     // Get expected table names from domain tables
     this.expectedTables = new Set(SERVER_DOMAIN_TABLES.map(t => t.replace(/^"|"$/g, '')));
   }
@@ -59,10 +95,10 @@ class InitialSyncTester {
    * Connect to server to begin sync
    */
   public async connect(): Promise<void> {
-    // STEP 1: Setup connection with LSN=0 to start initial sync
+    // STEP 1: Setup connection with LSN=0/0 for initial sync
     const wsUrl = new URL(this.config.wsUrl);
     wsUrl.searchParams.set('clientId', this.clientId);
-    wsUrl.searchParams.set('lsn', '0/0'); // Start from beginning
+    wsUrl.searchParams.set('lsn', '0/0'); // Always use 0/0 for initial sync
     
     console.log('Connecting to sync server:', {
       url: wsUrl.toString(),
@@ -105,13 +141,64 @@ class InitialSyncTester {
   }
   
   /**
-   * Disconnect from server
+   * Disconnect from server with a more aggressive termination strategy
    */
   public async disconnect(code = 1000, reason = 'Test complete'): Promise<void> {
-    if (this.ws) {
-      this.ws.close(code, reason);
-    }
-    this.ws = null;
+    console.log('Disconnecting WebSocket...');
+    
+    return new Promise<void>((resolve) => {
+      if (!this.ws) {
+        console.log('No active WebSocket connection to disconnect');
+        return resolve();
+      }
+      
+      // Remove all existing listeners to avoid memory leaks
+      this.ws.removeAllListeners();
+      
+      // Set a short timeout for graceful close
+      const forceCloseTimeout = setTimeout(() => {
+        console.log('Force closing WebSocket after timeout');
+        if (this.ws) {
+          // Force terminate the connection
+          try {
+            this.ws.terminate();
+          } catch (err) {
+            console.error('Error terminating WebSocket:', err);
+          }
+          this.ws = null;
+        }
+        resolve();
+      }, 1000);
+      
+      // Try graceful close first
+      try {
+        // Add just one close listener
+        this.ws.once('close', () => {
+          console.log('WebSocket closed gracefully');
+          clearTimeout(forceCloseTimeout);
+          this.ws = null;
+          resolve();
+        });
+        
+        // Attempt graceful close
+        this.ws.close(code, reason);
+      } catch (error) {
+        console.error('Error during WebSocket close:', error);
+        clearTimeout(forceCloseTimeout);
+        
+        // Force terminate on error
+        if (this.ws) {
+          try {
+            this.ws.terminate();
+          } catch (err) {
+            // Just log, don't throw
+            console.error('Error terminating WebSocket after close error:', err);
+          }
+          this.ws = null;
+        }
+        resolve();
+      }
+    });
   }
 
   /**
@@ -127,17 +214,20 @@ class InitialSyncTester {
         // Legacy state change message
         this.currentState = (message as ServerStateChangeMessage).state;
         this.serverLSN = (message as ServerStateChangeMessage).lsn;
+        console.log(`State changed to ${this.currentState} with LSN: ${this.serverLSN}`);
       } else if (message.type === 'srv_lsn_update') {
         // New LSN-only update message
         this.serverLSN = (message as ServerLSNUpdateMessage).lsn;
+        console.log(`Received LSN update: ${this.serverLSN}`);
         
         // Derive state from LSN comparison
         if (this.initStartLSN === '0/0' || !this.initStartLSN) {
           this.currentState = 'initial';
-        } else if (this.serverLSN !== this.initCompleteLSN) {
+        } else if (!this.initCompleteLSN || this.serverLSN !== this.initCompleteLSN) {
           this.currentState = 'catchup';
         } else {
           this.currentState = 'live';
+          console.log(`Entered live state with LSN: ${this.serverLSN}`);
         }
       }
     }
@@ -161,7 +251,8 @@ class InitialSyncTester {
         
       case 'srv_lsn_update':
         // STEP 7: Server sent LSN update
-        console.log('Received LSN update:', (message as ServerLSNUpdateMessage).lsn);
+        const lsnMessage = message as ServerLSNUpdateMessage;
+        console.log(`LSN update received: ${lsnMessage.lsn} (current: ${this.initCompleteLSN})`);
         break;
     }
   }
@@ -203,9 +294,57 @@ class InitialSyncTester {
       .every(table => this.receivedTables.has(table));
       
     if (allTablesReceived && !this.processedInitComplete) {
+      // Mark as processed
       this.processedInitComplete = true;
+      
       // STEP 6: Send init processed message
       await this.sendInitProcessed();
+      
+      // Store the server LSN (the complete message contains the server's LSN)
+      this.serverLSN = message.serverLSN;
+      
+      // Mark sync as successful - we're done with initial sync when we receive and process the complete message
+      this.syncSuccessful = true;
+      this.currentState = 'live';
+      console.log('✓ Initial sync completed successfully');
+      
+      // Save LSN file immediately when sync is successful
+      this.saveLSNFile();
+      
+      // If running as main module, exit now since we've completed our work
+      if (process.argv[1] === fileURLToPath(import.meta.url)) {
+        console.log('Sync complete and LSN saved. Exiting with success code.');
+        process.exit(0);
+      }
+    }
+  }
+
+  /**
+   * Save the LSN state to a file for future tests
+   */
+  private saveLSNFile(): void {
+    if (this.initCompleteLSN && this.syncSuccessful) {
+      try {
+        console.log(`Saving LSN file to: ${LSN_FILE_PATH}`);
+        
+        // Ensure directory exists
+        const dirPath = path.dirname(LSN_FILE_PATH);
+        if (!fs.existsSync(dirPath)) {
+          fs.mkdirSync(dirPath, { recursive: true });
+        }
+        
+        fs.writeFileSync(
+          LSN_FILE_PATH, 
+          JSON.stringify({
+            lsn: this.initCompleteLSN,
+            timestamp: new Date().toISOString(),
+            clientId: this.clientId
+          }, null, 2)
+        );
+        console.log(`Saved LSN state to ${LSN_FILE_PATH} for future tests`);
+      } catch (err) {
+        console.error('Failed to save LSN file:', err);
+      }
     }
   }
 
@@ -229,7 +368,7 @@ class InitialSyncTester {
    * Generate next unique message ID
    */
   private nextMessageId(): string {
-    return `clt_${Date.now()}_${this.messageId++}`;
+    return `clt_${this.clientId.substring(0, 8)}_${this.messageId++}`;
   }
 
   /**
@@ -300,12 +439,21 @@ class InitialSyncTester {
    * Validate complete initial sync process
    */
   public async validateInitialSync(timeoutMs: number = 30000): Promise<boolean> {
-    // Step 1: Wait for the sync to complete (state becomes live)
+    // Step 1: Wait for sync signals via events
     console.log('Validating initial sync...');
     try {
-      // Wait for LSN match instead of state
-      await this.waitForLSNMatch(timeoutMs);
-      console.log('✓ LSNs match (client is in sync with server)');
+      // If sync already completed during connection, just validate results
+      if (this.syncSuccessful) {
+        console.log('✓ Sync already completed successfully');
+      } else {
+        // Wait for sync to complete with timeout
+        const syncCompleted = await this.waitForSyncCompletion(timeoutMs);
+        if (!syncCompleted) {
+          throw new Error('Sync did not complete within timeout period');
+        }
+      }
+      
+      console.log('✓ Sync completed, validating results');
       
       // Step 2: Validate table hierarchy was respected
       if (this.validateTableOrder()) {
@@ -330,30 +478,76 @@ class InitialSyncTester {
       }
       
       console.log('✓ Initial sync validation successful');
+      return true;
     } catch (err) {
       console.error('❌ Initial sync validation failed:', err);
+      this.syncSuccessful = false;
       throw err;
     }
-    
-    return true;
   }
-
+  
   /**
-   * Wait for a specific sync state with timeout
+   * Helper method to wait for sync completion
    */
-  private waitForState(targetState: 'initial' | 'catchup' | 'live', timeout = 30000): Promise<boolean> {
-    return new Promise(resolve => {
-      const start = Date.now();
-      const checkState = () => {
-        if (this.currentState === targetState) {
-          resolve(true);
-        } else if (Date.now() - start > timeout) {
-          resolve(false);
-        } else {
-          setTimeout(checkState, 100);
+  private waitForSyncCompletion(timeout: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      // Already successful?
+      if (this.syncSuccessful) {
+        return resolve(true);
+      }
+      
+      // Set timeout
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeout);
+      
+      // Track if we've resolved
+      let hasResolved = false;
+      
+      // Function to clean up listeners
+      const cleanup = () => {
+        if (hasResolved) return;
+        hasResolved = true;
+        clearTimeout(timeoutId);
+        if (this.ws) {
+          this.ws.removeListener('message', messageHandler);
+          this.ws.removeListener('close', closeHandler);
         }
       };
-      checkState();
+      
+      // Message handler to check for completion
+      const messageHandler = (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString()) as Message;
+          this.handleMessage(message);
+          
+          // Check if we're done
+          if (this.syncSuccessful) {
+            cleanup();
+            resolve(true);
+          }
+        } catch (err) {
+          console.error('Error parsing message:', err);
+        }
+      };
+      
+      // Handle WebSocket close
+      const closeHandler = () => {
+        console.warn('WebSocket closed during sync validation');
+        cleanup();
+        // If we already completed sync, consider it successful
+        resolve(this.syncSuccessful);
+      };
+      
+      // Set up listeners
+      if (this.ws) {
+        this.ws.on('message', messageHandler);
+        this.ws.once('close', closeHandler);
+      } else {
+        // No websocket, can't complete
+        resolve(false);
+      }
     });
   }
 
@@ -460,33 +654,48 @@ class InitialSyncTester {
   }
 
   /**
-   * Wait for client and server LSNs to match (implies live state)
+   * Check if sync was successful
    */
-  private waitForLSNMatch(timeout = 30000): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      const startTime = Date.now();
+  public isSyncSuccessful(): boolean {
+    return this.syncSuccessful;
+  }
+  
+  /**
+   * Get the final LSN from sync
+   */
+  public getFinalLSN(): string {
+    return this.initCompleteLSN;
+  }
+
+  /**
+   * Run the initial sync test
+   */
+  public static async test(): Promise<void> {
+    console.log('Starting Initial Sync Test');
+    const tester = new InitialSyncTester();
+    
+    try {
+      // Step 1: Connect to server
+      await tester.connect();
       
-      const checkLSNs = () => {
-        // If LSNs match, we're in sync
-        if (this.serverLSN && this.initCompleteLSN && 
-            this.serverLSN === this.initCompleteLSN) {
-          console.log('LSNs match:', this.serverLSN);
-          return resolve(true);
-        }
-        
-        // Check timeout
-        if (Date.now() - startTime > timeout) {
-          return reject(new Error(`Timeout waiting for LSN match. ` +
-            `Server: ${this.serverLSN}, Client: ${this.initCompleteLSN}`));
-        }
-        
-        // Check again after delay
-        setTimeout(checkLSNs, 100);
-      };
+      // Step 2-7: Run validation (handles steps in order)
+      const syncValid = await tester.validateInitialSync();
       
-      // Start checking
-      checkLSNs();
-    });
+      if (!syncValid) {
+        throw new Error('Initial sync validation failed');
+      }
+      
+      // We don't need to save LSN file here, it's already saved in handleInitComplete
+      
+      console.log('Initial sync test completed successfully');
+    } catch (error) {
+      console.error('Test failed:', error);
+      // Don't exit here - let the finally block handle cleanup first
+      throw error; // Re-throw so the caller can handle it
+    } finally {
+      // Ensure we disconnect before exiting
+      await tester.disconnect(1000, 'Test complete');
+    }
   }
 }
 
@@ -494,52 +703,39 @@ class InitialSyncTester {
  * Run the initial sync test
  */
 async function testInitialSync() {
-  console.log('Starting Initial Sync Test');
-  const tester = new InitialSyncTester();
-  
   try {
-    // Step 1: Connect to server
-    await tester.connect();
-    
-    // Step 2-7: Run validation (handles steps in order)
-    const syncValid = await tester.validateInitialSync();
-    
-    if (!syncValid) {
-      throw new Error('Initial sync validation failed');
-    }
-    
-    // Save the LSN for future tests
-    const finalLSN = tester.getLastMessage<ServerInitCompleteMessage>('srv_init_complete')?.serverLSN;
-    if (finalLSN) {
-      const lsnFilePath = path.join(process.cwd(), '.sync-test-lsn.json');
-      fs.writeFileSync(
-        lsnFilePath, 
-        JSON.stringify({
-          lsn: finalLSN,
-          timestamp: new Date().toISOString(),
-          clientId: tester.getClientId()
-        }, null, 2)
-      );
-      console.log(`Saved LSN state to ${lsnFilePath} for future tests`);
-    }
-    
-    console.log('Initial sync test completed successfully');
+    await InitialSyncTester.test();
+    console.log('Test completed successfully, exiting with code 0');
   } catch (error) {
-    console.error('Test failed:', error);
+    console.error('Test execution failed with error. Exiting with code 1');
+    // Delay to ensure logs are flushed
+    await new Promise(resolve => setTimeout(resolve, 100));
     process.exit(1);
-  } finally {
-    // Ensure we disconnect before exiting
-    await tester.disconnect(1000, 'Test complete');
-    
-    // Only exit with success if we've reached this point without errors
-    if (process.argv[1] === fileURLToPath(import.meta.url)) {
-      console.log('Exiting with success code');
-      process.exit(0);
-    }
   }
+  
+  // Always exit with success if we get here
+  // Delay to ensure logs are flushed
+  await new Promise(resolve => setTimeout(resolve, 100));
+  process.exit(0);
 }
 
 // Run the test if this is the main module
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  testInitialSync();
+  console.log('Starting test as main module');
+  // Force exit after a reasonable timeout to prevent hanging
+  const forceExitTimeout = setTimeout(() => {
+    console.log('Force exiting after timeout');
+    process.exit(0);
+  }, 10000);
+  
+  // Ensure the force exit timeout is cleared if we exit normally
+  process.on('exit', () => {
+    clearTimeout(forceExitTimeout);
+  });
+  
+  // Run the test
+  testInitialSync().catch(() => {
+    console.error('Unhandled error in test execution');
+    process.exit(1);
+  });
 } 

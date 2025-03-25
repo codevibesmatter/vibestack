@@ -81,9 +81,6 @@ async function getTableChunk<T extends QueryResultRow>(
     LIMIT ${chunkSize + 1}
   `;
 
-  // Only log at debug level and with minimal info
-  syncLogger.debug('Fetching chunk', { table: cleanTableName(table) }, MODULE_NAME);
-
   // Create new client for this query
   const client = getDBClient(context);
   
@@ -99,8 +96,6 @@ async function getTableChunk<T extends QueryResultRow>(
     const hasMore = result.rows.length > chunkSize;
     const items = hasMore ? result.rows.slice(0, chunkSize) : result.rows;
     const nextCursor = items.length > 0 ? items[items.length - 1].id : null;
-
-    // Don't log every chunk result
 
     return {
       items,
@@ -123,13 +118,12 @@ async function processTableInChunks(
   table: string,
   processor: ChunkProcessor,
   options: ProcessTableOptions
-): Promise<void> {
-  // Only log at the beginning of processing a table
-  syncLogger.debug('Processing table in chunks', { table, chunkSize: options.chunkSize }, MODULE_NAME);
-
+): Promise<number> {
   let cursor: string | null = null;
   let totalProcessed = 0;
   let chunkNum = 0;
+
+  syncLogger.debug('Processing table', { table, chunkSize: options.chunkSize }, MODULE_NAME);
 
   while (true) {
     chunkNum++;
@@ -144,37 +138,7 @@ async function processTableInChunks(
     cursor = chunk.nextCursor;
   }
 
-  syncLogger.info('Completed table processing', { table, totalRecords: totalProcessed }, MODULE_NAME);
-}
-
-/**
- * Get current server LSN
- */
-async function getServerLSN(context: MinimalContext): Promise<string> {
-  const lsnResult = await sql<{ lsn: string }>(context, 'SELECT pg_current_wal_lsn() as lsn');
-  return lsnResult[0].lsn;
-}
-
-/**
- * Send a message to the client over WebSocket
- * @deprecated Use messageHandler.send() instead
- */
-function sendMessage(messageHandler: WebSocketHandler, message: ServerMessage): Promise<void> {
-  return messageHandler.send(message);
-}
-
-/**
- * Wait for a message of a specific type with optional filter
- * @deprecated Use messageHandler.waitForMessage() instead
- */
-function waitForMessage(
-  messageHandler: WebSocketHandler,
-  clientId: string,
-  type: CltMessageType, 
-  filter?: (msg: any) => boolean,
-  timeoutMs: number = 30000 // Default timeout of 30 seconds
-): Promise<void> {
-  return messageHandler.waitForMessage(type, filter, timeoutMs);
+  return totalProcessed;
 }
 
 /**
@@ -184,23 +148,16 @@ async function processTable(
   context: MinimalContext,
   clientId: string,
   table: string,
-  stateManager: StateManager,
   messageHandler: WebSocketHandler
-): Promise<void> {
-  // Get current sync state
-  const syncState = await stateManager.getInitialSyncProgress(clientId);
-  if (!syncState) throw new Error('Sync state not found');
-
-  syncLogger.info('Processing table data', { clientId, table }, MODULE_NAME);
-
+): Promise<number> {
+  let totalRecords = 0;
+  
   // Process table in chunks
-  await processTableInChunks(
+  totalRecords = await processTableInChunks(
     context,
     table,
     async (records, chunkNum, total) => {
       const changes = recordsToChanges(table, records);
-      
-      syncLogger.debug('Sending table chunk', { clientId, table, chunk: chunkNum, recordCount: changes.length }, MODULE_NAME);
       
       const initChangesMsg: ServerInitChangesMessage = {
         type: 'srv_init_changes',
@@ -225,7 +182,7 @@ async function processTable(
     { chunkSize: WS_CHUNK_SIZE }
   );
   
-  syncLogger.info('Table processing complete', { clientId, table }, MODULE_NAME);
+  return totalRecords;
 }
 
 /**
@@ -234,12 +191,12 @@ async function processTable(
 async function sendInitialSyncComplete(
   context: MinimalContext,
   clientId: string,
-  startLSN: string,
+  serverLSN: string,
   messageHandler: WebSocketHandler
 ): Promise<void> {
   const initCompleteMsg: ServerInitCompleteMessage = {
     type: 'srv_init_complete',
-    serverLSN: startLSN,
+    serverLSN,
     messageId: `srv_${Date.now()}`,
     timestamp: Date.now(),
     clientId
@@ -265,28 +222,23 @@ export async function performInitialSync(
   try {
     // Get current sync state if any
     let syncState = await stateManager.getInitialSyncProgress(clientId);
+    const startTime = Date.now();
     
-    // Check if we are resuming an interrupted sync
-    if (syncState && syncState.status === 'in_progress') {
-      syncLogger.info('Resuming interrupted sync', { clientId, completedTables: syncState.completedTables.length }, MODULE_NAME);
-    } else {
-      // Start a new sync from scratch
-      syncLogger.info('Starting new initial sync', { clientId }, MODULE_NAME);
-
-      // Get current server LSN before starting
-      const serverLSN = await stateManager.getServerLSN();
-      
-      // Create initial sync state
+    // Get current server LSN
+    const startLSN = await stateManager.getServerLSN();
+    
+    // Initialize new sync or use existing state
+    if (!syncState || syncState.status !== 'in_progress') {
+      // Start a new sync
       syncState = {
         table: '',
         lastChunk: 0,
         totalChunks: 0,
         completedTables: [],
         status: 'in_progress',
-        startLSN: serverLSN,
-        startTimeMs: Date.now()
+        startLSN,
+        startTimeMs: startTime
       };
-      await stateManager.saveInitialSyncProgress(clientId, syncState);
       
       // Send init start message
       const initStartMsg: ServerInitStartMessage = {
@@ -294,14 +246,16 @@ export async function performInitialSync(
         messageId: `srv_${Date.now()}`,
         timestamp: Date.now(),
         clientId,
-        serverLSN
+        serverLSN: startLSN
       };
-      
       await messageHandler.send(initStartMsg);
-    }
-
-    // If resuming, send resume message
-    if (syncState.completedTables.length > 0) {
+    } else {
+      // Resuming sync - send resume message
+      syncLogger.info('Resuming interrupted sync', { 
+        clientId, 
+        completedTables: syncState.completedTables.length 
+      }, MODULE_NAME);
+      
       const resumeMsg: ServerInitStartMessage = {
         type: 'srv_init_start',
         messageId: `srv_${Date.now()}`,
@@ -309,9 +263,11 @@ export async function performInitialSync(
         clientId,
         serverLSN: syncState.startLSN + ' (resuming)'
       };
-      
       await messageHandler.send(resumeMsg);
     }
+    
+    // Save initial state once at the beginning
+    await stateManager.saveInitialSyncProgress(clientId, syncState);
 
     // Get ordered tables for sync
     const sortedTables = Object.keys(SERVER_TABLE_HIERARCHY).sort((a, b) => {
@@ -320,55 +276,75 @@ export async function performInitialSync(
       return levelA - levelB;
     });
 
+    // Track sync progress metrics
+    let totalRecords = 0;
+    let processedTables = 0;
+    
     // Process each table in order
     for (const tableName of sortedTables) {
       // Skip processed tables if resuming
       if (syncState.completedTables.includes(tableName)) {
+        processedTables++;
         continue;
       }
 
-      // Update sync state to reflect current table being processed
+      // Update sync state to current table - save only when changing tables
       syncState.table = tableName;
       await stateManager.saveInitialSyncProgress(clientId, syncState);
 
       // Process this table
-      await processTable(context, clientId, tableName, stateManager, messageHandler);
+      syncLogger.info('Processing table', { clientId, table: tableName }, MODULE_NAME);
+      const tableRecords = await processTable(context, clientId, tableName, messageHandler);
+      totalRecords += tableRecords;
 
-      // Mark table as completed
+      // Add to completed tables
       syncState.completedTables.push(tableName);
+      processedTables++;
+      
+      // Periodically save state (after each table completes)
       await stateManager.saveInitialSyncProgress(clientId, syncState);
+      
+      syncLogger.info('Table completed', { 
+        clientId, 
+        table: tableName, 
+        records: tableRecords,
+        progress: `${processedTables}/${sortedTables.length} tables`
+      }, MODULE_NAME);
     }
 
-    // We made it through all tables! Send completion message
+    // Mark sync as complete in our state tracking
     syncState.status = 'complete';
     await stateManager.saveInitialSyncProgress(clientId, syncState);
 
     // Get final LSN
-    const serverLSN = await stateManager.getServerLSN();
+    const finalLSN = await stateManager.getServerLSN();
     
-    // Send sync complete message and wait for client processing
-    await sendInitialSyncComplete(context, clientId, serverLSN, messageHandler);
+    // Calculate sync metrics
+    const syncTimeMs = Date.now() - startTime;
+    
+    // Log completion before sending the completion message
+    syncLogger.info('Initial sync complete, sending completion message', {
+      clientId,
+      tables: sortedTables.length,
+      totalRecords,
+      syncTimeMs,
+      syncTimeSec: Math.round(syncTimeMs / 1000),
+      recordsPerSecond: Math.round((totalRecords / syncTimeMs) * 1000),
+      finalLSN
+    }, MODULE_NAME);
+    
+    // Send sync complete message and wait for client acknowledgment
+    await sendInitialSyncComplete(context, clientId, finalLSN, messageHandler);
 
-    // Update client's LSN
-    await stateManager.updateClientLSN(clientId, serverLSN);
-
-    // Track state change internally
+    // Update client's LSN and state in a single operation
+    await stateManager.updateClientLSN(clientId, finalLSN);
     await stateManager.updateClientSyncState(clientId, 'live');
-
-    // Calculate sync time
-    if (syncState.startTimeMs) {
-      const syncTimeMs = Date.now() - syncState.startTimeMs;
-      syncLogger.info('Initial sync complete', {
-        clientId,
-        tables: sortedTables.length,
-        syncTimeMs,
-        syncTimeSec: Math.round(syncTimeMs / 1000)
-      }, MODULE_NAME);
-    }
   } catch (error) {
-    syncLogger.error('Initial sync error', { clientId, error: error instanceof Error ? error.message : String(error) }, MODULE_NAME);
-
-    // No need to manually close the WebSocket - this should be handled by the SyncDO
+    syncLogger.error('Initial sync error', { 
+      clientId, 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    }, MODULE_NAME);
     throw error;
   }
 } 

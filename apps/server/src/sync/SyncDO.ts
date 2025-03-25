@@ -94,10 +94,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     this.stateManager = new SyncStateManager(context, state as any);
     this.syncId = state.id.toString();
     
-    syncLogger.debug('SyncDO constructed', {
-      syncId: this.syncId
-    }, MODULE_NAME);
-    
     // Register message handler for client changes
     this.onMessage('clt_send_changes', async (message: ClientMessage) => {
       syncLogger.info('Received client changes', {
@@ -262,9 +258,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       this.state.waitUntil(
         (async () => {
           try {
-            syncLogger.debug('Connection cleanup started', { clientId: this.clientId }, MODULE_NAME);
             await this.stateManager.cleanupConnection();
-            syncLogger.debug('Connection cleanup completed', { clientId: this.clientId }, MODULE_NAME);
           } catch (error) {
             syncLogger.error('Connection cleanup failed', {
               clientId: this.clientId,
@@ -292,12 +286,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
   private async handleWebSocketMessage(event: MessageEvent): Promise<void> {
     try {
       const message = JSON.parse(event.data as string) as ClientMessage;
-      
-      // Minimized logging
-      syncLogger.debug('Message received', {
-        type: message.type,
-        messageId: message.messageId
-      }, MODULE_NAME);
       
       // Store in message queue for waitForMessage
       if (!this.messageQueue.has(message.type)) {
@@ -371,12 +359,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     // Get the current server LSN
     const serverLSN = await this.stateManager.getServerLSN();
     
-    syncLogger.info('Determining sync strategy', {
-      clientId,
-      clientLSN,
-      serverLSN
-    }, MODULE_NAME);
-    
     // If client has no LSN (0/0), it needs initial sync
     if (clientLSN === '0/0') {
       syncLogger.info('Client needs initial sync', {
@@ -415,10 +397,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     
     switch (strategy) {
       case SyncStrategy.INITIAL:
-        syncLogger.info('Starting initial sync', { 
-          clientId 
-        }, MODULE_NAME);
-        
         // Update sync state
         await this.stateManager.updateClientSyncState(clientId, 'initial');
         
@@ -432,12 +410,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         break;
         
       case SyncStrategy.CATCHUP:
-        syncLogger.info('Starting catchup sync', { 
-          clientId, 
-          clientLSN: lsn,
-          serverLSN
-        }, MODULE_NAME);
-        
         // Update sync state
         await this.stateManager.updateClientSyncState(clientId, 'catchup');
         
@@ -447,26 +419,23 @@ export class SyncDO implements DurableObject, WebSocketHandler {
           clientId,
           lsn,           // Client LSN
           serverLSN,     // Server LSN - already retrieved by determineSyncStrategy
-          this,          // WebSocketHandler
+          this,
           this.stateManager
         );
-        
-        // After catchup, update client state to live
-        await this.stateManager.updateClientSyncState(clientId, 'live');
         break;
         
       case SyncStrategy.LIVE:
-        // Already in live state, send a confirmation message
-        syncLogger.info('Client already in live sync state', { 
-          clientId 
-        }, MODULE_NAME);
-        
         // Update sync state
         await this.stateManager.updateClientSyncState(clientId, 'live');
         
-        // Create and send sync completed message
-        const syncCompletedMsg = createLiveSyncConfirmation(clientId, lsn);
-        await this.send(syncCompletedMsg);
+        // Send confirmation message for live sync
+        const liveSyncMessage = createLiveSyncConfirmation(clientId, lsn);
+        await this.send(liveSyncMessage);
+        
+        syncLogger.info('Live sync confirmed', {
+          clientId,
+          lsn
+        }, MODULE_NAME);
         break;
     }
   }

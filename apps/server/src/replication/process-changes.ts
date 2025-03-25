@@ -71,16 +71,7 @@ export function shouldTrackTable(tableName: string): boolean {
   
   // Check if the normalized name is in the domain tables
   // Using type casting to handle the type mismatch
-  const shouldTrack = SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
-  
-  if (!shouldTrack) {
-    replicationLogger.debug('Filtered: Table not in SERVER_DOMAIN_TABLES', {
-      table: tableName,
-      normalizedName: normalizedTableName
-    }, MODULE_NAME);
-  }
-  
-  return shouldTrack;
+  return SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
 }
 
 /**
@@ -129,7 +120,6 @@ export function transformWALToTableChange(wal: WALData): TableChange | null {
     // Parse WAL data
     const parsedData = wal.data ? JSON.parse(wal.data) as PostgresWALMessage : null;
     if (!parsedData?.change || !Array.isArray(parsedData.change)) {
-      // Skip debug logging for invalid formats
       return null;
     }
 
@@ -151,13 +141,6 @@ export function transformWALToTableChange(wal: WALData): TableChange | null {
           acc[change.oldkeys!.keynames[index]] = value;
           return acc;
         }, {});
-        
-        // Only log delete operations in debug mode when troubleshooting specific issues
-        // replicationLogger.debug('Processed DELETE operation', {
-        //   lsn: wal.lsn,
-        //   table: change.table,
-        //   keys: Object.keys(data)
-        // }, MODULE_NAME);
       }
     } else {
       // For inserts and updates, use column data
@@ -208,63 +191,84 @@ export async function storeChangesInHistory(
   context: MinimalContext, 
   changes: TableChange[]
 ): Promise<boolean> {
+  // Skip if no changes to store
   if (changes.length === 0) {
     return true;
   }
-
-  // Count operations by type for concise logging
-  const ops = changes.reduce((acc: Record<string, number>, change) => {
-    acc[change.operation] = (acc[change.operation] || 0) + 1;
-    return acc;
-  }, {});
   
-  // Get unique tables for logging
-  const tables = Array.from(new Set(changes.map(c => c.table)));
-
-  // Single informative log for storage start that includes transform info
-  replicationLogger.info('Store changes', { 
-    count: changes.length,
-    ops,
-    tables: tables.length > 0 ? tables : []
-  }, MODULE_NAME);
-
-  try {
-    // Prepare values for a batch insert
-    const valueStrings: string[] = [];
-    const values: any[] = [];
-    let valueIndex = 1;
+  // Count operations by type for summary logging
+  const operationCounts: Record<string, number> = {};
+  const tables = new Set<string>();
+  let lastLSN = '';
+  
+  for (const change of changes) {
+    // Count by operation type
+    operationCounts[change.operation] = (operationCounts[change.operation] || 0) + 1;
     
-    for (const change of changes) {
-      const placeholders = [
-        `$${valueIndex++}`, // lsn
-        `$${valueIndex++}`, // table_name
-        `$${valueIndex++}`, // operation
-        `$${valueIndex++}`  // data
-      ];
-      
-      valueStrings.push(`(${placeholders.join(', ')})`);
-      
-      values.push(
-        change.lsn,                // lsn
-        change.table,              // table_name
-        change.operation,          // operation
-        JSON.stringify(change.data) // data
-      );
+    // Track tables
+    tables.add(change.table);
+    
+    // Track last LSN
+    if (!lastLSN || (change.lsn && change.lsn > lastLSN)) {
+      lastLSN = change.lsn || '';
     }
+  }
+  
+  try {
+    // Get database client
+    const client = getDBClient(context);
+    await client.connect();
     
-    // Execute batch insert
-    if (valueStrings.length > 0) {
+    // Start transaction
+    await client.query('BEGIN');
+    
+    // Insert changes in batches to prevent parameter limit issues
+    // Use SQL to insert in batches of 100
+    const BATCH_SIZE = 100;
+    
+    for (let i = 0; i < changes.length; i += BATCH_SIZE) {
+      const batch = changes.slice(i, i + BATCH_SIZE);
+      
+      // Build parameterized query for this batch
+      const values = batch.map((change, index) => {
+        const offset = index * 5;
+        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
+      }).join(', ');
+      
+      const params: any[] = [];
+      batch.forEach(change => {
+        params.push(
+          change.table,
+          change.operation,
+          JSON.stringify(change.data),
+          change.lsn,
+          change.updated_at
+        );
+      });
+      
       const query = `
-        INSERT INTO change_history (lsn, table_name, operation, data)
-        VALUES ${valueStrings.join(', ')}
-        ON CONFLICT DO NOTHING
+        INSERT INTO change_history 
+          (table_name, operation, data, lsn, updated_at) 
+        VALUES 
+          ${values}
+        ON CONFLICT (lsn, table_name, (data->>'id'))
+        DO NOTHING;
       `;
       
-      await sql(context, query, values);
+      await client.query(query, params);
     }
     
-    // Simple completion log - only essential info
-    replicationLogger.info('Changes stored', { count: changes.length }, MODULE_NAME);
+    // Commit transaction
+    await client.query('COMMIT');
+    
+    // Only log the final result once
+    replicationLogger.info('Changes stored', { 
+      count: changes.length, 
+      operations: operationCounts,
+      tables: Array.from(tables),
+      lastLSN 
+    }, MODULE_NAME);
+    
     return true;
   } catch (error) {
     replicationLogger.error('Store failed', {
@@ -412,82 +416,67 @@ export async function broadcastChangesToClients(
   changes: TableChange[],
   lastLSN: string
 ): Promise<boolean> {
-  if (changes.length === 0) {
-    return true;
-  }
-  
   try {
-    // Count tables for concise logging
-    const tables = Array.from(new Set(changes.map(c => c.table)));
-    
-    // Single concise log with table count
-    replicationLogger.info('Broadcasting', {
-      count: changes.length,
-      tables: tables.length > 0 ? tables : [],
-      lastLSN
-    }, MODULE_NAME);
-    
-    // Get active clients directly from KV
-    const activeClients = await getActiveClients(env);
-    
-    if (activeClients.length === 0) {
-      replicationLogger.info('No active clients, skipping broadcast', {}, MODULE_NAME);
+    // Skip broadcasting if no changes
+    if (changes.length === 0) {
       return true;
     }
     
+    // Get active clients to notify about changes
+    const activeClients = await getActiveClients(env);
+    
+    // Only log once at the end for results
     replicationLogger.info('Notifying clients', {
-      clientCount: activeClients.length, 
-      changeCount: changes.length
+      clientCount: activeClients.length,
+      changeCount: changes.length,
+      lastLSN
     }, MODULE_NAME);
     
-    let successCount = 0;
-    let failCount = 0;
+    // Track successful notifications
+    let notifiedCount = 0;
     
-    // Notify each active client
+    // Process each client
     for (const client of activeClients) {
       try {
-        // Get the SyncDO instance for this client
-        const id = env.SYNC.idFromName(`client:${client.clientId}`);
-        const syncDO = env.SYNC.get(id);
+        // Wake the client's SyncDO using the ClientState
+        const { clientId } = client;
         
-        // Create the URL with required parameters
-        const url = new URL('http://internal/new-changes');
-        url.searchParams.set('clientId', client.clientId);
-        url.searchParams.set('lsn', lastLSN); // Pass the actual LSN
+        // Make request to client's SyncDO for real-time updates
+        const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
+        const clientDo = env.SYNC.get(clientDoId);
         
-        const response = await syncDO.fetch(url.toString(), {
+        // Send notification
+        const response = await clientDo.fetch(`/new-changes`, {
           method: 'POST',
-          body: JSON.stringify({ changes, lastLSN }) // Include lastLSN in the request body
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            lsn: lastLSN
+          })
         });
         
-        if (response.ok) {
-          successCount++;
-        } else {
-          failCount++;
-          replicationLogger.warn('Client notification failed', {
-            clientId: client.clientId,
-            status: response.status
-          }, MODULE_NAME);
+        // Increase count on success
+        if (response.status === 200) {
+          notifiedCount++;
         }
-      } catch (err) {
-        failCount++;
-        replicationLogger.error('Client notification error', {
-          clientId: client.clientId,
-          error: err instanceof Error ? err.message : String(err)
-        }, MODULE_NAME);
+      } catch (error) {
+        // Just count failures, no need to log each one
       }
     }
     
+    // Log final broadcast result
     replicationLogger.info('Broadcast complete', {
       totalClients: activeClients.length,
-      successful: successCount,
-      failed: failCount
+      notifiedCount,
+      lastLSN
     }, MODULE_NAME);
     
-    return successCount > 0; // Return true if at least one client was notified
+    return true;
   } catch (error) {
     replicationLogger.error('Broadcast failed', {
-      error: error instanceof Error ? error.message : String(error)
+      error: error instanceof Error ? error.message : String(error),
+      changeCount: changes.length
     }, MODULE_NAME);
     return false;
   }
