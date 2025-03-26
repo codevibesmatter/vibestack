@@ -218,6 +218,11 @@ export async function storeChangesInHistory(
   try {
     // Get database client
     const client = getDBClient(context);
+    replicationLogger.debug('Attempting to connect to database', {
+      changeCount: changes.length,
+      tables: Array.from(tables)
+    }, MODULE_NAME);
+    
     await client.connect();
     
     // Start transaction
@@ -232,8 +237,8 @@ export async function storeChangesInHistory(
       
       // Build parameterized query for this batch
       const values = batch.map((change, index) => {
-        const offset = index * 5;
-        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5})`;
+        const baseIndex = index * 5;
+        return `($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, $${baseIndex + 5}::timestamptz)`;
       }).join(', ');
       
       const params: any[] = [];
@@ -255,14 +260,25 @@ export async function storeChangesInHistory(
         ON CONFLICT DO NOTHING;
       `;
       
-      await client.query(query, params);
+      replicationLogger.debug('Executing batch insert', {
+        batchSize: batch.length,
+        batchIndex: i / BATCH_SIZE,
+        totalBatches: Math.ceil(changes.length / BATCH_SIZE),
+        query: query.replace(/\s+/g, ' ').trim()
+      }, MODULE_NAME);
+      
+      const result = await client.query(query, params);
+      replicationLogger.debug('Batch insert result', {
+        rowCount: result.rowCount,
+        batchIndex: i / BATCH_SIZE
+      }, MODULE_NAME);
     }
     
     // Commit transaction
     await client.query('COMMIT');
     
-    // Only log the final result once at debug level instead of info to reduce noise
-    replicationLogger.debug('Changes stored', { 
+    // Log the final result
+    replicationLogger.info('Changes stored successfully', { 
       count: changes.length, 
       operations: operationCounts,
       tables: Array.from(tables),
@@ -272,9 +288,25 @@ export async function storeChangesInHistory(
     
     return true;
   } catch (error) {
+    // Log detailed error information
     replicationLogger.error('Store failed', {
-      error: error instanceof Error ? error.message : String(error)
+      error: error instanceof Error ? error.message : String(error),
+      errorStack: error instanceof Error ? error.stack : undefined,
+      changeCount: changes.length,
+      tables: Array.from(tables),
+      lastLSN
     }, MODULE_NAME);
+    
+    // Attempt to rollback transaction if it exists
+    try {
+      const client = getDBClient(context);
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      replicationLogger.error('Failed to rollback transaction', {
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+      }, MODULE_NAME);
+    }
+    
     return false;
   }
 }

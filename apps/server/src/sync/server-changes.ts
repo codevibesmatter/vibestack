@@ -456,23 +456,30 @@ export async function sendLiveChanges(
     // Order by domain tables hierarchy to ensure consistency
     orderedChanges = orderChangesByDomain(orderedChanges);
     
-    // Use provided LSN if available, otherwise extract from changes
+    // For live changes, we should always prefer the LSN from the changes when available
     let currentLSN: string;
     
-    if (providedLSN) {
+    // Extract the LSN from the last change in the ordered list if available
+    const changesHaveLSN = orderedChanges.length > 0 && orderedChanges[orderedChanges.length - 1].lsn;
+    
+    if (changesHaveLSN) {
+      // Prefer the LSN from the changes for live sync
+      currentLSN = String(orderedChanges[orderedChanges.length - 1].lsn);
+      syncLogger.debug('Using LSN from changes', { 
+        clientId, 
+        lsn: currentLSN 
+      }, MODULE_TAG);
+    } else if (providedLSN) {
+      // Fall back to provided LSN only if changes don't have LSN
       currentLSN = providedLSN;
-      syncLogger.debug('Using provided LSN', { 
+      syncLogger.debug('Using provided LSN (changes have no LSN)', { 
         clientId, 
         lsn: currentLSN 
       }, MODULE_TAG);
     } else {
-      // Extract the LSN from the last change in the ordered list
-      // Ensure it's a string by providing a default if undefined
-      currentLSN = orderedChanges.length > 0 && orderedChanges[orderedChanges.length - 1].lsn
-        ? String(orderedChanges[orderedChanges.length - 1].lsn)
-        : '0/0';
-      
-      syncLogger.debug('Using LSN from changes', { 
+      // Last resort default
+      currentLSN = '0/0';
+      syncLogger.debug('No LSN available, using default', { 
         clientId, 
         lsn: currentLSN 
       }, MODULE_TAG);

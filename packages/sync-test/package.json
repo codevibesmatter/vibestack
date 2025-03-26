@@ -15,6 +15,7 @@
     "test:all": "pnpm test:initial && pnpm test:catchup && pnpm test:changes && pnpm test:live",
     "test:init": "tsx src/scenarios/init-replication.ts",
     "test:db-init": "tsx src/scenarios/db-init-test.ts",
+    "test:wal-batch": "tsx src/scenarios/wal-batch-test.ts",
     "seed": "tsx src/seed/seed-cli.ts",
     "seed:small": "tsx src/seed/seed-cli.ts -- --size=small --clear=true",
     "seed:medium": "tsx src/seed/seed-cli.ts -- --size=medium --clear=true",

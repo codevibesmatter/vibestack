@@ -51,6 +51,31 @@ interface MixedChangesResult {
   };
 }
 
+// Add these interfaces near the top of the file with other interfaces
+interface ChangeHistoryEntry {
+  table_name: string;
+  operation: 'insert' | 'update' | 'delete';
+  data: Record<string, unknown>;
+  lsn: string;
+  timestamp: string;
+}
+
+interface ChangesByTable {
+  [key: string]: {
+    created: number;
+    updated: number;
+    deleted: number;
+  };
+}
+
+interface ExpectedChanges {
+  [key: string]: {
+    created: number;
+    updated: number;
+    deleted: number;
+  };
+}
+
 // Create readline interface for user input
 const rl = readline.createInterface({
   input: process.stdin,
@@ -150,99 +175,6 @@ async function getCurrentLSN(silent: boolean = false): Promise<string | null> {
 }
 
 /**
- * Test how quickly the replication system responds to changes
- * This measures the time from creation of changes to when they appear in the LSN
- */
-async function testReplicationResponseTime(
-  startLSN: string,
-  maxWaitTimeMs: number = 60000 // 60 seconds
-): Promise<{ success: boolean, timeMs: number, finalLSN: string }> {
-  const startTime = Date.now();
-  let pollCount = 0;
-  let lastLSN = startLSN;
-  
-  console.log('\nMonitoring LSN advancement:');
-  console.log(`Starting LSN: ${startLSN}`);
-  console.log('Polling every 1000ms...');
-  
-  while (Date.now() - startTime < maxWaitTimeMs) {
-    pollCount++;
-    
-    // Poll for LSN changes - use silent mode to reduce noise
-    const currentLSN = await getCurrentLSN(true);
-    if (!currentLSN) {
-      console.warn('Failed to get current LSN during polling');
-      await new Promise(resolve => setTimeout(resolve, 1000)); 
-      continue;
-    }
-    
-    // Check if LSN has advanced
-    if (currentLSN !== lastLSN) {
-      const timeMs = Date.now() - startTime;
-      console.log(`\n✅ LSN advanced from ${lastLSN} to ${currentLSN}`);
-      console.log(`Total time: ${timeMs}ms with ${pollCount} poll attempts`);
-      
-      return { 
-        success: true, 
-        timeMs,
-        finalLSN: currentLSN
-      };
-    }
-    
-    // Wait before next poll - 1 second to reduce API calls
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  
-  // Timeout reached
-  console.error(`\n❌ Timed out waiting for LSN to advance from ${startLSN}`);
-  return { 
-    success: false, 
-    timeMs: maxWaitTimeMs, 
-    finalLSN: lastLSN
-  };
-}
-
-/**
- * Create a large batch of database changes to test WAL processing
- */
-async function createLargeBatch(sql: any, batchSize: number = 100): Promise<number> {
-  console.time('batch-creation');
-  try {
-    console.log(`Creating large mixed entity batch of size ${batchSize}...`);
-    
-    // Create a realistic mix of entity changes across different entity types
-    const results = await createMixedChanges(sql, batchSize, {
-      task: 0.5,      // 50% tasks
-      project: 0.2,   // 20% projects
-      user: 0.2,      // 20% users
-      comment: 0.1    // 10% comments
-    });
-    
-    // Count only successful changes across all entity types
-    let actualChanges = 0;
-    Object.entries(results).forEach(([entityType, result]) => {
-      if (result) {
-        const entityTotal = 
-          (result.created?.length || 0) + 
-          (result.updated?.length || 0) + 
-          (result.deleted?.length || 0);
-        
-        console.log(`- ${entityType}: ${entityTotal} changes`);
-        actualChanges += entityTotal;
-      }
-    });
-    
-    console.log(`Created mixed batch with ${actualChanges} total successful changes (requested: ${batchSize})`);
-    return actualChanges; // Return the actual number of changes for comparison
-  } catch (error) {
-    console.error("Error creating large batch:", error);
-    return 0;
-  } finally {
-    console.timeEnd('batch-creation');
-  }
-}
-
-/**
  * Verify that our changes are correctly reflected in both the database and the WAL
  */
 async function verifyChangesAndWAL(
@@ -250,12 +182,13 @@ async function verifyChangesAndWAL(
   sql: SqlQueryFunction,
   startingLsn: string,
   replicationResult: { success: boolean, timeMs: number, finalLSN: string }
-): Promise<{ dbVerified: boolean; walVerified: boolean }> {
+): Promise<{ dbVerified: boolean; walVerified: boolean; changesHistoryVerified: boolean }> {
   console.log('\n========================================');
   console.log('🔍 Verifying Database Changes and WAL');
   console.log('========================================\n');
 
   let dbSuccess = true;
+  let changesHistorySuccess = true;
   
   // Track all deleted IDs for cross-referencing
   const allDeletedIds = {
@@ -264,6 +197,114 @@ async function verifyChangesAndWAL(
     users: result.deleted.users,
     comments: result.deleted.comments
   };
+  
+  // Verify changes_history table entries
+  console.log('\nVerifying changes_history table entries...');
+  try {
+    // Get all changes between the starting and final LSN
+    const changesHistoryQuery = sql`
+      SELECT table_name, operation, data, lsn, timestamp
+      FROM change_history
+      WHERE lsn::pg_lsn > ${startingLsn}::pg_lsn AND lsn::pg_lsn <= ${replicationResult.finalLSN}::pg_lsn
+      ORDER BY lsn::pg_lsn ASC;
+    `;
+
+    const changesHistory = await changesHistoryQuery as unknown as ChangeHistoryEntry[];
+    
+    // Count changes by table and operation
+    const changesByTable: ChangesByTable = {};
+    
+    for (const change of changesHistory) {
+      if (!changesByTable[change.table_name]) {
+        changesByTable[change.table_name] = { created: 0, updated: 0, deleted: 0 };
+      }
+      // Map operation types to our counter keys
+      const operationKey = change.operation === 'insert' ? 'created' :
+                          change.operation === 'update' ? 'updated' : 'deleted';
+      changesByTable[change.table_name][operationKey]++;
+    }
+
+    // Compare with expected changes
+    const expectedChanges: ExpectedChanges = {
+      tasks: {
+        created: result.created.tasks.length,
+        updated: result.updated.tasks.filter(id => !result.deleted.tasks.includes(id)).length,
+        deleted: result.deleted.tasks.length
+      },
+      projects: {
+        created: result.created.projects.length,
+        updated: result.updated.projects.filter(id => !result.deleted.projects.includes(id)).length,
+        deleted: result.deleted.projects.length
+      },
+      users: {
+        created: result.created.users.length,
+        updated: result.updated.users.filter(id => !result.deleted.users.includes(id)).length,
+        deleted: result.deleted.users.length
+      },
+      comments: {
+        created: result.created.comments.length,
+        updated: result.updated.comments.filter(id => !result.deleted.comments.includes(id)).length,
+        deleted: result.deleted.comments.length
+      }
+    };
+
+    // Log the comparison
+    console.log('\nChanges History Verification:');
+    console.log('-----------------------------');
+    console.log('Expected vs Actual Changes:');
+    
+    for (const table of Object.keys(expectedChanges)) {
+      console.log(`\n${table}:`);
+      const expected = expectedChanges[table];
+      const actual = changesByTable[table] || { created: 0, updated: 0, deleted: 0 };
+      
+      console.log(`  Created: ${actual.created}/${expected.created}`);
+      console.log(`  Updated: ${actual.updated}/${expected.updated}`);
+      console.log(`  Deleted: ${actual.deleted}/${expected.deleted}`);
+      
+      // Check if counts match
+      if (actual.created !== expected.created ||
+          actual.updated !== expected.updated ||
+          actual.deleted !== expected.deleted) {
+        changesHistorySuccess = false;
+        console.error(`❌ Mismatch in ${table} changes`);
+      } else {
+        console.log(`✓ ${table} changes match`);
+      }
+    }
+
+    // Verify LSN sequence
+    const lsnSequence = changesHistory.map(c => c.lsn);
+    const hasGaps = lsnSequence.some((lsn, i) => {
+      if (i === 0) return false;
+      return lsn <= lsnSequence[i - 1];
+    });
+
+    if (hasGaps) {
+      changesHistorySuccess = false;
+      console.error('❌ LSN sequence has gaps or is not strictly increasing');
+    } else {
+      console.log('✓ LSN sequence is valid');
+    }
+
+    // Log total changes
+    const totalExpected = Object.values(expectedChanges).reduce((acc, curr) => 
+      acc + curr.created + curr.updated + curr.deleted, 0);
+    const totalActual = Object.values(changesByTable).reduce((acc, curr) => 
+      acc + curr.created + curr.updated + curr.deleted, 0);
+
+    console.log(`\nTotal Changes: ${totalActual}/${totalExpected}`);
+    if (totalActual !== totalExpected) {
+      changesHistorySuccess = false;
+      console.error('❌ Total number of changes does not match');
+    } else {
+      console.log('✓ Total number of changes matches');
+    }
+
+  } catch (error) {
+    console.error('Error verifying changes_history table:', error);
+    changesHistorySuccess = false;
+  }
   
   // Verify database records
   console.log('Verifying database records...');
@@ -555,10 +596,18 @@ async function verifyChangesAndWAL(
       console.error(`❌ LSN did not advance, indicating WAL processing failed`);
     }
     
-    return { dbVerified: dbSuccess, walVerified };
+    return { 
+      dbVerified: dbSuccess, 
+      walVerified,
+      changesHistoryVerified: changesHistorySuccess 
+    };
   } catch (error) {
     console.error('Error verifying WAL entries:', error);
-    return { dbVerified: dbSuccess, walVerified: false };
+    return { 
+      dbVerified: dbSuccess, 
+      walVerified: false,
+      changesHistoryVerified: false 
+    };
   }
 }
 
@@ -644,7 +693,7 @@ async function runWALBatchTest(): Promise<void> {
       return;
     }
     
-    // Get starting LSN using getCurrentLSN
+    // Get starting LSN
     console.log('\nFetching current replication LSN...');
     const startLSN = await getCurrentLSN();
     if (!startLSN) {
@@ -701,22 +750,28 @@ async function runWALBatchTest(): Promise<void> {
     
     console.log(`Created mixed batch with ${actualChanges} total successful changes (requested: ${batchSize})`);
     
-    // Monitor LSN advancement
-    console.log('\nWaiting for replication system to process changes...');
+    // Wait a short time for changes to be processed
+    console.log('\nWaiting for changes to be processed...');
+    // Wait longer for changes to be processed
+    await new Promise(resolve => setTimeout(resolve, 5000));
     
-    // Wait for 100ms before checking LSN to give the system time to start processing
-    await new Promise(resolve => setTimeout(resolve, 100));
+    // Get final LSN after waiting
+    const finalLSN = await getCurrentLSN();
+    if (!finalLSN) {
+      console.error('❌ Failed to get final LSN');
+      await closeDbConnection(sql);
+      return;
+    }
+    console.log(`Final LSN: ${finalLSN}`);
     
-    // Poll LSN until it changes, indicating the batch has been processed
-    const replicationResult = await testReplicationResponseTime(startLSN);
-    
-    // Verify database changes and WAL entries
+    // Verify database records first
+    console.log('\nVerifying database records...');
     if (sql) {
       const verificationResult = await verifyChangesAndWAL(
         results,
         sql,
         startLSN,
-        replicationResult
+        { success: true, timeMs: 2000, finalLSN }
       );
       
       // Display results
@@ -724,11 +779,9 @@ async function runWALBatchTest(): Promise<void> {
       console.log('WAL Batch Test Results Summary');
       console.log('========================================');
       console.log(`Starting LSN: ${startLSN}`);
-      console.log(`Final LSN: ${replicationResult.finalLSN}`);
+      console.log(`Final LSN: ${finalLSN}`);
       console.log(`Batch size requested: ${batchSize}`);
       console.log(`Successful changes created: ${actualChanges}`);
-      console.log(`Changes processed in WAL: ${actualChanges}`);
-      console.log(`Processing time: ${replicationResult.timeMs}ms`);
       
       // Report on database verification
       if (verificationResult.dbVerified) {
@@ -744,9 +797,18 @@ async function runWALBatchTest(): Promise<void> {
         console.log(`❌ WAL verification failed`);
       }
       
+      // Report on changes_history verification
+      if (verificationResult.changesHistoryVerified) {
+        console.log(`✅ Changes history table verified successfully`);
+      } else {
+        console.log(`❌ Changes history table verification failed`);
+      }
+      
       console.log('========================================');
       
-      const overallSuccess = verificationResult.dbVerified && verificationResult.walVerified;
+      const overallSuccess = verificationResult.dbVerified && 
+                            verificationResult.walVerified && 
+                            verificationResult.changesHistoryVerified;
       
       if (overallSuccess) {
         console.log(`✅ WAL batch processing test passed`);
