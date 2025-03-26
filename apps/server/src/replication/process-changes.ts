@@ -189,7 +189,8 @@ export function transformWALChanges(changes: WALData[]): TableChange[] {
  */
 export async function storeChangesInHistory(
   context: MinimalContext, 
-  changes: TableChange[]
+  changes: TableChange[],
+  storeBatchSize: number = 100
 ): Promise<boolean> {
   // Skip if no changes to store
   if (changes.length === 0) {
@@ -223,8 +224,8 @@ export async function storeChangesInHistory(
     await client.query('BEGIN');
     
     // Insert changes in batches to prevent parameter limit issues
-    // Use SQL to insert in batches of 100
-    const BATCH_SIZE = 100;
+    // Use SQL to insert in batches of configured size
+    const BATCH_SIZE = storeBatchSize;
     
     for (let i = 0; i < changes.length; i += BATCH_SIZE) {
       const batch = changes.slice(i, i + BATCH_SIZE);
@@ -265,7 +266,8 @@ export async function storeChangesInHistory(
       count: changes.length, 
       operations: operationCounts,
       tables: Array.from(tables),
-      lastLSN 
+      lastLSN,
+      batchSize: BATCH_SIZE
     }, MODULE_NAME);
     
     return true;
@@ -285,7 +287,8 @@ export async function consumeWALChanges(
   context: MinimalContext,
   stateManager: StateManager,
   slotName: string,
-  lastLSN: string
+  lastLSN: string,
+  walConsumeSize: number = 2000
 ): Promise<boolean> {
   // Instead of using the sql helper, we'll manage the connection explicitly
   const client = getDBClient(context);
@@ -297,7 +300,8 @@ export async function consumeWALChanges(
     // Connect explicitly
     await client.connect();
     
-    // Use client directly to consume changes
+    // Use client directly to consume changes with configurable batch size
+    // This larger batch size helps to process more changes at once
     const consumeQuery = `
       SELECT data, lsn, xid 
       FROM pg_logical_slot_get_changes(
@@ -308,18 +312,27 @@ export async function consumeWALChanges(
         'include-timestamp', 'true'
       )
       WHERE lsn <= $2::pg_lsn
-      LIMIT 200;
+      LIMIT ${walConsumeSize};
     `;
     
     const result = await client.query(consumeQuery, [slotName, lastLSN]);
     const consumedCount = result.rows.length;
+    const reachedLimit = consumedCount >= walConsumeSize;
     
-    // Single concise log with LSN transition at debug level to reduce noise
-    replicationLogger.debug('WAL changes consumed', {
-      count: consumedCount,
-      lsn: `${currentLSN} → ${lastLSN}`,
-      slot: slotName
-    }, MODULE_NAME);
+    // Only log at info level for large batches or when we hit the limit
+    if (reachedLimit || consumedCount > walConsumeSize / 2) {
+      replicationLogger.info('WAL changes consumed (large batch)', {
+        count: consumedCount,
+        lsn: `${currentLSN} → ${lastLSN}`,
+        reachedLimit
+      }, MODULE_NAME);
+    } else {
+      // Otherwise log at debug level to reduce noise
+      replicationLogger.debug('WAL changes consumed', {
+        count: consumedCount,
+        lsn: `${currentLSN} → ${lastLSN}`
+      }, MODULE_NAME);
+    }
     
     return true;
   } catch (error) {
@@ -444,20 +457,55 @@ export async function broadcastChangesToClients(
         const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
         const clientDo = env.SYNC.get(clientDoId);
         
-        // Send notification
-        const response = await clientDo.fetch(`/new-changes`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            lsn: lastLSN
-          })
-        });
+        // Log the client ID and attempt
+        replicationLogger.info('Attempting to notify client', {
+          clientId,
+          objectId: clientDoId.toString()
+        }, MODULE_NAME);
         
-        // Increase count on success
-        if (response.status === 200) {
-          notifiedCount++;
+        // For Durable Objects, create a proper Request object
+        try {
+          // Create a new Request object
+          const newRequest = new Request(
+            `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                changes: changes,
+                lsn: lastLSN
+              })
+            }
+          );
+          
+          // Log the attempt
+          replicationLogger.info('Sending request to SyncDO', {
+            clientId,
+            url: newRequest.url
+          }, MODULE_NAME);
+          
+          // Send the request to the Durable Object
+          const response = await clientDo.fetch(newRequest);
+          
+          // Log the response
+          const responseText = await response.text();
+          replicationLogger.info('Received response from SyncDO', {
+            clientId,
+            status: response.status,
+            responseText
+          }, MODULE_NAME);
+          
+          // Count successful responses
+          if (response.status === 200) {
+            notifiedCount++;
+          }
+        } catch (error) {
+          replicationLogger.error('Error sending notification to SyncDO', {
+            clientId,
+            error: error instanceof Error ? error.message : String(error)
+          }, MODULE_NAME);
         }
       } catch (error) {
         // Just count failures, no need to log each one
@@ -489,82 +537,123 @@ export async function broadcastChangesToClients(
  */
 export async function processWALChanges(
   context: MinimalContext,
-  changes: WALData[]
-): Promise<{ tableChanges: TableChange[], storedSuccessfully: boolean }> {
+  changes: WALData[],
+  storeBatchSize?: number
+): Promise<{ tableChanges: TableChange[], storedSuccessfully: boolean, filteredCount?: number, filterReason?: string }> {
   // Early return for empty changes
   if (!changes || changes.length === 0) {
-    return { tableChanges: [], storedSuccessfully: true };
+    return { tableChanges: [], storedSuccessfully: true, filteredCount: 0 };
   }
 
   // ====== STEP 1: TRANSFORM ======
   // Convert WAL changes to TableChange format and filter invalid ones
   const tableChanges = transformWALChanges(changes);
   
+  // Calculate how many changes were filtered out
+  const filteredCount = changes.length - tableChanges.length;
+  let filterReason = '';
+  
+  // If many changes were filtered, log this at info level and collect sample data
+  if (filteredCount > 0) {
+    // Try to determine why changes were filtered
+    // This helps diagnose the missing changes issue
+    try {
+      // Take a sample of filtered changes for analysis
+      const sampleWALChange = changes[0];
+      const sampleData = sampleWALChange.data ? JSON.parse(sampleWALChange.data) : null;
+      
+      if (sampleData?.change?.[0]) {
+        const changeInfo = sampleData.change[0];
+        const table = changeInfo.table;
+        const schema = changeInfo.schema;
+        
+        // Check if table is in our tracking list
+        const isTableTracked = shouldTrackTable(table);
+        
+        if (!isTableTracked) {
+          filterReason = `Table ${schema}.${table} not in tracked list`;
+        } else if (!changeInfo.columnnames || !changeInfo.columnvalues) {
+          filterReason = `Missing column data in ${schema}.${table} changes`;
+        } else {
+          filterReason = `Unknown filter reason for ${schema}.${table}`;
+        }
+      } else {
+        filterReason = 'Invalid WAL format';
+      }
+    } catch (error) {
+      filterReason = 'Error analyzing filtered changes';
+    }
+    
+    replicationLogger.info('WAL changes filtered', {
+      originalCount: changes.length,
+      validCount: tableChanges.length,
+      filteredCount,
+      reason: filterReason
+    }, MODULE_NAME);
+  }
+  
   // Early return if no valid changes after transformation
   if (tableChanges.length === 0) {
-    return { tableChanges: [], storedSuccessfully: true };
+    return { tableChanges: [], storedSuccessfully: true, filteredCount, filterReason };
   }
   
   // ====== STEP 2: STORE ======
   // Store the transformed changes in the change_history table
-  const storedSuccessfully = await storeChangesInHistory(context, tableChanges);
+  const storedSuccessfully = await storeChangesInHistory(context, tableChanges, storeBatchSize);
   
   // Return both the changes and storage status for the next step in the pipeline
-  return { tableChanges, storedSuccessfully };
+  return { tableChanges, storedSuccessfully, filteredCount, filterReason };
 }
 
 /**
- * Complete WAL processing workflow: transform, store, update LSN, broadcast
- * This maintains the existing behavior while providing a clear linear flow.
- * Handles LSN-only updates differently from domain table changes.
+ * Process WAL changes without consuming them, just saving the LSN
+ * This is a more efficient version that doesn't consume WAL entries but still
+ * tracks the current LSN position for processing purposes
  */
-export async function processAndConsumeWALChanges(
+export async function processWALChangesWithoutConsume(
   peekedChanges: WALData[],
   env: Env,
   context: MinimalContext,
   stateManager: StateManager,
-  slotName: string
-): Promise<{ success: boolean, storedChanges: boolean, consumedChanges: boolean, changeCount?: number }> {
+  storeBatchSize?: number
+): Promise<{ success: boolean, storedChanges: boolean, changeCount?: number, needsMorePolling?: boolean, filteredCount?: number, lastLSN: string }> {
   // Early return if no changes
   if (!peekedChanges || peekedChanges.length === 0) {
-    return { success: true, storedChanges: false, consumedChanges: false };
+    return { success: true, storedChanges: false, needsMorePolling: false, lastLSN: '' };
   }
 
   // Get the lastLSN from the peeked changes
   const lastLSN = peekedChanges[peekedChanges.length - 1].lsn;
+  
+  // Check if we likely hit the batch limit (potentially more changes available)
+  const likelyMoreChanges = peekedChanges.length >= 1000; // Use a simpler threshold
 
   try {
-    // ====== STEP 1: TRANSFORM AND STORE ======
     // Transform WAL to TableChanges and store in history
-    const { tableChanges, storedSuccessfully } = await processWALChanges(context, peekedChanges);
+    const { tableChanges, storedSuccessfully, filteredCount } = await processWALChanges(context, peekedChanges, storeBatchSize);
     
     // Determine if this is an LSN-only update (no valid domain table changes)
     const isLSNOnlyUpdate = tableChanges.length === 0;
     
     if (isLSNOnlyUpdate) {
-      // For LSN-only updates, just update the LSN and consume the WAL
+      // Only log at info level after WAL changes are processed
       replicationLogger.info('LSN-only update (no domain table changes)', {
         walCount: peekedChanges.length,
-        lsn: lastLSN
+        lsn: lastLSN,
+        likelyMoreChanges,
+        filteredCount
       }, MODULE_NAME);
       
       // Update the LSN for LSN-only changes
       await stateManager.setLSN(lastLSN);
       
-      // Consume the WAL for these changes
-      const consumedSuccessfully = await consumeWALChanges(context, stateManager, slotName, lastLSN);
-      
-      if (!consumedSuccessfully) {
-        replicationLogger.warn('Failed to consume WAL for LSN-only update, but LSN updated', {
-          lsn: lastLSN
-        }, MODULE_NAME);
-      }
-      
       return { 
         success: true, 
         storedChanges: false, // No domain table changes to store
-        consumedChanges: consumedSuccessfully,
-        changeCount: 0
+        changeCount: 0,
+        needsMorePolling: likelyMoreChanges,
+        filteredCount,
+        lastLSN
       };
     }
     
@@ -572,7 +661,7 @@ export async function processAndConsumeWALChanges(
     
     // If storage wasn't successful, log a warning and update LSN anyway
     if (!storedSuccessfully) {
-      replicationLogger.warn('Domain table changes not stored, skipping WAL consume', {
+      replicationLogger.warn('Domain table changes not stored', {
         lsn: lastLSN
       }, MODULE_NAME);
       
@@ -582,12 +671,17 @@ export async function processAndConsumeWALChanges(
         lsn: lastLSN
       }, MODULE_NAME);
       
-      return { success: true, storedChanges: false, consumedChanges: false, changeCount: tableChanges.length };
+      return { 
+        success: true, 
+        storedChanges: false, 
+        changeCount: tableChanges.length,
+        needsMorePolling: likelyMoreChanges,
+        filteredCount,
+        lastLSN
+      };
     }
     
-    // ====== STEP 2: UPDATE LSN IMMEDIATELY AFTER STORAGE SUCCESS ======
-    // Update LSN as soon as storage succeeds, before attempting WAL consumption
-    // This ensures we don't reprocess changes even if WAL consumption fails
+    // Update LSN as soon as storage succeeds
     try {
       await stateManager.setLSN(lastLSN);
       replicationLogger.debug('Updated LSN after successful domain table change storage', {
@@ -602,34 +696,23 @@ export async function processAndConsumeWALChanges(
       // Continue with the process despite LSN update error
     }
     
-    // ====== STEP 3: CONSUME WAL ======
-    // Try to consume the WAL changes (advance the replication slot)
-    // Even if this fails, we've already updated the LSN
-    const consumedSuccessfully = await consumeWALChanges(context, stateManager, slotName, lastLSN);
-    
-    if (!consumedSuccessfully) {
-      replicationLogger.warn('WAL consumption failed, but LSN already updated', {
-        lsn: lastLSN
-      }, MODULE_NAME);
-    }
-    
-    // ====== STEP 4: NOTIFY CLIENTS ======
     // Broadcast changes to clients with actual domain table changes
     await broadcastChangesToClients(env, tableChanges, lastLSN);
     
     return { 
       success: true, 
-      storedChanges: storedSuccessfully, 
-      consumedChanges: consumedSuccessfully,
-      changeCount: tableChanges.length
+      storedChanges: storedSuccessfully,
+      changeCount: tableChanges.length,
+      needsMorePolling: likelyMoreChanges,
+      filteredCount,
+      lastLSN
     };
   } catch (error) {
     // Check for the specific "replication slot is active" error
     const errorMsg = error instanceof Error ? error.message : String(error);
     if (errorMsg.includes('replication slot') && errorMsg.includes('is active for PID')) {
       replicationLogger.warn('Replication slot is already in use, skipping this poll cycle', {
-        error: errorMsg,
-        slot: slotName
+        error: errorMsg
       }, MODULE_NAME);
       
       // When this error occurs, we should still consider the operation successful
@@ -637,8 +720,10 @@ export async function processAndConsumeWALChanges(
       return {
         success: true,
         storedChanges: false,
-        consumedChanges: false,
-        changeCount: peekedChanges.length
+        changeCount: peekedChanges.length,
+        needsMorePolling: false,
+        filteredCount: 0, // Default value for error case
+        lastLSN
       };
     }
     
@@ -651,8 +736,90 @@ export async function processAndConsumeWALChanges(
     return {
       success: false,
       storedChanges: false,
-      consumedChanges: false,
-      changeCount: peekedChanges.length
+      changeCount: peekedChanges.length,
+      needsMorePolling: false,
+      filteredCount: 0, // Default value for error case
+      lastLSN
     };
   }
+}
+
+/**
+ * Complete WAL processing workflow: transform, store, update LSN, broadcast
+ * This maintains the existing behavior while providing a clear linear flow.
+ * Handles LSN-only updates differently from domain table changes.
+ */
+export async function processAndConsumeWALChanges(
+  peekedChanges: WALData[],
+  env: Env,
+  context: MinimalContext,
+  stateManager: StateManager,
+  slotName: string,
+  walConsumeSize?: number,
+  storeBatchSize?: number
+): Promise<{ success: boolean, storedChanges: boolean, consumedChanges: boolean, changeCount?: number, needsMorePolling?: boolean, filteredCount?: number }> {
+  // Process the changes without consuming WAL
+  const result = await processWALChangesWithoutConsume(
+    peekedChanges,
+    env,
+    context,
+    stateManager,
+    storeBatchSize
+  );
+  
+  // If no changes or processing failed, return early
+  if (!result.success || !peekedChanges || peekedChanges.length === 0) {
+    return { 
+      success: result.success, 
+      storedChanges: result.storedChanges, 
+      consumedChanges: false,
+      changeCount: result.changeCount,
+      needsMorePolling: result.needsMorePolling,
+      filteredCount: result.filteredCount
+    };
+  }
+  
+  // Consuming is now optional and can be done in a separate process
+  // For backward compatibility, we'll still consume the WAL here
+  // but this can be disabled in the future
+  
+  let consumedSuccessfully = false;
+  
+  // Use the provided consume size or default to 2000 if not specified
+  const consumeSize = walConsumeSize || 2000;
+  
+  // Only try to consume WAL if lastLSN is not empty
+  if (result.lastLSN) {
+    try {
+      // Attempt WAL consumption
+      consumedSuccessfully = await consumeWALChanges(
+        context, 
+        stateManager, 
+        slotName, 
+        result.lastLSN, 
+        consumeSize
+      );
+      
+      if (!consumedSuccessfully) {
+        replicationLogger.warn('WAL consumption failed, but LSN already updated', {
+          lsn: result.lastLSN
+        }, MODULE_NAME);
+      }
+    } catch (consumeError) {
+      replicationLogger.error('Error during WAL consumption', {
+        error: consumeError instanceof Error ? consumeError.message : String(consumeError),
+        lsn: result.lastLSN
+      }, MODULE_NAME);
+      // Consumption failure is not considered a critical error
+    }
+  }
+  
+  return {
+    success: result.success,
+    storedChanges: result.storedChanges,
+    consumedChanges: consumedSuccessfully,
+    changeCount: result.changeCount,
+    needsMorePolling: result.needsMorePolling,
+    filteredCount: result.filteredCount
+  };
 } 

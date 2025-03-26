@@ -65,6 +65,11 @@ export class StateManager {
         
         // If slot doesn't exist, create it
         if (!exists) {
+          replicationLogger.info('Creating replication slot and resources', {
+            slot: this.config.slot,
+            publication: this.config.publication
+          }, MODULE_NAME);
+          
           // Create slot with wal2json plugin
           await client.query(`
             SELECT pg_create_logical_replication_slot(
@@ -103,9 +108,17 @@ export class StateManager {
 
           exists = newSlotResult.rows.length > 0;
           slotLSN = exists ? newSlotResult.rows[0].confirmed_flush_lsn : undefined;
+        } else {
+          // Log at debug level for routine status checks to reduce log noise
+          replicationLogger.debug('Replication slot exists', {
+            slot: this.config.slot,
+            slotLSN,
+            currentWAL
+          }, MODULE_NAME);
         }
 
-        replicationLogger.info('Slot status checked', {
+        // Log detailed status at debug level to reduce noise
+        replicationLogger.debug('Slot status details', {
           slot: this.config.slot,
           exists,
           slotLSN,

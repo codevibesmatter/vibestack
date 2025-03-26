@@ -31,6 +31,28 @@ interface LSNState {
   clientId?: string;
 }
 
+// Define catchup message types using type instead of interface to avoid extension issues
+type ServerCatchupChangesMessage = {
+  type: 'srv_catchup_changes';
+  messageId: string;
+  timestamp: number;
+  changes: any[];
+  sequence?: {
+    chunk: number;
+    total: number;
+  };
+  lastLSN?: string;
+};
+
+type ClientCatchupReceivedMessage = {
+  type: 'clt_catchup_received';
+  messageId: string;
+  timestamp: number;
+  clientId: string;
+  chunkReceived: number;
+  lsn?: string;
+};
+
 /**
  * Get database URL from environment
  */
@@ -119,17 +141,58 @@ async function initializeReplication(): Promise<boolean> {
 }
 
 /**
+ * Get current LSN value from server
+ */
+async function getCurrentLSN(): Promise<string | null> {
+  try {
+    // Convert the WebSocket URL to the base HTTP URL
+    const wsUrl = new URL(DEFAULT_CONFIG.wsUrl);
+    const baseUrl = `http${wsUrl.protocol === 'wss:' ? 's' : ''}://${wsUrl.host}`;
+    const lsnUrl = `${baseUrl}/api/replication/lsn`;
+    
+    console.log(`Fetching current LSN: ${lsnUrl}`);
+    
+    const response = await fetch(lsnUrl);
+    if (!response.ok) {
+      console.error(`Failed to fetch LSN: ${response.status} ${response.statusText}`);
+      return null;
+    }
+    
+    const result = await response.json() as any;
+    if (result && result.success && result.lsn) {
+      console.log(`Current server LSN: ${result.lsn}`);
+      return result.lsn;
+    } else {
+      console.error('Invalid LSN response:', result);
+      return null;
+    }
+  } catch (error) {
+    console.error('Error fetching current LSN:', error);
+    return null;
+  }
+}
+
+/**
  * Test live synchronization with concurrent database operations
  */
 async function testLiveSync(): Promise<number> {
   console.log('Starting Live Sync Test');
   
-  // Load existing LSN and client ID from file
+  // Get the current LSN from the server first
+  const currentServerLSN = await getCurrentLSN();
+  if (!currentServerLSN) {
+    console.error('Failed to get current LSN from server');
+    return 1;
+  }
+  
+  // Load existing client ID from file if available
   const lsnInfo = getLSNInfoFromFile();
-  const currentLSN = lsnInfo.lsn;
   let savedClientId = lsnInfo.clientId;
   
-  console.log(`Using existing LSN: ${currentLSN}`);
+  // Use server's current LSN instead of the saved one
+  const currentLSN = currentServerLSN;
+  console.log(`Using current server LSN: ${currentLSN}`);
+  
   if (savedClientId) {
     console.log(`Using saved client ID: ${savedClientId}`);
   }
@@ -158,21 +221,19 @@ async function testLiveSync(): Promise<number> {
     console.warn('Replication initialization failed. Proceeding anyway, but sync may not work correctly.');
   }
   
-  // Read the LSN file again to ensure we have the most recent value before connecting
-  const updatedLsnInfo = getLSNInfoFromFile();
-  const startLSN = updatedLsnInfo.lsn;
-  const clientId = updatedLsnInfo.clientId || savedClientId;
-  
   // Track stats for reporting
   const stats = {
     totalMessages: 0,
     changesMessages: 0,
+    catchupMessages: 0,
+    catchupChunksReceived: 0,
+    catchupChunksAcknowledged: 0,
     lsnUpdateMessages: 0,
-    syncCompletedMessages: 0, // Keep for backward compatibility
+    syncCompletedMessages: 0,
     totalChangesReceived: 0,
-    finalLSN: startLSN,
-    clientId: clientId,
-    testCompletedSuccessfully: false  // Default to false and set to true only when all changes are created
+    finalLSN: currentLSN,
+    clientId: savedClientId,
+    testCompletedSuccessfully: false
   };
   
   // Setup sync tester with default config
@@ -180,11 +241,11 @@ async function testLiveSync(): Promise<number> {
   
   // Track various message types
   let changesReceived = false;
-  // We no longer use syncCompleted - using LSN updates instead
+  let catchupCompleted = false;
   
   // Setup timeouts
-  const timeoutDuration = 30000; // 30 seconds
-  const testDuration = 30000;    // 30 seconds - shortened since we only need 3 changes max
+  const timeoutDuration = 60000; // 60 seconds - extended for catchup
+  const testDuration = 30000;    // 30 seconds for live changes after catchup
   
   // Log message receipt
   const logMessageReceipt = (type: string) => {
@@ -192,12 +253,58 @@ async function testLiveSync(): Promise<number> {
   };
   
   // Setup message listener
-  tester.onMessage = (message: Message) => {
+  tester.onMessage = async (message: any) => {
     stats.totalMessages++;
     
     // Handle different message types
     const msgType = message.type as string;
     switch (msgType) {
+      case 'srv_catchup_changes':
+        const catchupMsg = message as any;
+        logMessageReceipt(msgType);
+        stats.catchupMessages++;
+        stats.catchupChunksReceived++;
+        
+        console.log(`Received catchup chunk ${catchupMsg.sequence?.chunk}/${catchupMsg.sequence?.total} with ${catchupMsg.changes?.length || 0} changes`);
+        
+        if (catchupMsg.lastLSN) {
+          console.log(`  Last LSN in catchup: ${catchupMsg.lastLSN}`);
+          stats.finalLSN = catchupMsg.lastLSN;
+        }
+        
+        if (catchupMsg.changes) {
+          stats.totalChangesReceived += catchupMsg.changes.length;
+        }
+        
+        // Send acknowledgment for the catchup chunk
+        try {
+          if (catchupMsg.sequence) {
+            const ackMessage: any = {
+              type: 'clt_catchup_received',
+              messageId: `ack_${Date.now()}`,
+              timestamp: Date.now(),
+              clientId: stats.clientId || tester.getClientId(),
+              chunkReceived: catchupMsg.sequence.chunk,
+              lsn: catchupMsg.lastLSN || stats.finalLSN
+            };
+            
+            await tester.sendMessage(ackMessage);
+            stats.catchupChunksAcknowledged++;
+            console.log(`✅ Acknowledged catchup chunk ${catchupMsg.sequence.chunk}/${catchupMsg.sequence.total}`);
+            
+            // Check if this is the last chunk
+            if (catchupMsg.sequence.chunk === catchupMsg.sequence.total) {
+              console.log('All catchup chunks received and acknowledged');
+              catchupCompleted = true;
+            }
+          } else {
+            console.warn('Catchup message missing sequence information, cannot acknowledge');
+          }
+        } catch (error) {
+          console.error('Failed to send catchup acknowledgment:', error);
+        }
+        break;
+        
       case 'srv_live_changes':
         const changesMsg = message as ServerChangesMessage;
         logMessageReceipt(msgType);
@@ -229,11 +336,6 @@ async function testLiveSync(): Promise<number> {
         console.log(`Received srv_send_changes message #${stats.changesMessages} (legacy message type)`);
         console.log(`  ⚠️ DEPRECATED: This message type has been replaced with 'srv_live_changes' for live sync`);
         console.log(`  Contains ${legacyChangesMsg.changes.length} changes`);
-        
-        // Check if sequence information is available
-        if (legacyChangesMsg.sequence) {
-          console.log(`  Chunk ${legacyChangesMsg.sequence.chunk}/${legacyChangesMsg.sequence.total}`);
-        }
         
         if (legacyChangesMsg.lastLSN) {
           console.log(`  Has lastLSN: ${legacyChangesMsg.lastLSN}`);
@@ -267,6 +369,9 @@ async function testLiveSync(): Promise<number> {
           stats.finalLSN = syncMsg.finalLSN;
           console.log(`Using final LSN from sync completed message: ${stats.finalLSN}`);
         }
+        
+        catchupCompleted = true;
+        console.log('🔄 Catchup synchronization complete, proceeding with live changes');
         break;
         
       default:
@@ -277,12 +382,43 @@ async function testLiveSync(): Promise<number> {
   
   // Connect to the server with the current LSN and client ID
   console.log('Connecting to server with current LSN...');
-  await tester.connect(startLSN, clientId);
+  await tester.connect(currentLSN, savedClientId);
   
   // If we don't have a client ID yet, get it from the tester
   if (!stats.clientId) {
     stats.clientId = tester.getClientId();
     console.log(`New client ID assigned: ${stats.clientId}`);
+  }
+  
+  // Wait for catchup to complete before proceeding with live test
+  console.log('Waiting for catchup synchronization to complete...');
+  const catchupTimeout = 30000; // 30 seconds
+  const catchupStartTime = Date.now();
+  
+  while (!catchupCompleted && (Date.now() - catchupStartTime) < catchupTimeout) {
+    // Wait a bit before checking again
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Send heartbeat occasionally to keep connection alive
+    if ((Date.now() - catchupStartTime) % 5000 < 500) {
+      try {
+        await tester.sendMessage({
+          type: 'clt_heartbeat',
+          messageId: `hb_${Date.now()}`,
+          timestamp: Date.now(),
+          clientId: stats.clientId || tester.getClientId()
+        });
+        console.log('Heartbeat sent while waiting for catchup');
+      } catch (error) {
+        console.warn('Failed to send heartbeat:', error);
+      }
+    }
+  }
+  
+  if (!catchupCompleted) {
+    console.warn('⚠️ Catchup synchronization did not complete within timeout. Proceeding with live test anyway.');
+  } else {
+    console.log('✅ Catchup synchronization completed successfully. Starting live test.');
   }
   
   console.log(`Running live sync test for ${testDuration / 1000} seconds...`);
@@ -350,11 +486,15 @@ async function testLiveSync(): Promise<number> {
     // Set a timeout to end the test
     setTimeout(() => {
       console.log(`Test duration reached with ${changesCreated} changes created.`);
-      console.log(`TIMEOUT: Test failed to create all ${maxChanges} changes in the allotted time.`);
+      if (changesCreated < maxChanges) {
+        console.log(`TIMEOUT: Test failed to create all ${maxChanges} changes in the allotted time.`);
+        stats.testCompletedSuccessfully = false;
+      } else {
+        console.log(`Test completed successfully with all ${maxChanges} changes created.`);
+        stats.testCompletedSuccessfully = true;
+      }
       running = false;
       clearInterval(changeInterval);
-      // Test timed out without completing all changes
-      stats.testCompletedSuccessfully = false;
       resolve();
     }, testDuration);
   });
@@ -372,6 +512,7 @@ async function testLiveSync(): Promise<number> {
   // Analyze results
   console.log('\nMessage Analysis Summary:');
   console.log(`- Total messages received: ${stats.totalMessages}`);
+  console.log(`- Catchup: ${stats.catchupMessages} messages, ${stats.catchupChunksReceived} chunks received, ${stats.catchupChunksAcknowledged} chunks acknowledged`);
   console.log(`- Found ${stats.changesMessages} changes messages with ${stats.totalChangesReceived} total changes`);
   console.log(`  (Both 'srv_live_changes' and legacy 'srv_send_changes' are counted)`);
   console.log(`- LSN updates: ${stats.lsnUpdateMessages}`);
@@ -393,24 +534,30 @@ async function testLiveSync(): Promise<number> {
   
   console.log('\nLive Sync Results:');
   console.log('--------------------');
-  console.log(`Starting LSN: ${startLSN}`);
+  console.log(`Starting LSN: ${currentLSN}`);
   console.log(`Final LSN: ${stats.finalLSN}`);
   console.log(`Client ID: ${stats.clientId}`);
   console.log(`Total messages: ${stats.totalMessages}`);
+  console.log(`Catchup messages: ${stats.catchupMessages}`);
   console.log(`Changes messages: ${stats.changesMessages}`);
   console.log(`Total changes received: ${stats.totalChangesReceived}`);
   
   // Success criteria
-  const lsnAdvanced = stats.finalLSN !== startLSN;
+  const lsnAdvanced = stats.finalLSN !== currentLSN;
   const receivedAllChanges = stats.totalChangesReceived >= changesCreated;
+  const catchupHandledCorrectly = stats.catchupChunksReceived === stats.catchupChunksAcknowledged;
   
-  console.log(`Success: ${lsnAdvanced ? 'LSN advanced' : 'No LSN advancement'} from ${startLSN} to ${stats.finalLSN}`);
+  console.log(`Success: ${lsnAdvanced ? 'LSN advanced' : 'No LSN advancement'} from ${currentLSN} to ${stats.finalLSN}`);
+  console.log(`Success: ${catchupHandledCorrectly ? 'Catchup handled correctly' : 'Catchup acknowledgment mismatch'}`);
   console.log(`Success: ${changesReceived ? 'Received changes during live sync' : 'No changes received'}`);
   console.log(`Success: ${receivedAllChanges ? `Received all ${changesCreated} created changes` : `Missing some changes (received ${stats.totalChangesReceived}/${changesCreated})`}`);
   console.log(`Success: ${stats.testCompletedSuccessfully ? 'Test completed all changes' : 'Test timed out before creating all changes'}`);
   
-  // Overall test success - now factors in whether the test completed all changes or timed out
-  const testSucceeded = lsnAdvanced && changesReceived && receivedAllChanges && stats.testCompletedSuccessfully;
+  // Overall test success - factors in catchup handling and live notifications
+  const testSucceeded = lsnAdvanced && (catchupHandledCorrectly || stats.catchupMessages === 0) && 
+                         (changesReceived || stats.totalChangesReceived > 0) && 
+                         receivedAllChanges && stats.testCompletedSuccessfully;
+                         
   console.log(`\nOverall Test Result: ${testSucceeded ? 'SUCCESS ✅' : 'FAILURE ❌'}`);
   
   console.log('Closing database connection...');

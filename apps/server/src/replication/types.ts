@@ -9,15 +9,80 @@ import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
  * Configuration for the replication system
  */
 export interface ReplicationConfig {
+  /**
+   * Replication slot name used for PostgreSQL logical replication
+   */
   slot: string;
+  
+  /**
+   * Publication name for logical replication setup
+   */
   publication: string;
-  hibernationDelay: number;
+  
+  /**
+   * Maximum number of WAL changes to fetch in a single peek operation
+   * Higher values process more changes at once but use more memory
+   */
+  walBatchSize?: number;
+  
+  /**
+   * Maximum number of WAL changes to consume in a single consume operation
+   * Controls how many changes to acknowledge to PostgreSQL at once
+   */
+  walConsumeSize?: number;
+  
+  /**
+   * Threshold percentage of batch size that triggers immediate re-polling
+   * When reached, system will immediately poll again without waiting for the next cycle
+   * Value from 0.0 to 1.0 (e.g., 0.5 = re-poll when batch is 50% full)
+   */
+  walBatchThreshold?: number;
+  
+  /**
+   * Interval in milliseconds between polling cycles
+   * Shorter intervals detect changes faster but consume more resources
+   */
+  pollingInterval?: number;
+  
+  /**
+   * Faster polling interval to use when high throughput is detected
+   * This allows the system to process large batches of changes more quickly
+   * For example, 100ms for high throughput vs 1000ms for normal operation
+   */
+  fastPollingInterval?: number;
+  
+  /**
+   * Maximum number of consecutive immediate re-polls when batches are full
+   * Prevents infinite loops if there are too many changes
+   */
+  maxConsecutivePolls?: number;
+  
+  /**
+   * Batch size for storing changes in the change_history table
+   * Controls how many INSERT statements are batched together
+   */
+  storeBatchSize?: number;
+  
+  /**
+   * Skip consuming WAL during normal processing cycle
+   * When true, the replication system only tracks LSN position without consuming WAL
+   * This can improve performance for high-volume changes as WAL can be consumed on a separate schedule
+   * Default is false for backward compatibility
+   */
+  skipWALConsumption?: boolean;
 }
 
 export const DEFAULT_REPLICATION_CONFIG: ReplicationConfig = {
   slot: 'vibestack',
   publication: 'vibestack_pub',
-  hibernationDelay: 60000 // 1 minute
+  walBatchSize: 2000,      // Increased from 1000 - maximum changes to peek at once
+  walConsumeSize: 2000,    // Increased from 1000 - maximum changes to consume at once
+  walBatchThreshold: 0.5,  // Re-poll immediately if batch is 50% full
+  pollingInterval: 1000,   // 1 second between polls
+  fastPollingInterval: 100, // 100ms for high throughput scenarios
+  maxConsecutivePolls: 10, // Maximum consecutive immediate re-polls
+  storeBatchSize: 100,     // Number of changes to batch in a single INSERT
+  skipWALConsumption: true  // Skip consuming WAL during normal processing for improved performance
 };
 
 /**

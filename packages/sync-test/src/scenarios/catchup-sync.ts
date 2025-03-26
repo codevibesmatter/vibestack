@@ -11,7 +11,6 @@ import type {
   ClientHeartbeatMessage,
   ServerSyncCompletedMessage
 } from '@repo/sync-types';
-import { createServerBulkChanges } from '../changes/server-changes.js';
 import fs from 'fs';
 import path from 'path';
 import { config } from 'dotenv';
@@ -19,6 +18,7 @@ import { neon } from '@neondatabase/serverless';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
+import { createMixedChanges } from '../changes/entity-changes.js';
 
 // Load environment variables from .env file
 config();
@@ -473,8 +473,15 @@ async function testCatchupSync() {
     console.log('Creating server changes...');
     // Create enough changes to ensure WAL generation
     const numChanges = 25; // Create 25 changes
-    console.log(`Creating ${numChanges} changes...`);
-    await createServerBulkChanges(sql as any, Task, numChanges);
+    console.log(`Creating ${numChanges} mixed entity changes...`);
+    
+    // Create a realistic mix of entity changes across different entity types
+    await createMixedChanges(sql as any, numChanges, {
+      task: 0.6,      // 60% tasks - tasks are the primary entity
+      project: 0.15,  // 15% projects
+      user: 0.15,     // 15% users
+      comment: 0.1    // 10% comments
+    });
 
     // Initialize replication system via HTTP before connecting
     console.log('Initializing replication system...');

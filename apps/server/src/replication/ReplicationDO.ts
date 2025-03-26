@@ -27,7 +27,6 @@ export class ReplicationDO implements DurableObject {
   private stateManager: StateManager;
   private metrics: ReplicationMetrics;
   private config: ReplicationConfig = DEFAULT_REPLICATION_CONFIG;
-  private static readonly LAST_ACTIVE_KEY = 'last_active_timestamp';
 
   constructor(state: DurableObjectState, env: Env) {
     this.durableObjectState = state;
@@ -35,21 +34,6 @@ export class ReplicationDO implements DurableObject {
     
     // Initialize managers
     this.stateManager = new StateManager(state, this.config);
-    
-    // Log wake-up - constructor is called when DO wakes from hibernation
-    this.durableObjectState.blockConcurrencyWhile(async () => {
-      const lastActive = await state.storage.get<number>(ReplicationDO.LAST_ACTIVE_KEY);
-      if (lastActive) {
-        const hibernationDuration = Date.now() - lastActive;
-        replicationLogger.info('DO waking', {
-          lastActiveAt: new Date(lastActive).toISOString(),
-          hibernationSecs: Math.round(hibernationDuration / 1000)
-        }, MODULE_NAME);
-      }
-      
-      // Record wake-up time
-      await state.storage.put(ReplicationDO.LAST_ACTIVE_KEY, Date.now());
-    });
     
     // Initialize metrics
     this.metrics = {
@@ -78,8 +62,11 @@ export class ReplicationDO implements DurableObject {
       this.stateManager
     );
     
-    // DO NOT check slot or start polling in constructor
-    // This will be handled by explicit initializeReplication call via API
+    // Initialize the replication system in the background
+    // This will check if the slot exists and start polling immediately
+    this.durableObjectState.waitUntil(
+      this.initializeAndStartPolling()
+    );
   }
 
   private getContext(): MinimalContext {
@@ -88,6 +75,46 @@ export class ReplicationDO implements DurableObject {
       passThroughOnException: () => {},
       props: undefined
     });
+  }
+
+  /**
+   * Initialize replication and start polling immediately
+   * This ensures polling is active as soon as the DO is created
+   */
+  private async initializeAndStartPolling(): Promise<void> {
+    try {
+      replicationLogger.info('Auto-initializing replication system', {}, MODULE_NAME);
+      
+      // Check if slot exists or create it
+      const c = this.getContext();
+      const slotStatus = await this.stateManager.checkSlotStatus(c);
+      
+      // Use debug instead of info to reduce duplicate logs
+      replicationLogger.debug('Replication slot check completed', {
+        slotExists: slotStatus.exists
+      }, MODULE_NAME);
+      
+      // Start polling immediately - the polling manager will log its own status
+      await this.pollingManager.startPolling();
+      
+      // Log successful initialization at debug level only
+      replicationLogger.debug('Auto-initialization completed', {}, MODULE_NAME);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      replicationLogger.error('Failed to auto-initialize replication', { 
+        error: errorMessage 
+      }, MODULE_NAME);
+      
+      // Even on error, attempt to start polling
+      // This provides resilience - polling will skip problematic slots
+      try {
+        await this.pollingManager.startPolling();
+      } catch (pollErr) {
+        replicationLogger.error('Failed to start polling after initialization error', {
+          error: pollErr instanceof Error ? pollErr.message : String(pollErr)
+        }, MODULE_NAME);
+      }
+    }
   }
 
   /**
@@ -177,33 +204,59 @@ export class ReplicationDO implements DurableObject {
    */
   private async handleInit(): Promise<Response> {
     try {
-      // Step 1: Check the slot exists
-      const initResult = await this.initializeReplication();
-      if (!initResult.success) {
-        return new Response(JSON.stringify(initResult), {
-          status: 500,
+      // Check if polling is already initialized and active first - this is a very fast check
+      // since it just checks memory state, no database calls needed
+      const isAlreadyPolling = this.pollingManager.hasCompletedFirstPoll;
+      
+      if (isAlreadyPolling) {
+        replicationLogger.debug('API: Replication already initialized', {}, MODULE_NAME);
+        
+        return new Response(JSON.stringify({
+          success: true,
+          pollingStarted: true,
+          alreadyInitialized: true
+        }), {
+          status: 200,
           headers: { 'Content-Type': 'application/json' }
         });
       }
       
-      // Step 2: Start the polling process
-      replicationLogger.info('Triggering polling process from API', {}, MODULE_NAME);
-      
-      // Start polling in the background - don't await
-      // We use waitUntil to ensure the DO stays alive to complete this
-      this.durableObjectState.waitUntil(this.pollingManager.startPolling());
-
-      return new Response(JSON.stringify({
-        success: true,
-        slotStatus: initResult.slotStatus,
-        pollingStarted: true
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
+      // If not already polling, perform full initialization including slot check
+      // This is the same flow as the auto-initialization but returns a Response
+      try {
+        replicationLogger.info('API: Initializing replication', {}, MODULE_NAME);
+        
+        // Check if slot exists or create it
+        const c = this.getContext();
+        const slotStatus = await this.stateManager.checkSlotStatus(c);
+        
+        // Start polling - PollingManager will handle its own logging
+        await this.pollingManager.startPolling();
+        
+        return new Response(JSON.stringify({
+          success: true,
+          slotStatus,
+          pollingStarted: true
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        replicationLogger.error('API: Failed to initialize replication', { 
+          error: errorMessage 
+        }, MODULE_NAME);
+        
+        return new Response(JSON.stringify({
+          success: false,
+          error: errorMessage
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      replicationLogger.error('Init error', { error: errorMessage }, MODULE_NAME);
       return new Response(JSON.stringify({
         success: false,
         error: errorMessage
@@ -221,10 +274,24 @@ export class ReplicationDO implements DurableObject {
     try {
       const c = this.getContext();
       const slotStatus = await this.stateManager.checkSlotStatus(c);
+      const currentLSN = await this.stateManager.getLSN();
+      
+      // Get polling status information
+      const pollingActive = this.pollingManager.hasCompletedFirstPoll;
+      const pollCount = this.pollingManager.getPollCount ? this.pollingManager.getPollCount() : 0;
+      const pollingDuration = pollingActive && pollCount > 0 
+        ? `${Math.floor(pollCount / 60)} minutes (${pollCount} polls)` 
+        : "inactive";
       
       return new Response(JSON.stringify({
         success: true,
-        slotStatus
+        slotStatus,
+        currentLSN,
+        polling: {
+          active: pollingActive,
+          count: pollCount,
+          duration: pollingDuration
+        }
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
@@ -259,14 +326,8 @@ export class ReplicationDO implements DurableObject {
    */
   private async cleanup(): Promise<void> {
     try {
-      // Update last active timestamp 
-      const now = Date.now();
-      await this.durableObjectState.storage.put(ReplicationDO.LAST_ACTIVE_KEY, now);
-      
       // Log clean shutdown
-      replicationLogger.info('DO shutting down', {
-        lastActiveAt: new Date(now).toISOString()
-      }, MODULE_NAME);
+      replicationLogger.info('DO shutting down', {}, MODULE_NAME);
 
       // Stop the polling interval
       await this.pollingManager.stopPolling();

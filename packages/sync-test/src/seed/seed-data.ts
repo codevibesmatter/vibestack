@@ -494,12 +494,12 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
       comments.push({
         id: commentId,
         content: faker.lorem.paragraph(),
-        entityType: 'task',
-        entityId: taskId,
-        authorId: authorId,
-        parentId: null,
-        createdAt: faker.date.past(),
-        updatedAt: new Date()
+        entity_type: 'task',
+        entity_id: taskId,
+        author_id: authorId,
+        parent_id: null,
+        created_at: faker.date.past(),
+        updated_at: new Date()
       });
       
       commentProgressCount++;
@@ -517,12 +517,12 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
         comments.push({
           id: replyId,
           content: faker.lorem.paragraph(),
-          entityType: 'task',
-          entityId: taskId,
-          authorId: replyAuthorId,
-          parentId: parentId,
-          createdAt: faker.date.past(),
-          updatedAt: new Date()
+          entity_type: 'task',
+          entity_id: taskId,
+          author_id: replyAuthorId,
+          parent_id: parentId,
+          created_at: faker.date.past(),
+          updated_at: new Date()
         });
         
         commentProgressCount++;
@@ -543,16 +543,16 @@ export async function seedData(dbUrl: string, config: SeedConfig): Promise<SeedR
     // Insert each comment in the chunk
     for (const comment of chunk) {
       await sql`
-        INSERT INTO comments (id, content, "entityType", "entityId", "authorId", "parentId", "createdAt", "updatedAt")
+        INSERT INTO comments (id, content, entity_type, entity_id, author_id, parent_id, created_at, updated_at)
         VALUES (
           ${comment.id}, 
           ${comment.content}, 
-          ${comment.entityType}, 
-          ${comment.entityId}, 
-          ${comment.authorId}, 
-          ${comment.parentId}, 
-          ${comment.createdAt}, 
-          ${comment.updatedAt}
+          ${comment.entity_type}, 
+          ${comment.entity_id}, 
+          ${comment.author_id}, 
+          ${comment.parent_id}, 
+          ${comment.created_at}, 
+          ${comment.updated_at}
         )
       `;
     }
