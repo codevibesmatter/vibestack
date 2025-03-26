@@ -457,12 +457,6 @@ export async function broadcastChangesToClients(
         const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
         const clientDo = env.SYNC.get(clientDoId);
         
-        // Log the client ID and attempt
-        replicationLogger.info('Attempting to notify client', {
-          clientId,
-          objectId: clientDoId.toString()
-        }, MODULE_NAME);
-        
         // For Durable Objects, create a proper Request object
         try {
           // Create a new Request object
@@ -480,29 +474,15 @@ export async function broadcastChangesToClients(
             }
           );
           
-          // Log the attempt
-          replicationLogger.info('Sending request to SyncDO', {
-            clientId,
-            url: newRequest.url
-          }, MODULE_NAME);
-          
           // Send the request to the Durable Object
           const response = await clientDo.fetch(newRequest);
-          
-          // Log the response
-          const responseText = await response.text();
-          replicationLogger.info('Received response from SyncDO', {
-            clientId,
-            status: response.status,
-            responseText
-          }, MODULE_NAME);
           
           // Count successful responses
           if (response.status === 200) {
             notifiedCount++;
           }
         } catch (error) {
-          replicationLogger.error('Error sending notification to SyncDO', {
+          replicationLogger.debug('Client notification failed', {
             clientId,
             error: error instanceof Error ? error.message : String(error)
           }, MODULE_NAME);

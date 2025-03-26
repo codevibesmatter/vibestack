@@ -123,16 +123,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // Log all incoming requests
-    syncLogger.info('SyncDO received request', {
-      path,
-      method: request.method,
-      clientId: this.clientId,
-      hasWebSocket: this.webSocket !== null,
-      webSocketState: this.webSocket?.readyState,
-      query: Object.fromEntries(url.searchParams.entries())
-    }, MODULE_NAME);
-
     try {
       // Route requests based on path
       if (path === '/api/sync') {
@@ -148,14 +138,8 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         // Handle both paths for metrics too
         return this.handleMetrics();
       } else {
-        // No route matched - log this for debugging
-        syncLogger.warn('No route matched in SyncDO', {
-          path,
-          method: request.method,
-          clientId: this.clientId,
-          url: request.url
-        }, MODULE_NAME);
-        return new Response(`Route not found: ${path}`, { status: 404 });
+        // No route matched
+        return new Response('Not found', { status: 404 });
       }
     } catch (error) {
       syncLogger.error('Request handling error', {
@@ -468,11 +452,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
 
     syncLogger.info('Received new changes request', {
       clientId,
-      lsnFromUrl,
-      isConnected: this.isConnected(),
-      webSocketState: this.webSocket?.readyState,
-      url: request.url,
-      path: new URL(request.url).pathname
+      lsnFromUrl
     }, MODULE_NAME);
 
     // Basic validation
