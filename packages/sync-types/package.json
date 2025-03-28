@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@repo/eslint-config": "*",
+    "tsup": "^8.4.0",
     "typescript": "^5.0.4"
   }
-} 
+}

@@ -9,8 +9,8 @@ interface TableChange$1 {
     updated_at: string;
 }
 
-type SrvMessageType = 'srv_send_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_lsn_update' | 'srv_changes_received' | 'srv_changes_applied' | 'srv_sync_completed';
-type CltMessageType = 'clt_sync_request' | 'clt_send_changes' | 'clt_heartbeat' | 'clt_error' | 'clt_changes_received' | 'clt_changes_applied' | 'clt_init_received' | 'clt_init_processed';
+type SrvMessageType = 'srv_send_changes' | 'srv_catchup_changes' | 'srv_live_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_lsn_update' | 'srv_changes_received' | 'srv_changes_applied' | 'srv_sync_completed' | 'srv_catchup_completed';
+type CltMessageType = 'clt_sync_request' | 'clt_send_changes' | 'clt_heartbeat' | 'clt_error' | 'clt_changes_received' | 'clt_changes_applied' | 'clt_init_received' | 'clt_init_processed' | 'clt_catchup_received';
 interface BaseMessage {
     messageId: string;
     timestamp: number;
@@ -20,7 +20,7 @@ interface ServerMessage extends BaseMessage {
     type: SrvMessageType;
 }
 interface ServerChangesMessage extends ServerMessage {
-    type: 'srv_send_changes';
+    type: 'srv_send_changes' | 'srv_catchup_changes' | 'srv_live_changes';
     changes: TableChange$1[];
     lastLSN: string;
     sequence?: {
@@ -72,6 +72,14 @@ interface ServerSyncCompletedMessage extends ServerMessage {
     success: boolean;
     error?: string;
 }
+interface ServerCatchupCompletedMessage extends ServerMessage {
+    type: 'srv_catchup_completed';
+    startLSN: string;
+    finalLSN: string;
+    changeCount: number;
+    success: boolean;
+    error?: string;
+}
 interface ClientMessage extends BaseMessage {
     type: CltMessageType;
 }
@@ -103,7 +111,7 @@ interface ClientInitReceivedMessage extends ClientMessage {
 interface ClientInitProcessedMessage extends ClientMessage {
     type: 'clt_init_processed';
 }
-type Message = ServerMessage | ClientMessage;
+type Message = ServerMessage | ServerCatchupCompletedMessage | ClientMessage;
 
 /**
  * Core change type for replication
@@ -115,6 +123,30 @@ interface TableChange {
     data: Record<string, unknown>;
     lsn?: string;
     updated_at: string;
+}
+/**
+ * Strongly typed record data for sync operations
+ * Represents the common fields expected in all records
+ */
+interface RecordData {
+    id: string;
+    client_id: string;
+    updated_at: string;
+    [key: string]: unknown;
+}
+/**
+ * Result of executing a client change
+ */
+interface ExecutionResult {
+    success: boolean;
+    error?: {
+        code: string;
+        message: string;
+        details?: any;
+    };
+    data?: any;
+    isConflict?: boolean;
+    skipped?: boolean;
 }
 
 /**
@@ -130,4 +162,4 @@ interface ClientDeregistration {
 declare function isTableChange(payload: unknown): payload is TableChange;
 declare function isClientMessageType(type: string): type is CltMessageType;
 
-export { type BaseMessage, type ClientAppliedMessage, type ClientChangesMessage, type ClientDeregistration, type ClientHeartbeatMessage, type ClientInitProcessedMessage, type ClientInitReceivedMessage, type ClientMessage, type ClientReceivedMessage, type ClientRegistration, type CltMessageType, type Message, type ServerAppliedMessage, type ServerChangesMessage, type ServerInitChangesMessage, type ServerInitCompleteMessage, type ServerInitStartMessage, type ServerLSNUpdateMessage, type ServerMessage, type ServerReceivedMessage, type ServerStateChangeMessage, type ServerSyncCompletedMessage, type SrvMessageType, type TableChange, isClientMessageType, isTableChange };
+export { type BaseMessage, type ClientAppliedMessage, type ClientChangesMessage, type ClientDeregistration, type ClientHeartbeatMessage, type ClientInitProcessedMessage, type ClientInitReceivedMessage, type ClientMessage, type ClientReceivedMessage, type ClientRegistration, type CltMessageType, type ExecutionResult, type Message, type RecordData, type ServerAppliedMessage, type ServerCatchupCompletedMessage, type ServerChangesMessage, type ServerInitChangesMessage, type ServerInitCompleteMessage, type ServerInitStartMessage, type ServerLSNUpdateMessage, type ServerMessage, type ServerReceivedMessage, type ServerStateChangeMessage, type ServerSyncCompletedMessage, type SrvMessageType, type TableChange, isClientMessageType, isTableChange };

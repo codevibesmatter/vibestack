@@ -225,4 +225,14 @@ export class SyncTester {
   public isConnected(): boolean {
     return this.connected;
   }
+
+  /**
+   * Get the WebSocket instance
+   */
+  public getWebSocket(): WebSocket {
+    if (!this.ws) {
+      throw new Error('Not connected');
+    }
+    return this.ws;
+  }
 } 

@@ -11,7 +11,7 @@
     "test:initial": "tsx src/scenarios/initial-sync.ts",
     "test:catchup": "tsx src/scenarios/catchup-sync.ts",
     "test:changes": "tsx src/scenarios/client-changes.ts",
-    "test:live": "tsx src/scenarios/live-sync.ts",
+    "test:live": "tsx src/scenarios/live-sync/index.ts",
     "test:all": "pnpm test:initial && pnpm test:catchup && pnpm test:changes && pnpm test:live",
     "test:init": "tsx src/scenarios/init-replication.ts",
     "test:db-init": "tsx src/scenarios/db-init-test.ts",

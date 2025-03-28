@@ -1,0 +1,583 @@
+import type { TableChange } from '@repo/sync-types';
+import { replicationLogger } from '../middleware/logger';
+import type { MinimalContext } from '../types/hono';
+import type { WALData, PostgresWALMessage } from '../types/wal';
+import { sql, getDBClient } from '../lib/db';
+import { StateManager } from './state-manager';
+import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
+import type { Env } from '../types/env';
+
+/**
+ * Process Changes Module
+ * 
+ * This module handles the processing of PostgreSQL Write-Ahead Log (WAL) changes 
+ * into our application data model. It follows a clear linear flow:
+ * 
+ * 1. TRANSFORMATION
+ *    - Raw WAL data is received from the database
+ *    - Invalid changes are filtered out
+ *    - Valid changes are transformed into TableChange objects
+ * 
+ * 2. STORAGE
+ *    - TableChange objects are stored in the change_history table
+ *    - This provides a centralized historical record of all changes
+ * 
+ * 3. LSN MANAGEMENT
+ *    - Once changes are successfully stored, the Log Sequence Number (LSN) is advanced
+ *    - This happens by consuming the replication slot up to the last LSN
+ *    - The current LSN is tracked in the StateManager
+ * 
+ * 4. CLIENT NOTIFICATION
+ *    - After storage and LSN advancement, connected clients are notified
+ *    - Active clients are queried directly from KV storage
+ *    - Changes are broadcast to relevant clients
+ * 
+ * KEY PRINCIPLES:
+ * - Changes are validated early in the pipeline
+ * - LSN is only advanced after successful storage
+ * - Each function has a single responsibility
+ * - Clear separation between transformation, storage, and notification
+ * - Error handling at each step to prevent data loss
+ * 
+ * MAIN ENTRY POINTS:
+ * - processWALChanges: Handle transformation and storage
+ * - processAndConsumeWALChanges: Complete flow including LSN management and client notification
+ */
+
+const MODULE_NAME = 'process-changes';
+
+/**
+ * Client state persisted in KV storage
+ */
+export interface ClientState {
+  clientId: string;
+  active: boolean;
+  lastSeen: number;
+}
+
+/**
+ * Check if a table should be tracked for replication
+ * Uses SERVER_DOMAIN_TABLES to determine which tables should be tracked
+ */
+export function shouldTrackTable(tableName: string): boolean {
+  // Skip the change_history table itself to avoid recursive loops
+  if (tableName === 'change_history') {
+    return false;
+  }
+  
+  // Use SERVER_DOMAIN_TABLES to determine which tables should be tracked
+  // The array contains quoted table names like '"users"', so we need to handle that
+  const normalizedTableName = `"${tableName}"`;
+  
+  // Check if the normalized name is in the domain tables
+  // Using type casting to handle the type mismatch
+  return SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
+}
+
+/**
+ * Validates if a WAL change contains the necessary data to be processed.
+ * Checks for schema, table, and column data presence.
+ */
+export function isValidTableChange(
+  change: NonNullable<PostgresWALMessage['change']>[number] | undefined,
+  lsn: string
+): boolean {
+  if (!change?.schema || !change?.table) {
+    // Skip debug logging for common filter cases
+    return false;
+  }
+  
+  // Check if this is a table we should track
+  if (!shouldTrackTable(change.table)) {
+    return false;
+  }
+
+  // For DELETE operations, we don't require column data
+  if (change.kind === 'delete') {
+    // For deletes, we still need to identify which record was deleted
+    if (!change.oldkeys) {
+      // Skip detailed debug logging
+      return false;
+    }
+    return true;
+  }
+
+  // For INSERT and UPDATE operations, we need column data
+  if (!change.columnnames || !change.columnvalues) {
+    // Skip detailed debug logging
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Transforms WAL data into our standardized TableChange format.
+ * Returns null for invalid or unparseable changes.
+ */
+export function transformWALToTableChange(wal: WALData): { change: TableChange | null; reason?: string } {
+  try {
+    // Parse WAL data
+    const parsedData = wal.data ? JSON.parse(wal.data) as PostgresWALMessage : null;
+    if (!parsedData?.change || !Array.isArray(parsedData.change)) {
+      return { change: null, reason: 'Invalid WAL data structure' };
+    }
+
+    // Get the first change
+    const change = parsedData.change[0];
+    
+    // Validate the change structure
+    if (!change?.schema || !change?.table) {
+      return { change: null, reason: 'Missing schema or table' };
+    }
+    
+    // Check if this is a table we should track
+    if (!shouldTrackTable(change.table)) {
+      return { change: null, reason: `Table ${change.table} not in tracked tables` };
+    }
+
+    // For DELETE operations, we don't require column data
+    if (change.kind === 'delete') {
+      // For deletes, we still need to identify which record was deleted
+      if (!change.oldkeys) {
+        return { change: null, reason: 'Delete operation missing oldkeys' };
+      }
+    } else {
+      // For INSERT and UPDATE operations, we need column data
+      if (!change.columnnames || !change.columnvalues) {
+        return { change: null, reason: 'Insert/Update operation missing column data' };
+      }
+    }
+
+    // Handle data differently based on operation type
+    let data: Record<string, unknown> = {};
+    
+    if (change.kind === 'delete') {
+      // For deletes, use oldkeys to identify the deleted record
+      if (change.oldkeys) {
+        data = change.oldkeys.keyvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
+          acc[change.oldkeys!.keynames[index]] = value;
+          return acc;
+        }, {});
+      }
+    } else {
+      // For inserts and updates, use column data
+      if (change.columnnames && change.columnvalues) {
+        data = change.columnvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
+          acc[change.columnnames![index]] = value;
+          return acc;
+        }, {});
+      }
+    }
+
+    // Get timestamp from data or use current time
+    const timestamp = data.updated_at as string || new Date().toISOString();
+
+    // Return in our universal format
+    return {
+      change: {
+        table: change.table,
+        operation: change.kind,
+        data,
+        lsn: wal.lsn,
+        updated_at: timestamp
+      }
+    };
+  } catch (error) {
+    return { 
+      change: null, 
+      reason: `Error transforming WAL data: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+/**
+ * Transforms an array of WAL changes to TableChange objects.
+ * Filters out invalid changes.
+ */
+export function transformWALChanges(changes: WALData[]): { tableChanges: TableChange[], filteredReasons: Record<string, number> } {
+  const results = changes.map(transformWALToTableChange);
+  const tableChanges = results
+    .map(result => result.change)
+    .filter((change): change is TableChange => change !== null);
+  
+  // Count reasons for filtering
+  const filteredReasons = results
+    .filter(result => result.change === null && result.reason)
+    .reduce((acc, result) => {
+      const reason = result.reason!;
+      acc[reason] = (acc[reason] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+  
+  return { tableChanges, filteredReasons };
+}
+
+/**
+ * Stores transformed changes in the change_history table.
+ * Returns true if successful, false otherwise.
+ */
+export async function storeChangesInHistory(
+  context: MinimalContext, 
+  changes: TableChange[],
+  storeBatchSize: number = 100
+): Promise<boolean> {
+  // Skip if no changes to store
+  if (changes.length === 0) {
+    return true;
+  }
+  
+  try {
+    // Get database client
+    const client = getDBClient(context);
+    await client.connect();
+    
+    // Start transaction
+    await client.query('BEGIN');
+    
+    // Insert changes in batches to prevent parameter limit issues
+    const BATCH_SIZE = storeBatchSize;
+    
+    for (let i = 0; i < changes.length; i += BATCH_SIZE) {
+      const batch = changes.slice(i, i + BATCH_SIZE);
+      
+      // Build parameterized query for this batch
+      const values = batch.map((change, index) => {
+        const baseIndex = index * 5;
+        return `($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, $${baseIndex + 5}::timestamptz)`;
+      }).join(', ');
+      
+      const params: any[] = [];
+      batch.forEach(change => {
+        params.push(
+          change.table,
+          change.operation,
+          JSON.stringify(change.data),
+          change.lsn,
+          change.updated_at
+        );
+      });
+      
+      const query = `
+        INSERT INTO change_history 
+          (table_name, operation, data, lsn, timestamp) 
+        VALUES 
+          ${values}
+        ON CONFLICT DO NOTHING;
+      `;
+      
+      await client.query(query, params);
+    }
+    
+    // Commit transaction
+    await client.query('COMMIT');
+    
+    // Log only the final result
+    replicationLogger.info('Changes stored successfully', { 
+      count: changes.length
+    }, MODULE_NAME);
+    
+    return true;
+  } catch (error) {
+    // Log only the error
+    replicationLogger.error('Failed to store changes', {
+      error: error instanceof Error ? error.message : String(error),
+      count: changes.length
+    }, MODULE_NAME);
+    
+    // Attempt to rollback transaction if it exists
+    try {
+      const client = getDBClient(context);
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      replicationLogger.error('Rollback failed', {
+        error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+      }, MODULE_NAME);
+    }
+    
+    return false;
+  }
+}
+
+/**
+ * Get all active clients directly from KV storage
+ * Filters out inactive and stale clients
+ */
+export async function getActiveClients(env: Env, timeout = 10 * 60 * 1000): Promise<ClientState[]> {
+  try {
+    const { keys } = await env.CLIENT_REGISTRY.list({ prefix: 'client:' });
+    const activeClients: ClientState[] = [];
+    const now = Date.now();
+    
+    for (const key of keys) {
+      const value = await env.CLIENT_REGISTRY.get(key.name);
+      if (!value) continue;
+      
+      try {
+        const state = JSON.parse(value);
+        const clientId = key.name.replace('client:', '');
+        const lastSeen = state.lastSeen || 0;
+        const timeSinceLastSeen = now - lastSeen;
+        
+        // Only include active, non-stale clients
+        if (state.active && timeSinceLastSeen <= timeout) {
+          activeClients.push({
+            clientId,
+            active: true,
+            lastSeen
+          });
+        }
+      } catch (err) {
+        replicationLogger.error('Client parse error', {
+          key: key.name,
+          error: err instanceof Error ? err.message : String(err)
+        }, MODULE_NAME);
+      }
+    }
+    
+    replicationLogger.debug('Active clients retrieved', { 
+      count: activeClients.length 
+    }, MODULE_NAME);
+    
+    return activeClients;
+  } catch (error) {
+    replicationLogger.error('Client retrieval failed', {
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
+    return [];
+  }
+}
+
+/**
+ * Check if there are any active clients
+ * Fast path to avoid unnecessary processing when no clients are connected
+ */
+export async function hasActiveClients(env: Env): Promise<boolean> {
+  try {
+    const activeClients = await getActiveClients(env);
+    return activeClients.length > 0;
+  } catch (error) {
+    replicationLogger.error('Active clients check failed', {
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
+    return false;
+  }
+}
+
+/**
+ * Broadcasts changes to connected clients directly
+ * Uses SyncDO for each active client
+ */
+export async function broadcastChangesToClients(
+  env: Env,
+  changes: TableChange[],
+  lastLSN: string
+): Promise<boolean> {
+  try {
+    // Skip broadcasting if no changes
+    if (changes.length === 0) {
+      return true;
+    }
+    
+    // Get active clients to notify about changes
+    const activeClients = await getActiveClients(env);
+    
+    // Track successful notifications
+    let notifiedCount = 0;
+    
+    // Process each client
+    for (const client of activeClients) {
+      try {
+        // Wake the client's SyncDO using the ClientState
+        const { clientId } = client;
+        
+        // Make request to client's SyncDO for real-time updates
+        const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
+        const clientDo = env.SYNC.get(clientDoId);
+        
+        // For Durable Objects, create a proper Request object
+        try {
+          // Create a new Request object
+          const newRequest = new Request(
+            `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                changes: changes,
+                lsn: lastLSN
+              })
+            }
+          );
+          
+          // Send the request to the Durable Object
+          const response = await clientDo.fetch(newRequest);
+          
+          // Count successful responses
+          if (response.status === 200) {
+            notifiedCount++;
+          }
+        } catch (error) {
+          replicationLogger.debug('Client notification failed', {
+            clientId,
+            error: error instanceof Error ? error.message : String(error)
+          }, MODULE_NAME);
+        }
+      } catch (error) {
+        // Just count failures, no need to log each one
+      }
+    }
+    
+    // Log broadcast result
+    replicationLogger.info('Broadcast complete', {
+      totalClients: activeClients.length,
+      notifiedCount,
+      changeCount: changes.length,
+      lastLSN
+    }, MODULE_NAME);
+    
+    return true;
+  } catch (error) {
+    replicationLogger.error('Broadcast failed', {
+      error: error instanceof Error ? error.message : String(error),
+      changeCount: changes.length
+    }, MODULE_NAME);
+    return false;
+  }
+}
+
+/**
+ * Process changes and broadcast to clients
+ * This is the main entry point for processing changes without consuming WAL
+ */
+export async function processChanges(
+  changes: WALData[],
+  env: Env,
+  context: MinimalContext,
+  stateManager: StateManager,
+  storeBatchSize?: number
+): Promise<{ success: boolean, storedChanges: boolean, changeCount?: number, needsMorePolling?: boolean, filteredCount?: number, lastLSN: string }> {
+  // Early return if no changes
+  if (!changes || changes.length === 0) {
+    return { success: true, storedChanges: false, needsMorePolling: false, lastLSN: '' };
+  }
+
+  // Get the lastLSN from the changes
+  const lastLSN = changes[changes.length - 1].lsn;
+  
+  // Check if we likely hit the batch limit
+  const likelyMoreChanges = changes.length >= 1000;
+
+  try {
+    // ====== STEP 1: TRANSFORM ======
+    // Convert WAL changes to TableChange format and filter invalid ones
+    const { tableChanges, filteredReasons } = transformWALChanges(changes);
+    
+    // Calculate how many changes were filtered out
+    const filteredCount = changes.length - tableChanges.length;
+    
+    // If many changes were filtered, log this at debug level with reasons
+    if (filteredCount > 0) {
+      replicationLogger.debug('Changes filtered', {
+        originalCount: changes.length,
+        validCount: tableChanges.length,
+        filteredCount,
+        reasons: filteredReasons
+      }, MODULE_NAME);
+    }
+    
+    // Early return if no valid changes after transformation
+    if (tableChanges.length === 0) {
+      await stateManager.setLSN(lastLSN);
+      return { 
+        success: true, 
+        storedChanges: false,
+        changeCount: 0,
+        needsMorePolling: likelyMoreChanges,
+        filteredCount,
+        lastLSN
+      };
+    }
+    
+    // ====== STEP 2: STORE ======
+    // Store the transformed changes in the change_history table
+    const storedSuccessfully = await storeChangesInHistory(context, tableChanges, storeBatchSize);
+    
+    if (!storedSuccessfully) {
+      replicationLogger.warn('Storage failed for domain changes', {
+        lsn: lastLSN
+      }, MODULE_NAME);
+      
+      await stateManager.setLSN(lastLSN);
+      replicationLogger.debug('LSN updated despite storage failure', {
+        lsn: lastLSN
+      }, MODULE_NAME);
+      
+      return { 
+        success: true, 
+        storedChanges: false, 
+        changeCount: tableChanges.length,
+        needsMorePolling: likelyMoreChanges,
+        filteredCount,
+        lastLSN
+      };
+    }
+    
+    try {
+      await stateManager.setLSN(lastLSN);
+      replicationLogger.debug('LSN updated', {
+        lsn: lastLSN,
+        changeCount: tableChanges.length
+      }, MODULE_NAME);
+    } catch (lsnError) {
+      replicationLogger.error('LSN update failed', {
+        error: lsnError instanceof Error ? lsnError.message : String(lsnError),
+        lsn: lastLSN
+      }, MODULE_NAME);
+    }
+    
+    await broadcastChangesToClients(env, tableChanges, lastLSN);
+    
+    return { 
+      success: true, 
+      storedChanges: storedSuccessfully,
+      changeCount: tableChanges.length,
+      needsMorePolling: likelyMoreChanges,
+      filteredCount,
+      lastLSN
+    };
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    
+    if (errorMsg.includes('replication slot') && errorMsg.includes('is active for PID')) {
+      replicationLogger.debug('Replication slot in use', {
+        error: errorMsg
+      }, MODULE_NAME);
+      
+      return {
+        success: true,
+        storedChanges: false,
+        changeCount: changes.length,
+        needsMorePolling: false,
+        filteredCount: 0,
+        lastLSN
+      };
+    }
+    
+    replicationLogger.error('Change processing failed', {
+      error: errorMsg,
+      lsn: lastLSN
+    }, MODULE_NAME);
+    
+    return {
+      success: false,
+      storedChanges: false,
+      changeCount: changes.length,
+      needsMorePolling: false,
+      filteredCount: 0,
+      lastLSN
+    };
+  }
+} 

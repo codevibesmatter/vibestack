@@ -4,7 +4,8 @@ import type {
   ServerChangesMessage,
   ServerStateChangeMessage,
   ServerLSNUpdateMessage,
-  ServerSyncCompletedMessage
+  ServerSyncCompletedMessage,
+  ServerCatchupCompletedMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
@@ -125,9 +126,9 @@ export function createCatchupSyncCompletion(
   startLSN: string,
   finalLSN: string,
   changeCount: number
-): ServerSyncCompletedMessage {
+): ServerCatchupCompletedMessage {
   return {
-    type: 'srv_sync_completed',
+    type: 'srv_catchup_completed',
     messageId: `srv_${Date.now()}_completion`,
     timestamp: Date.now(),
     clientId,
@@ -145,9 +146,9 @@ export function createCatchupSyncError(
   clientId: string,
   startLSN: string,
   error: Error | string
-): ServerSyncCompletedMessage {
+): ServerCatchupCompletedMessage {
   return {
-    type: 'srv_sync_completed',
+    type: 'srv_catchup_completed',
     messageId: `srv_${Date.now()}_completion`,
     timestamp: Date.now(),
     clientId,

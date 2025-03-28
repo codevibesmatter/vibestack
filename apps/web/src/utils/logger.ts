@@ -120,7 +120,7 @@ export class ChangesLogger {
    * Log a batch of changes being processed
    */
   public logBatchProcessing(count: number): void {
-    this.logger.info(`Processing batch of ${count} changes`);
+    this.logger.debug(`Processing ${count} changes`);
   }
   
   /**

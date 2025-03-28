@@ -16,7 +16,7 @@ import { getDBClient } from '../lib/db';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 import { AppBindings, createMinimalContext, MinimalContext } from '../types/hono';
 import { StateManager } from './state-manager';
-import { getActiveClients, hasActiveClients } from './process-changes';
+import { getAllClientIds } from './process-changes';
 
 const MODULE_NAME = 'DO';
 
@@ -406,11 +406,11 @@ export class ReplicationDO implements DurableObject {
     const c = this.getContext();
     
     try {
-      const clients = await getActiveClients(this.env);
+      const clientIds = await getAllClientIds(this.env);
       
       return new Response(JSON.stringify({
         success: true,
-        clients
+        clients: clientIds.map((id: string) => ({ clientId: id }))
       }), {
         status: 200,
         headers: {

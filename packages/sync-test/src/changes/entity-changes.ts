@@ -228,11 +228,41 @@ export async function createMixedChanges(
   const entityPromises = Object.entries(entityCounts).map(async ([entityType, entityCount]) => {
     if (!entityCount) return [entityType, { created: [], updated: [], deleted: [] }];
     
+    // Create one less than requested to account for the duplicate we'll add
+    const baseCount = Math.max(1, entityCount - 1);
     const result = await createMixedEntityChanges(
       sql, 
       entityType as EntityType,
-      entityCount
+      baseCount
     );
+    
+    // Force a duplicate change for this entity type
+    // We'll duplicate the last created entity if available, otherwise the last updated
+    let duplicateId: string | undefined;
+    if (result.created && result.created.length > 0) {
+      duplicateId = result.created[result.created.length - 1];
+    } else if (result.updated && result.updated.length > 0) {
+      duplicateId = result.updated[result.updated.length - 1];
+    }
+    
+    if (duplicateId) {
+      console.log(`Forcing duplicate change for ${entityType} with ID: ${duplicateId}`);
+      
+      // Create a duplicate change based on the original operation type
+      if (result.created && result.created.includes(duplicateId)) {
+        // If it was created, create it again
+        const duplicateResult = await createBulkEntityChanges(sql, entityType as EntityType, 1);
+        if (duplicateResult.length > 0) {
+          result.created.push(duplicateResult[0]);
+        }
+      } else if (result.updated && result.updated.includes(duplicateId)) {
+        // If it was updated, update it again
+        const duplicateResult = await updateBulkEntityChanges(sql, entityType as EntityType, 1);
+        if (duplicateResult.length > 0) {
+          result.updated.push(duplicateResult[0]);
+        }
+      }
+    }
     
     return [entityType, result];
   });

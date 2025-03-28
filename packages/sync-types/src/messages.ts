@@ -13,7 +13,8 @@ export type SrvMessageType =
   | 'srv_lsn_update'      // Server LSN update notification
   | 'srv_changes_received' // Server acknowledges receipt of changes
   | 'srv_changes_applied'  // Server signals changes were applied
-  | 'srv_sync_completed';  // Server signals catchup sync completed with summary
+  | 'srv_sync_completed'   // Generic sync completion (for live sync)
+  | 'srv_catchup_completed'; // Catchup sync completion
 
 export type CltMessageType =
   | 'clt_sync_request'      // Client requests sync
@@ -108,6 +109,15 @@ export interface ServerSyncCompletedMessage extends ServerMessage {
   error?: string;         // Error message if any
 }
 
+export interface ServerCatchupCompletedMessage extends ServerMessage {
+  type: 'srv_catchup_completed';
+  startLSN: string;       // Starting LSN for the catchup sync
+  finalLSN: string;       // Final LSN after catchup sync
+  changeCount: number;    // Total number of changes sent
+  success: boolean;       // Whether catchup sync completed successfully
+  error?: string;         // Error message if any
+}
+
 // Client message interfaces
 export interface ClientMessage extends BaseMessage {
   type: CltMessageType;
@@ -154,6 +164,9 @@ export interface ClientCatchupReceivedMessage extends ClientMessage {
 }
 
 // Union types for all messages
-export type Message = ServerMessage | ClientMessage;
+export type Message = 
+  | ServerMessage 
+  | ServerCatchupCompletedMessage
+  | ClientMessage;
 
 // No need for named exports since these are already exported at declaration

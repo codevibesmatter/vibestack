@@ -12,6 +12,7 @@ import type {
 
 export interface Config {
   wsUrl: string;
+  baseUrl: string;
   connectTimeout: number;
   syncWaitTime: number;
   changeWaitTime: number;

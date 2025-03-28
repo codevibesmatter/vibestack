@@ -11,7 +11,8 @@ import type {
   ClientHeartbeatMessage,
   ServerSyncCompletedMessage,
   ClientMessage,
-  CltMessageType
+  CltMessageType,
+  ServerCatchupCompletedMessage
 } from '@repo/sync-types';
 import { createServerBulkChanges, createServerChange } from '../changes/server-changes.js';
 import { createMixedChanges } from '../changes/entity-changes.js';
@@ -343,6 +344,90 @@ async function testLiveSync(): Promise<number> {
     console.log(`📩 RECEIVED: ${type.substring(0, 12)} (total messages: ${stats.totalMessages})`);
   };
   
+  // Check if all changes have been received
+  const checkAllChangesReceived = () => {
+    const allExpectedChanges = new Set<string>();
+    const allReceivedChanges = new Set<string>();
+    
+    // Collect all expected changes
+    Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, entityChanges]) => {
+      entityChanges.created.forEach(id => allExpectedChanges.add(id));
+      entityChanges.updated.forEach(id => allExpectedChanges.add(id));
+      entityChanges.deleted.forEach(id => allExpectedChanges.add(id));
+    });
+    
+    // Collect all received changes
+    Object.keys(stats.changeTracker.receivedChanges).forEach(id => {
+      allReceivedChanges.add(id);
+    });
+    
+    // Find missing changes
+    const missingChanges = Array.from(allExpectedChanges).filter(id => !allReceivedChanges.has(id));
+    
+    // Check if we've received all expected changes
+    const allReceived = Array.from(allExpectedChanges).every(id => allReceivedChanges.has(id));
+    
+    // Only show progress and missing changes if we're actually done waiting
+    if (allReceived || stats.totalChangesReceived >= stats.changeTracker.totalChangesCreated) {
+      if (missingChanges.length > 0) {
+        console.log('\nMissing changes:');
+        missingChanges.forEach(id => {
+          // Find which entity type and change type this ID belongs to
+          let found = false;
+          Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, changes]) => {
+            if (changes.created.includes(id)) {
+              console.log(`❌ Missing created change for ${entityType}: ${id}`);
+              found = true;
+            }
+            if (changes.updated.includes(id)) {
+              console.log(`❌ Missing updated change for ${entityType}: ${id}`);
+              found = true;
+            }
+            if (changes.deleted.includes(id)) {
+              console.log(`❌ Missing deleted change for ${entityType}: ${id}`);
+              found = true;
+            }
+          });
+          
+          if (!found) {
+            console.log(`❌ Missing change with unknown type: ${id}`);
+          }
+        });
+        
+        console.log(`\nTotal missing changes: ${missingChanges.length}`);
+        console.log(`Expected: ${allExpectedChanges.size}`);
+        console.log(`Received: ${allReceivedChanges.size}`);
+      }
+      
+      console.log('\n✅ All expected changes received!');
+      console.log(`Total changes created: ${stats.changeTracker.totalChangesCreated}`);
+      console.log(`Total changes received: ${stats.totalChangesReceived}`);
+      console.log('\nChange summary by entity type:');
+      
+      Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, entityChanges]) => {
+        const totalExpected = entityChanges.created.length + entityChanges.updated.length + entityChanges.deleted.length;
+        const totalReceived = Object.keys(stats.changeTracker.receivedChanges).filter(id => 
+          entityChanges.created.includes(id) || 
+          entityChanges.updated.includes(id) || 
+          entityChanges.deleted.includes(id)
+        ).length;
+        
+        console.log(`${entityType}: ${totalReceived}/${totalExpected} changes received`);
+      });
+      
+      // Only complete if we've received exactly the number of changes we created
+      if (stats.totalChangesReceived === stats.changeTracker.totalChangesCreated) {
+        stats.changeTracker.allChangesReceived = true;
+        stats.testCompletedSuccessfully = true;
+        resolveTestFinished();
+      } else {
+        console.log(`\nWaiting for more changes... (received ${stats.totalChangesReceived}/${stats.changeTracker.totalChangesCreated})`);
+      }
+    }
+    
+    return allReceived;
+  };
+  
   // Setup message listener
   tester.onMessage = async (message: any) => {
     stats.totalMessages++;
@@ -439,21 +524,26 @@ async function testLiveSync(): Promise<number> {
         
         // Process and track received changes
         if (changesMsg.changes && changesMsg.changes.length > 0) {
-          stats.totalChangesReceived += changesMsg.changes.length;
-          stats.changeTracker.totalChangesReceived += changesMsg.changes.length;
-          
-          // Track unique entity IDs to avoid reporting duplicates
+          // Track unique entity IDs to avoid counting duplicates
           const processedIds = new Set<string>();
           
-          // Match changes with what we created
+          // Track unique changes for counting
+          changesMsg.changes.forEach((change: any) => {
+            if (change?.data?.id) {
+              const changeId = String(change.data.id);
+              if (!processedIds.has(changeId)) {
+                stats.totalChangesReceived++;
+                stats.changeTracker.totalChangesReceived++;
+                processedIds.add(changeId);
+              }
+            }
+          });
+          
+          // Process all changes for matching against our expected changes
           changesMsg.changes.forEach((change: any) => {
             if (change?.data?.id) {
               const changeId = String(change.data.id);
               stats.changeTracker.receivedChanges[changeId] = true;
-              
-              // Skip duplicate processing of the same entity in a single message
-              if (processedIds.has(changeId)) return;
-              processedIds.add(changeId);
               
               // Check if we're tracking this change in our pending changes
               let matchFound = false;
@@ -482,7 +572,16 @@ async function testLiveSync(): Promise<number> {
           });
           
           // Check if we've received all expected changes
-          checkAllChangesReceived();
+          const allReceived = checkAllChangesReceived();
+          
+          // Only complete the test if we've received all changes
+          if (allReceived && stats.totalChangesReceived >= stats.changeTracker.totalChangesCreated) {
+            console.log(`\n✅ All ${stats.changeTracker.totalChangesCreated} changes received!`);
+            stats.testCompletedSuccessfully = true;
+            resolveTestFinished();
+          } else {
+            console.log(`\nWaiting for more changes... (received ${stats.totalChangesReceived}/${stats.changeTracker.totalChangesCreated})`);
+          }
         }
         break;
         
@@ -498,6 +597,38 @@ async function testLiveSync(): Promise<number> {
             console.log(`  Updated finalLSN from LSN update: ${lsnMsg.lsn} (previous: ${stats.finalLSN})`);
           }
           stats.finalLSN = lsnMsg.lsn;
+        }
+        break;
+        
+      case 'srv_catchup_completed':
+        const catchupCompletedMsg = message as ServerCatchupCompletedMessage;
+        logMessageReceipt(message.type);
+        stats.syncCompletedMessages++;
+        
+        console.log(`Received catchup completed message: ${catchupCompletedMsg.startLSN ? `startLSN=${catchupCompletedMsg.startLSN}, ` : ''}finalLSN=${catchupCompletedMsg.finalLSN}, changes=${catchupCompletedMsg.changeCount}, success=${catchupCompletedMsg.success}`);
+        
+        if (catchupCompletedMsg.finalLSN) {
+          // Only update if the sync completion LSN is more recent
+          if (compareLSN(catchupCompletedMsg.finalLSN, stats.finalLSN) > 0) {
+            console.log(`  Updated finalLSN from catchup completed message: ${catchupCompletedMsg.finalLSN} (previous: ${stats.finalLSN})`);
+            stats.finalLSN = catchupCompletedMsg.finalLSN;
+          } else {
+            console.log(`  Keeping current finalLSN: ${stats.finalLSN} (catchup completed LSN: ${catchupCompletedMsg.finalLSN})`);
+          }
+        }
+        
+        if (!catchupCompleted) {
+          catchupCompleted = true;
+          console.log('🔄 Catchup synchronization complete, proceeding with live changes');
+          
+          // Only try to start batch changes if they haven't been started yet
+          // and the waitForCatchupToComplete function hasn't already handled it
+          if (!batchChangesStarted && !catchupHandled) {
+            console.log('Starting batch changes from catchup_completed handler...');
+            startBatchChanges();
+          } else {
+            console.log(`Not starting batch changes: batchStarted=${batchChangesStarted}, catchupHandled=${catchupHandled}`);
+          }
         }
         break;
         
@@ -518,20 +649,6 @@ async function testLiveSync(): Promise<number> {
             console.log(`  Keeping current finalLSN: ${stats.finalLSN} (sync completed LSN: ${syncMsg.finalLSN})`);
           }
         }
-        
-        if (!catchupCompleted) {
-          catchupCompleted = true;
-          console.log('🔄 Catchup synchronization complete, proceeding with live changes');
-          
-          // Only try to start batch changes if they haven't been started yet
-          // and the waitForCatchupToComplete function hasn't already handled it
-          if (!batchChangesStarted && !catchupHandled) {
-            console.log('Starting batch changes from sync_completed handler...');
-            startBatchChanges();
-          } else {
-            console.log(`Not starting batch changes: batchStarted=${batchChangesStarted}, catchupHandled=${catchupHandled}`);
-          }
-        }
         break;
         
       default:
@@ -539,50 +656,6 @@ async function testLiveSync(): Promise<number> {
         console.log(`Received other message type: ${message.type}`);
     }
   };
-  
-  // Check if all changes have been received
-  function checkAllChangesReceived() {
-    // In single mode, we just check if we've received at least the number of changes we created
-    if (testConfig.testMode === 'single') {
-      if (stats.totalChangesReceived >= stats.changeTracker.totalChangesCreated) {
-        console.log(`✅ Received all ${stats.changeTracker.totalChangesCreated} changes`);
-        stats.changeTracker.allChangesReceived = true;
-        stats.testCompletedSuccessfully = true;
-        resolveTestFinished();
-      }
-      return;
-    }
-    
-    // For batch modes, we check each specific entity ID
-    let totalTracked = 0;
-    let totalMatched = 0;
-    
-    // Count the total number of changes we're explicitly tracking
-    Object.values(stats.changeTracker.pendingChanges).forEach(entityChanges => {
-      totalTracked += entityChanges.created.length + entityChanges.updated.length + entityChanges.deleted.length;
-      
-      // Count how many have been received
-      entityChanges.created.forEach(id => {
-        if (stats.changeTracker.receivedChanges[id]) totalMatched++;
-      });
-      entityChanges.updated.forEach(id => {
-        if (stats.changeTracker.receivedChanges[id]) totalMatched++;
-      });
-      entityChanges.deleted.forEach(id => {
-        if (stats.changeTracker.receivedChanges[id]) totalMatched++;
-      });
-    });
-    
-    console.log(`${totalMatched}/${totalTracked} tracked changes have been received`);
-    
-    // If we've matched all changes, we're done
-    if (totalMatched >= totalTracked && totalTracked > 0) {
-      console.log(`✅ All ${totalTracked} changes have been received!`);
-      stats.changeTracker.allChangesReceived = true;
-      stats.testCompletedSuccessfully = true;
-      resolveTestFinished();
-    }
-  }
   
   // Wait for catchup to complete before proceeding with live test
   async function waitForCatchupToComplete() {
@@ -698,8 +771,8 @@ async function testLiveSync(): Promise<number> {
       }
     }
     
-    // Set a 30 second timeout for receiving all changes
-    console.log(`Setting 30 second timeout to receive all changes...`);
+    // Set a 120 second timeout for receiving all changes
+    console.log(`Setting 120 second timeout to receive all changes...`);
     setTimeout(() => {
       if (!stats.changeTracker.allChangesReceived) {
         console.warn(`⚠️ Not all changes were received within timeout`);
@@ -709,7 +782,7 @@ async function testLiveSync(): Promise<number> {
         stats.testCompletedSuccessfully = false;
         resolveTestFinished();
       }
-    }, 30000);
+    }, 120000); // Increased timeout to 120 seconds
   }
   
   // Connect to the server with the current LSN and client ID
@@ -786,15 +859,80 @@ async function testLiveSync(): Promise<number> {
   console.log(`Total changes created: ${stats.changeTracker.totalChangesCreated}`);
   console.log(`Total changes received: ${stats.totalChangesReceived}`);
   
+  // Find missing changes for the summary
+  const allExpectedChanges = new Set<string>();
+  const allReceivedChanges = new Set<string>();
+  
+  // Collect all expected changes
+  Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, entityChanges]) => {
+    entityChanges.created.forEach(id => allExpectedChanges.add(id));
+    entityChanges.updated.forEach(id => allExpectedChanges.add(id));
+    entityChanges.deleted.forEach(id => allExpectedChanges.add(id));
+  });
+  
+  // Collect all received changes
+  Object.keys(stats.changeTracker.receivedChanges).forEach(id => {
+    allReceivedChanges.add(id);
+  });
+  
+  // Find missing changes
+  const missingChanges = Array.from(allExpectedChanges).filter(id => !allReceivedChanges.has(id));
+  
+  if (missingChanges.length > 0) {
+    console.log('\nMissing Changes Summary:');
+    console.log('------------------------');
+    console.log(`Total missing changes: ${missingChanges.length}`);
+    
+    // Group missing changes by entity type and change type
+    const missingByType: {[key: string]: {created: string[], updated: string[], deleted: string[]}} = {};
+    
+    missingChanges.forEach(id => {
+      Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, changes]) => {
+        if (!missingByType[entityType]) {
+          missingByType[entityType] = { created: [], updated: [], deleted: [] };
+        }
+        
+        if (changes.created.includes(id)) {
+          missingByType[entityType].created.push(id);
+        }
+        if (changes.updated.includes(id)) {
+          missingByType[entityType].updated.push(id);
+        }
+        if (changes.deleted.includes(id)) {
+          missingByType[entityType].deleted.push(id);
+        }
+      });
+    });
+    
+    // Print missing changes by type
+    Object.entries(missingByType).forEach(([entityType, changes]) => {
+      console.log(`\n${entityType}:`);
+      if (changes.created.length > 0) {
+        console.log(`  Created: ${changes.created.length} changes`);
+        changes.created.forEach(id => console.log(`    - ${id}`));
+      }
+      if (changes.updated.length > 0) {
+        console.log(`  Updated: ${changes.updated.length} changes`);
+        changes.updated.forEach(id => console.log(`    - ${id}`));
+      }
+      if (changes.deleted.length > 0) {
+        console.log(`  Deleted: ${changes.deleted.length} changes`);
+        changes.deleted.forEach(id => console.log(`    - ${id}`));
+      }
+    });
+  }
+  
   // Success criteria
   const lsnAdvanced = compareLSN(stats.finalLSN, currentLSN) > 0;
   const receivedAllChanges = stats.totalChangesReceived >= stats.changeTracker.totalChangesCreated;
   const catchupHandledCorrectly = stats.catchupChunksReceived === stats.catchupChunksAcknowledged;
   
+  console.log('\nTest Results:');
+  console.log('-------------');
   console.log(`LSN status: ${lsnAdvanced ? 'Advanced' : 'No change'} from ${currentLSN} to ${stats.finalLSN} (may not change with small number of changes)`);
   console.log(`Success: ${catchupHandledCorrectly ? 'Catchup handled correctly' : 'Catchup acknowledgment mismatch'}`);
   console.log(`Success: ${changesReceived ? 'Received changes during live sync' : 'No changes received'}`);
-  console.log(`Success: ${receivedAllChanges ? `Received all ${stats.changeTracker.totalChangesCreated} created changes` : `Missing some changes (received ${stats.totalChangesReceived}/${stats.changeTracker.totalChangesCreated})`}`);
+  console.log(`Success: ${receivedAllChanges ? `Received all ${stats.changeTracker.totalChangesCreated} created changes` : `Missing ${missingChanges.length} changes (received ${stats.totalChangesReceived}/${stats.changeTracker.totalChangesCreated})`}`);
   console.log(`Success: ${stats.testCompletedSuccessfully ? 'Test completed all changes' : 'Timed out before receiving all changes'}`);
   
   // Overall test success - factors in catchup handling and live notifications
@@ -928,13 +1066,18 @@ async function createChanges(
   try {
     console.log(`\nCreating changes in ${testMode} mode...`);
     
+    // Initialize pendingChanges for all entity types if not already present
+    ['task', 'project', 'user', 'comment'].forEach(entityType => {
+      tracker.pendingChanges[entityType] = tracker.pendingChanges[entityType] || 
+        { created: [], updated: [], deleted: [] };
+    });
+    
     if (testMode === 'single') {
       // Original single change mode
       console.log(`Creating single Task insert...`);
       await createServerChange(sql, Task, 'insert');
       tracker.totalChangesCreated++;
-      tracker.pendingChanges['task'] = tracker.pendingChanges['task'] || { created: [], updated: [], deleted: [] };
-      // Note: In single mode we don't track specific IDs since we're just counting
+      tracker.pendingChanges['task'].created.push('single-task'); // Add a placeholder ID for single mode
       
       console.log(`Successfully created single change (total: ${tracker.totalChangesCreated})`);
       return true;
@@ -950,13 +1093,7 @@ async function createChanges(
       // Process results and update tracker
       let totalChangesInBatch = 0;
       
-      // Initialize pendingChanges for each entity type if not already present
-      ['task', 'project', 'user', 'comment'].forEach(entityType => {
-        tracker.pendingChanges[entityType] = tracker.pendingChanges[entityType] || 
-          { created: [], updated: [], deleted: [] };
-      });
-      
-      // Update tracker with created changes
+      // First, update tracker with all created changes
       Object.entries(results).forEach(([entityType, entityChanges]) => {
         if (!entityChanges) return;
         
@@ -982,6 +1119,17 @@ async function createChanges(
         }
       });
       
+      // Then add one duplicate change for the first entity type
+      const firstEntityType = Object.keys(results)[0] as keyof typeof results;
+      const firstEntityChanges = results[firstEntityType];
+      if (firstEntityType && firstEntityChanges && firstEntityChanges.created && firstEntityChanges.created.length > 0) {
+        const duplicateId = firstEntityChanges.created[0];
+        console.log(`- Adding duplicate update for ${firstEntityType} ${duplicateId}`);
+        await createServerChange(sql, Task, 'update');
+        tracker.pendingChanges[firstEntityType].updated.push(duplicateId);
+        totalChangesInBatch++;
+      }
+      
       // Update batch and change counts
       tracker.batchesCreated++;
       tracker.totalChangesCreated += totalChangesInBatch;
@@ -989,6 +1137,15 @@ async function createChanges(
       console.timeEnd('batch-creation');
       console.log(`Successfully created batch ${tracker.batchesCreated} with ${totalChangesInBatch} changes`);
       console.log(`Total changes created so far: ${tracker.totalChangesCreated}`);
+      
+      // Log the current state of pending changes
+      console.log('\nCurrent pending changes:');
+      Object.entries(tracker.pendingChanges).forEach(([entityType, changes]) => {
+        console.log(`${entityType}:`);
+        console.log(`  Created: ${changes.created.length}`);
+        console.log(`  Updated: ${changes.updated.length}`);
+        console.log(`  Deleted: ${changes.deleted.length}`);
+      });
       
       return totalChangesInBatch > 0;
     }

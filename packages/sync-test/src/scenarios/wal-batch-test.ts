@@ -227,22 +227,22 @@ async function verifyChangesAndWAL(
     // Compare with expected changes
     const expectedChanges: ExpectedChanges = {
       tasks: {
-        created: result.created.tasks.length,
+        created: result.created.tasks.filter(id => !result.deleted.tasks.includes(id)).length,
         updated: result.updated.tasks.filter(id => !result.deleted.tasks.includes(id)).length,
         deleted: result.deleted.tasks.length
       },
       projects: {
-        created: result.created.projects.length,
+        created: result.created.projects.filter(id => !result.deleted.projects.includes(id)).length,
         updated: result.updated.projects.filter(id => !result.deleted.projects.includes(id)).length,
         deleted: result.deleted.projects.length
       },
       users: {
-        created: result.created.users.length,
+        created: result.created.users.filter(id => !result.deleted.users.includes(id)).length,
         updated: result.updated.users.filter(id => !result.deleted.users.includes(id)).length,
         deleted: result.deleted.users.length
       },
       comments: {
-        created: result.created.comments.length,
+        created: result.created.comments.filter(id => !result.deleted.comments.includes(id)).length,
         updated: result.updated.comments.filter(id => !result.deleted.comments.includes(id)).length,
         deleted: result.deleted.comments.length
       }

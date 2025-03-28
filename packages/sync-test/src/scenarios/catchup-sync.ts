@@ -1,6 +1,6 @@
 import { SyncTester } from '../test-sync.js';
 import { DEFAULT_CONFIG } from '../config.js';
-import { Task } from '@repo/dataforge/server-entities';
+import { Task, Project, User, Comment } from '@repo/dataforge/server-entities';
 import { Client } from '@neondatabase/serverless';
 import type { DataSource } from 'typeorm';
 import type { 
@@ -9,7 +9,8 @@ import type {
   ServerLSNUpdateMessage,
   Message,
   ClientHeartbeatMessage,
-  ServerSyncCompletedMessage
+  ServerSyncCompletedMessage,
+  ServerCatchupCompletedMessage
 } from '@repo/sync-types';
 import fs from 'fs';
 import path from 'path';
@@ -18,10 +19,68 @@ import { neon } from '@neondatabase/serverless';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
-import { createMixedChanges } from '../changes/entity-changes.js';
+import { createServerChange } from '../changes/server-changes.js';
+import { generateFakeData } from '../utils/fake-data.js';
+import inquirer from 'inquirer';
+import { createMixedChanges, type EntityType } from '../changes/entity-changes.js';
 
 // Load environment variables from .env file
 config();
+
+// Define test mode types
+type TestMode = 'single' | 'batch' | 'custom';
+
+// Define change types
+type ChangeType = 'insert' | 'update' | 'delete';
+
+// Interface for entity changes
+interface EntityChanges {
+  created: string[];
+  updated: string[];
+  deleted: string[];
+}
+
+// Interface for change distribution
+interface ChangeDistribution {
+  [key: string]: number;
+}
+
+// Interface for change tracking
+interface ChangeTracker {
+  pendingChanges: {
+    [entityType: string]: {
+      created: string[];
+      updated: string[];
+      deleted: string[];
+    }
+  };
+  receivedChanges: {
+    [changeId: string]: boolean;
+  };
+  batchSize: number;
+  batchesCreated: number;
+  changeDistribution: {[key: string]: number};
+  totalChangesCreated: number;
+  totalChangesReceived: number;
+  allChangesReceived: boolean;
+  testMode: TestMode;
+}
+
+// Enhanced test statistics
+interface TestStats {
+  totalMessages: number;
+  changesMessages: number;
+  catchupMessages: number;
+  catchupChunksReceived: number;
+  catchupChunksAcknowledged: number;
+  lsnUpdateMessages: number;
+  syncCompletedMessages: number;
+  totalChangesReceived: number;
+  finalLSN: string;
+  clientId?: string;
+  testCompletedSuccessfully: boolean;
+  changeTracker: ChangeTracker;
+}
 
 // Define a type for the Neon client
 type SqlQueryFunction = ReturnType<typeof neon>;
@@ -194,6 +253,198 @@ async function initializeReplication(): Promise<boolean> {
 }
 
 /**
+ * Display an interactive menu to select test mode and configuration
+ */
+async function showTestMenu(): Promise<{
+  testMode: TestMode;
+  batchSize?: number;
+  distribution?: ChangeDistribution;
+}> {
+  console.log('\n========================================');
+  console.log('🔄 Catchup Sync Test Configuration');
+  console.log('========================================\n');
+  
+  // Select test mode
+  const { mode } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'mode',
+      message: 'Select test mode:',
+      choices: [
+        { name: 'Single Changes (Original Test)', value: 'single' },
+        { name: 'Batch Changes (Multiple entities)', value: 'batch' },
+        { name: 'Custom Configuration', value: 'custom' }
+      ]
+    }
+  ]);
+  
+  // Default configuration
+  let batchSize = 3;
+  let distribution: ChangeDistribution = { task: 0.5, project: 0.2, user: 0.2, comment: 0.1 };
+  
+  // If batch or custom mode, ask for batch size
+  if (mode === 'batch' || mode === 'custom') {
+    const batchSizeAnswer = await inquirer.prompt([
+      {
+        type: 'number',
+        name: 'size',
+        message: 'Enter batch size (number of changes to create):',
+        default: mode === 'batch' ? 10 : 3,
+        validate: (value) => value > 0 ? true : 'Please enter a number greater than 0'
+      }
+    ]);
+    
+    batchSize = batchSizeAnswer.size;
+    
+    // For custom mode, allow configuring distribution
+    if (mode === 'custom') {
+      console.log('\nEntity distribution (must sum to 1.0):');
+      const distributionAnswer = await inquirer.prompt([
+        {
+          type: 'number',
+          name: 'task',
+          message: 'Task percentage (0.0-1.0):',
+          default: 0.5,
+          validate: (value) => (value >= 0 && value <= 1) ? true : 'Please enter a number between 0 and 1'
+        },
+        {
+          type: 'number',
+          name: 'project',
+          message: 'Project percentage (0.0-1.0):',
+          default: 0.2,
+          validate: (value) => (value >= 0 && value <= 1) ? true : 'Please enter a number between 0 and 1'
+        },
+        {
+          type: 'number',
+          name: 'user',
+          message: 'User percentage (0.0-1.0):',
+          default: 0.2,
+          validate: (value) => (value >= 0 && value <= 1) ? true : 'Please enter a number between 0 and 1'
+        },
+        {
+          type: 'number',
+          name: 'comment',
+          message: 'Comment percentage (0.0-1.0):',
+          default: 0.1,
+          validate: (value) => (value >= 0 && value <= 1) ? true : 'Please enter a number between 0 and 1'
+        }
+      ]);
+      
+      // Safely calculate total and normalize distribution
+      const values = Object.values(distributionAnswer) as number[];
+      const total = values.reduce((sum, val) => sum + val, 0);
+      
+      // Create distribution object with normalized values
+      distribution = {
+        task: Number(distributionAnswer.task) / total,
+        project: Number(distributionAnswer.project) / total,
+        user: Number(distributionAnswer.user) / total,
+        comment: Number(distributionAnswer.comment) / total
+      };
+      
+      console.log('\nNormalized distribution:');
+      Object.entries(distribution).forEach(([key, val]) => {
+        console.log(`- ${key}: ${(val * 100).toFixed(1)}%`);
+      });
+    }
+  }
+  
+  return {
+    testMode: mode as TestMode,
+    batchSize,
+    distribution
+  };
+}
+
+function getRandomChangeType(): ChangeType {
+  const types: ChangeType[] = ['insert', 'update', 'delete'];
+  return types[Math.floor(Math.random() * types.length)];
+}
+
+/**
+ * Create database changes based on the selected test mode
+ */
+async function createChanges(
+  sql: any, 
+  tracker: ChangeTracker,
+  testMode: TestMode
+): Promise<boolean> {
+  try {
+    console.log(`\nCreating changes in ${testMode} mode...`);
+    
+    // Initialize pendingChanges for all entity types if not already present
+    ['task', 'project', 'user', 'comment'].forEach(entityType => {
+      tracker.pendingChanges[entityType] = tracker.pendingChanges[entityType] || 
+        { created: [], updated: [], deleted: [] };
+    });
+    
+    if (testMode === 'single') {
+      // Original single change mode
+      console.log(`Creating single Task insert...`);
+      await createServerChange(sql, Task, 'insert');
+      tracker.totalChangesCreated++;
+      tracker.pendingChanges['task'].created.push('single-task'); // Add a placeholder ID for single mode
+      
+      console.log(`Successfully created single change (total: ${tracker.totalChangesCreated})`);
+      return true;
+    }
+    else {
+      // Batch mode with mixed entity types
+      console.log(`Creating mixed entity batch of size ${tracker.batchSize}...`);
+      console.time('batch-creation');
+      
+      // Create a batch of mixed changes using the entity-changes module
+      const results = await createMixedChanges(sql, tracker.batchSize, tracker.changeDistribution);
+      
+      // Process results and update tracker
+      let totalChangesInBatch = 0;
+      
+      // Update tracker with created changes
+      Object.entries(results).forEach(([entityType, entityChanges]) => {
+        if (!entityChanges) return;
+        
+        // Track created entities
+        if (entityChanges.created && entityChanges.created.length > 0) {
+          console.log(`- Created ${entityChanges.created.length} ${entityType}s`);
+          tracker.pendingChanges[entityType].created.push(...entityChanges.created);
+          totalChangesInBatch += entityChanges.created.length;
+        }
+        
+        // Track updated entities
+        if (entityChanges.updated && entityChanges.updated.length > 0) {
+          console.log(`- Updated ${entityChanges.updated.length} ${entityType}s`);
+          tracker.pendingChanges[entityType].updated.push(...entityChanges.updated);
+          totalChangesInBatch += entityChanges.updated.length;
+        }
+        
+        // Track deleted entities
+        if (entityChanges.deleted && entityChanges.deleted.length > 0) {
+          console.log(`- Deleted ${entityChanges.deleted.length} ${entityType}s`);
+          tracker.pendingChanges[entityType].deleted.push(...entityChanges.deleted);
+          totalChangesInBatch += entityChanges.deleted.length;
+        }
+      });
+      
+      // Update batch and change counts
+      tracker.batchesCreated++;
+      tracker.totalChangesCreated += totalChangesInBatch;
+      
+      console.timeEnd('batch-creation');
+      console.log(`Successfully created batch ${tracker.batchesCreated} with ${totalChangesInBatch} changes`);
+      return true;
+    }
+  } catch (error) {
+    console.error('Failed to create changes:', error);
+    return false;
+  }
+}
+
+// Type guard for entity types
+function isEntityType(value: string): value is EntityType {
+  return ['task', 'project', 'user', 'comment'].includes(value);
+}
+
+/**
  * Test the catchup synchronization workflow
  * 
  * FLOW:
@@ -205,6 +456,9 @@ async function initializeReplication(): Promise<boolean> {
  */
 async function testCatchupSync() {
   console.log('Starting Catchup Sync Test');
+  
+  // Allow user to select test mode and configuration
+  const testConfig = await showTestMenu();
   
   // Load the existing LSN and client ID from file
   const { lsn: startingLSN, clientId: savedClientId } = getLSNInfoFromFile();
@@ -220,44 +474,123 @@ async function testCatchupSync() {
   let sql: SqlQueryFunction | undefined;
   let finalLSN = startingLSN;
   
+  // Initialize change tracker based on test mode
+  const changeTracker: ChangeTracker = {
+    pendingChanges: {},
+    receivedChanges: {},
+    batchSize: testConfig.batchSize || 3,
+    batchesCreated: 0,
+    changeDistribution: testConfig.distribution || { task: 0.5, project: 0.2, user: 0.2, comment: 0.1 },
+    totalChangesCreated: 0,
+    totalChangesReceived: 0,
+    allChangesReceived: false,
+    testMode: testConfig.testMode
+  };
+  
   // Track statistics for reporting
-  let changesMessages = 0;
-  let totalChanges = 0;
-  let lastChunk = 0;
-  let totalChunks = 0;
-  let syncCompletedReceived = false;
-  let syncCompletedSuccess = false;
-  let syncCompletedChangeCount = 0;
-  let syncCompletedFinalLSN = '';
+  const stats: TestStats = {
+    totalMessages: 0,
+    changesMessages: 0,
+    catchupMessages: 0,
+    catchupChunksReceived: 0,
+    catchupChunksAcknowledged: 0,
+    lsnUpdateMessages: 0,
+    syncCompletedMessages: 0,
+    totalChangesReceived: 0,
+    finalLSN: startingLSN,
+    clientId: savedClientId,
+    testCompletedSuccessfully: false,
+    changeTracker
+  };
+  
+  // Track various message types
+  let changesReceived = false;
+  let catchupCompleted = false;
+  let batchChangesStarted = false; // Flag to prevent multiple batch starts
+  let catchupHandled = false; // Global flag to track catchup handling
+
+  // Test completion promise
+  let resolveTestFinished: (value: void) => void;
+  const testFinished = new Promise<void>((resolve) => {
+    resolveTestFinished = resolve;
+  });
+  
+  // Helper function to check if all changes have been received
+  function checkAllChangesReceived() {
+    // In single mode, we just check if we've received at least the number of changes we created
+    if (testConfig.testMode === 'single') {
+      if (stats.totalChangesReceived >= stats.changeTracker.totalChangesCreated) {
+        console.log(`✅ Received all ${stats.changeTracker.totalChangesCreated} changes`);
+        stats.changeTracker.allChangesReceived = true;
+        stats.testCompletedSuccessfully = true;
+        resolveTestFinished();
+      }
+      return;
+    }
+    
+    // For batch modes, we check each specific entity ID
+    let totalTracked = 0;
+    let totalMatched = 0;
+    
+    // Count the total number of changes we're explicitly tracking
+    Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, entityChanges]) => {
+      const entityTotal = entityChanges.created.length + entityChanges.updated.length + entityChanges.deleted.length;
+      totalTracked += entityTotal;
+      
+      // Count how many have been received
+      let entityMatched = 0;
+      entityChanges.created.forEach(id => {
+        if (stats.changeTracker.receivedChanges[id]) entityMatched++;
+      });
+      entityChanges.updated.forEach(id => {
+        if (stats.changeTracker.receivedChanges[id]) entityMatched++;
+      });
+      entityChanges.deleted.forEach(id => {
+        if (stats.changeTracker.receivedChanges[id]) entityMatched++;
+      });
+      
+      totalMatched += entityMatched;
+      
+      // Log progress for each entity type
+      if (entityTotal > 0) {
+        console.log(`${entityType}: ${entityMatched}/${entityTotal} changes received`);
+      }
+    });
+    
+    // Only log progress if we have tracked changes
+    if (totalTracked > 0) {
+      console.log(`Overall progress: ${totalMatched}/${totalTracked} tracked changes have been received`);
+    }
+    
+    // If we've matched all changes, we're done
+    if (totalMatched >= totalTracked && totalTracked > 0) {
+      console.log(`✅ All ${totalTracked} changes have been received!`);
+      stats.changeTracker.allChangesReceived = true;
+      stats.testCompletedSuccessfully = true;
+      resolveTestFinished();
+    }
+  }
   
   // Set up a message listener to process messages as they arrive
   tester.onMessage = (message) => {
     if ('type' in message) {
-      // Check for messages that might be sync_completed but not matching our type check
-      const msgType = message.type;
-      if (typeof msgType === 'string' && 
-          (msgType.includes('sync_completed') || msgType.includes('syncCompleted') || msgType.includes('sync-completed'))) {
-        console.log(`\n⚠️⚠️⚠️ POTENTIAL SYNC COMPLETED MESSAGE FOUND WITH TYPE "${msgType}":`);
-        console.log(JSON.stringify(message, null, 2));
-        console.log(`⚠️⚠️⚠️ END POTENTIAL SYNC COMPLETED\n`);
-      }
+      stats.totalMessages++;
       
       // Handle changes messages
       if (message.type === 'srv_catchup_changes' as any) {
         const changesMsg = message as ServerChangesMessage;
-        changesMessages++;
+        stats.catchupMessages++;
+        stats.catchupChunksReceived++;
         
-        console.log(`Received srv_catchup_changes message #${changesMessages}`);
+        console.log(`Received srv_catchup_changes message #${stats.catchupMessages}`);
         
         if (changesMsg.changes) {
-          totalChanges += changesMsg.changes.length;
+          stats.totalChangesReceived += changesMsg.changes.length;
           console.log(`  Contains ${changesMsg.changes.length} changes`);
           
           // Track chunking information
           if (changesMsg.sequence) {
-            lastChunk = changesMsg.sequence.chunk;
-            totalChunks = changesMsg.sequence.total;
-            console.log(`  Chunk ${lastChunk}/${totalChunks}`);
+            console.log(`  Chunk ${changesMsg.sequence.chunk}/${changesMsg.sequence.total}`);
           }
           
           // Track LSN progression
@@ -269,57 +602,15 @@ async function testCatchupSync() {
             }
           }
           
-          // Send chunk acknowledgment - new part to actually implement flow control
-          try {
-            const ackMessage: any = {
-              type: 'clt_catchup_received',
-              messageId: `clt_ack_${Date.now()}`,
-              timestamp: Date.now(),
-              clientId: tester.getClientId(),
-              chunk: changesMsg.sequence?.chunk || 1,
-              lsn: changesMsg.lastLSN || finalLSN
-            };
-            
-            // Send the acknowledgment
-            tester.sendMessage(ackMessage).then(() => {
-              console.log(`  ✅ Sent acknowledgment for chunk ${ackMessage.chunk} with LSN ${ackMessage.lsn}`);
-            }).catch(err => {
-              console.error(`  ❌ Failed to send acknowledgment:`, err);
-            });
-          } catch (ackError) {
-            console.error(`  ❌ Error creating acknowledgment:`, ackError);
-          }
-        }
-      }
-      
-      // Legacy handling for 'srv_send_changes' during transition period 
-      else if (message.type === 'srv_send_changes' as any) {
-        const changesMsg = message as ServerChangesMessage;
-        changesMessages++;
-        
-        console.log(`Received srv_send_changes message #${changesMessages} (legacy message type)`);
-        console.log(`  ⚠️ DEPRECATED: This message type has been replaced with 'srv_catchup_changes' for catchup sync`);
-        
-        if (changesMsg.changes) {
-          totalChanges += changesMsg.changes.length;
-          console.log(`  Contains ${changesMsg.changes.length} changes`);
-          
-          // Same tracking as above...
-          if (changesMsg.sequence) {
-            lastChunk = changesMsg.sequence.chunk;
-            totalChunks = changesMsg.sequence.total;
-            console.log(`  Chunk ${lastChunk}/${totalChunks}`);
-          }
-          
-          if (changesMsg.lastLSN) {
-            console.log(`  Has lastLSN: ${changesMsg.lastLSN}`);
-            if (compareLSN(changesMsg.lastLSN, finalLSN) > 0) {
-              finalLSN = changesMsg.lastLSN;
-              console.log(`  Updated finalLSN from changes message: ${finalLSN}`);
+          // Track received changes by ID
+          changesMsg.changes.forEach(change => {
+            if (change?.data?.id) {
+              const changeId = String(change.data.id);
+              stats.changeTracker.receivedChanges[changeId] = true;
             }
-          }
+          });
           
-          // Send chunk acknowledgment for legacy message type too
+          // Send chunk acknowledgment
           try {
             const ackMessage: any = {
               type: 'clt_catchup_received',
@@ -332,6 +623,7 @@ async function testCatchupSync() {
             
             // Send the acknowledgment
             tester.sendMessage(ackMessage).then(() => {
+              stats.catchupChunksAcknowledged++;
               console.log(`  ✅ Sent acknowledgment for chunk ${ackMessage.chunk} with LSN ${ackMessage.lsn}`);
             }).catch(err => {
               console.error(`  ❌ Failed to send acknowledgment:`, err);
@@ -342,114 +634,40 @@ async function testCatchupSync() {
         }
       }
       
-      // Handle LSN updates - this is the authoritative source for LSN
+      // Handle LSN updates
       else if (message.type === 'srv_lsn_update') {
         const lsnMsg = message as ServerLSNUpdateMessage;
+        stats.lsnUpdateMessages++;
         console.log(`Received LSN update message: ${lsnMsg.lsn}`);
         
-        // Always update the LSN from a dedicated LSN update message
         if (lsnMsg.lsn) {
-          if (finalLSN !== lsnMsg.lsn) {
-            console.log(`Updating finalLSN: ${finalLSN} -> ${lsnMsg.lsn}`);
+          if (compareLSN(lsnMsg.lsn, finalLSN) > 0) {
+            console.log(`  Updated finalLSN from LSN update: ${lsnMsg.lsn}`);
+            finalLSN = lsnMsg.lsn;
           }
-          finalLSN = lsnMsg.lsn;
         }
       }
       
-      // Handle sync completed message - this is the final message in catchup sync
-      else if (message.type === 'srv_sync_completed') {
-        const syncCompletedMsg = message as any;
-        console.log(`Received sync completed message: ${syncCompletedMsg.startLSN ? `startLSN=${syncCompletedMsg.startLSN}, ` : ''}finalLSN=${syncCompletedMsg.finalLSN}, changes=${syncCompletedMsg.changeCount}, success=${syncCompletedMsg.success}`);
+      // Handle catchup sync completed message
+      else if (message.type === 'srv_catchup_completed') {
+        const syncCompletedMsg = message as ServerCatchupCompletedMessage;
+        stats.syncCompletedMessages++;
+        console.log(`Received catchup sync completed message: ${syncCompletedMsg.startLSN ? `startLSN=${syncCompletedMsg.startLSN}, ` : ''}finalLSN=${syncCompletedMsg.finalLSN}, changes=${syncCompletedMsg.changeCount}, success=${syncCompletedMsg.success}`);
         
-        syncCompletedReceived = true;
-        syncCompletedSuccess = syncCompletedMsg.success;
-        syncCompletedChangeCount = syncCompletedMsg.changeCount;
-        syncCompletedFinalLSN = syncCompletedMsg.finalLSN;
-        
-        // Update LSN from the sync completed message if it's more recent
-        if (syncCompletedMsg.finalLSN && compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
-          finalLSN = syncCompletedMsg.finalLSN;
-          console.log(`Updated finalLSN from sync completed message: ${finalLSN}`);
+        if (syncCompletedMsg.finalLSN) {
+          if (compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
+            console.log(`  Updated finalLSN from sync completed message: ${syncCompletedMsg.finalLSN}`);
+            finalLSN = syncCompletedMsg.finalLSN;
+          }
         }
+        
+        // Check if we've received all expected changes
+        checkAllChangesReceived();
       }
     }
   };
   
   try {
-    // Debug helper function for examining messages in detail
-    const debugMessage = (message: any, label: string = "Message Debug") => {
-      if (!message) {
-        console.log(`${label}: [Message is null or undefined]`);
-        return;
-      }
-      
-      console.log(`\n===== ${label} =====`);
-      console.log(`Type: ${message.type || 'No type field!'}`);
-      
-      if (typeof message !== 'object') {
-        console.log(`Value: ${message} (type: ${typeof message})`);
-        return;
-      }
-      
-      // Check for missing fields
-      const expectedFields = ['type', 'messageId', 'timestamp', 'clientId'];
-      const missingFields = expectedFields.filter(field => !(field in message));
-      if (missingFields.length > 0) {
-        console.log(`Missing fields: ${missingFields.join(', ')}`);
-      }
-      
-      // Special checks for sync completed message
-      if (message.type === 'srv_sync_completed') {
-        const scFields = ['startLSN', 'finalLSN', 'changeCount', 'success'];
-        const missingScFields = scFields.filter(field => !(field in message));
-        
-        console.log(`This is a sync completed message`);
-        console.log(`Fields: ${Object.keys(message).join(', ')}`);
-        
-        if (missingScFields.length > 0) {
-          console.log(`⚠️ Missing expected srv_sync_completed fields: ${missingScFields.join(', ')}`);
-        }
-        
-        // Check data types
-        if ('finalLSN' in message && typeof message.finalLSN !== 'string') {
-          console.log(`⚠️ Invalid finalLSN type: ${typeof message.finalLSN}`);
-        }
-        
-        if ('changeCount' in message && typeof message.changeCount !== 'number') {
-          console.log(`⚠️ Invalid changeCount type: ${typeof message.changeCount}`);
-        }
-        
-        if ('success' in message && typeof message.success !== 'boolean') {
-          console.log(`⚠️ Invalid success type: ${typeof message.success}`);
-        }
-      }
-      
-      console.log(`Raw message content:`);
-      console.log(JSON.stringify(message, null, 2));
-      console.log('================================\n');
-    };
-
-    // Add debug handling for sync_completed to original message handler
-    const originalOriginalOnMessage = tester.onMessage;
-    tester.onMessage = (message) => {
-      if ('type' in message && message.type === 'srv_sync_completed') {
-        debugMessage(message, "DETECTED SYNC COMPLETED MESSAGE");
-      }
-      
-      if (originalOriginalOnMessage) {
-        originalOriginalOnMessage(message);
-      }
-    };
-
-    // Read the LSN file again to ensure we have the most recent value
-    const freshLsnInfo = getLSNInfoFromFile();
-    const initialCurrentLSN = freshLsnInfo.lsn;
-    
-    if (initialCurrentLSN !== startingLSN) {
-      console.log(`Notice: LSN file was updated since process start. Using latest LSN: ${initialCurrentLSN}`);
-      finalLSN = initialCurrentLSN;
-    }
-    
     // Initialize the Neon client using the neon() function
     console.log('Initializing database connection...');
     sql = neon(getDatabaseURL());
@@ -458,7 +676,6 @@ async function testCatchupSync() {
     // Verify the connection is active before proceeding
     console.log('Verifying database connection...');
     const connectionCheck = await sql`SELECT 1 as connection_test`;
-    // Safely check the connection result
     if (!connectionCheck || !Array.isArray(connectionCheck) || connectionCheck.length === 0) {
       throw new Error('Database connection verification failed: empty result');
     }
@@ -471,34 +688,44 @@ async function testCatchupSync() {
     
     // Create server changes BEFORE connecting to the sync server
     console.log('Creating server changes...');
-    // Create enough changes to ensure WAL generation
-    const numChanges = 25; // Create 25 changes
-    console.log(`Creating ${numChanges} mixed entity changes...`);
     
-    // Create a realistic mix of entity changes across different entity types
-    await createMixedChanges(sql as any, numChanges, {
-      task: 0.6,      // 60% tasks - tasks are the primary entity
-      project: 0.15,  // 15% projects
-      user: 0.15,     // 15% users
-      comment: 0.1    // 10% comments
-    });
-
+    // Create changes based on test mode
+    const maxBatches = testConfig.testMode === 'single' ? 3 : 1; // For single mode, create 3 changes; for batch modes, create 1 batch
+    
+    for (let batchNum = 0; batchNum < maxBatches; batchNum++) {
+      // Create the changes
+      const success = await createChanges(sql, stats.changeTracker, testConfig.testMode);
+      
+      if (!success) {
+        console.error(`Failed to create batch ${batchNum + 1}/${maxBatches}`);
+        continue;
+      }
+      
+      console.log(`Waiting for changes to be processed...`);
+      
+      // If we're doing multiple batches, wait a bit between them
+      if (batchNum < maxBatches - 1) {
+        console.log(`Waiting 5 seconds before next batch...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+    
     // Initialize replication system via HTTP before connecting
     console.log('Initializing replication system...');
     const initSuccess = await initializeReplication();
     if (!initSuccess) {
       console.warn('Replication initialization failed. Proceeding anyway, but sync may not work correctly.');
     }
-
+    
     // Wait for changes to be processed by the replication system AFTER initialization
-    const replicationWaitTime = 20000; // 20 seconds
+    const replicationWaitTime = 10000; // 10 seconds
     console.log(`Waiting ${replicationWaitTime/1000} seconds for replication system to process changes...`);
     console.log('This allows the server to:');
     console.log('1. Process changes created during this test');
     console.log('2. Advance its internal LSN position');
     console.log('3. Prepare for client connection');
     await new Promise(resolve => setTimeout(resolve, replicationWaitTime));
-
+    
     // Read the LSN file again to ensure we have the most recent value before connecting
     const updatedLsnInfo = getLSNInfoFromFile();
     const currentLSN = updatedLsnInfo.lsn;
@@ -511,225 +738,25 @@ async function testCatchupSync() {
     
     // Connect with the most current LSN and client ID
     console.log('Connecting to server with current LSN...');
-
-    // Simply use the current LSN from the file
     await tester.connect(currentLSN, currentClientId);
     
-    // Wait for catchup sync with timeouts for each expected action
-    console.log('Waiting for sync events with individual timeouts...');
-    
-    // Create action flags and timestamps
-    const actions = {
-      changesReceived: { received: false, timestamp: 0, count: 0 },
-      syncCompleted: { received: false, timestamp: 0, success: false }
-    };
-    
-    // Set up message handler to check for relevant messages
-    const originalOnMessage = tester.onMessage;
-    tester.onMessage = (message) => {
-      // Still call the original handler if it exists
-      if (originalOnMessage) {
-        originalOnMessage(message);
-      }
-      
-      if ('type' in message) {
-        if ((message.type as string) === 'srv_catchup_changes' || (message.type as string) === 'srv_send_changes') {
-          console.log('✅ Changes message received');
-          actions.changesReceived.received = true;
-          actions.changesReceived.timestamp = Date.now();
-          actions.changesReceived.count++;
-        } else if (message.type === 'srv_sync_completed') {
-          console.log('✅ Sync completed message received');
-          const syncCompletedMsg = message as ServerSyncCompletedMessage;
-          
-          // Update the action state for the timeout resolution
-          actions.syncCompleted.received = true;
-          actions.syncCompleted.timestamp = Date.now();
-          actions.syncCompleted.success = syncCompletedMsg.success;
-          
-          // Also update the global state variables
-          syncCompletedReceived = true;
-          syncCompletedSuccess = syncCompletedMsg.success;
-          syncCompletedChangeCount = syncCompletedMsg.changeCount;
-          syncCompletedFinalLSN = syncCompletedMsg.finalLSN;
-          
-          // Update final LSN if needed
-          if (syncCompletedMsg.finalLSN && compareLSN(syncCompletedMsg.finalLSN, finalLSN) > 0) {
-            finalLSN = syncCompletedMsg.finalLSN;
-            console.log(`✅ LSN updated from sync completed message: ${finalLSN}`);
-          }
-          
-          // Log change count from server's perspective
-          console.log(`✅ Server reports ${syncCompletedMsg.changeCount} changes sent`);
-        }
-      }
-    };
-    
-    // Set up timeouts for each expected action
-    const timeoutMs = 30000; // 30 seconds total timeout
-    const startTime = Date.now();
-    
-    // Create promises for each expected action
-    const changesReceivedPromise = new Promise<'success' | 'timeout'>((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (actions.changesReceived.received) {
-          clearInterval(checkInterval);
-          resolve('success');
-        } else if (Date.now() - startTime > timeoutMs) {
-          clearInterval(checkInterval);
-          resolve('timeout');
-        }
-      }, 100);
-    });
-    
-    const syncCompletedPromise = new Promise<'success' | 'timeout'>((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (actions.syncCompleted.received) {
-          clearInterval(checkInterval);
-          resolve('success');
-        } else if (Date.now() - startTime > timeoutMs) {
-          clearInterval(checkInterval);
-          resolve('timeout');
-        }
-      }, 100);
-    });
-    
-    // Set up the progress reporting
-    const progressInterval = setInterval(() => {
-      const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`\n===== Sync Progress Report (${elapsedSeconds}s elapsed) =====`);
-      
-      // Report on actions status with more details
-      console.log(`Changes received: ${actions.changesReceived.received 
-        ? `✅ (${actions.changesReceived.count} messages with ${totalChanges} changes)` 
-        : '⏳ Waiting...'}`);
-      
-      console.log(`Sync completed: ${actions.syncCompleted.received 
-        ? `✅ (${new Date(actions.syncCompleted.timestamp).toISOString().split('T')[1].split('.')[0]})` 
-        : '⏳ Waiting...'}`);
+    // Set a 30 second timeout for receiving all changes
+    console.log(`Setting 30 second timeout to receive all changes...`);
+    setTimeout(() => {
+      if (!stats.changeTracker.allChangesReceived) {
+        console.warn(`⚠️ Not all changes were received within timeout`);
+        console.log(`Created ${stats.changeTracker.totalChangesCreated} changes, received ${stats.totalChangesReceived}`);
         
-      if (syncCompletedReceived) {
-        console.log(`  - Success: ${syncCompletedSuccess ? '✅' : '❌'}`);
-        console.log(`  - Changes: ${syncCompletedChangeCount}`);
-        console.log(`  - Final LSN: ${syncCompletedFinalLSN}`);
+        // Complete the test even though not all changes were received
+        stats.testCompletedSuccessfully = false;
       }
-      
-      // Message log analysis
-      const messages = tester.getMessageLog();
-      console.log(`\nMessage Log Stats (${messages.length} total):`);
-      
-      // Count message types
-      const typeCounts = messages.reduce((counts, msg) => {
-        if ('type' in msg) {
-          const type = msg.type;
-          counts[type] = (counts[type] || 0) + 1;
-        }
-        return counts;
-      }, {} as Record<string, number>);
-      
-      // Display message type counts
-      Object.entries(typeCounts).forEach(([type, count]) => {
-        console.log(`  - ${type}: ${count}`);
-      });
-      
-      // Print the last few messages for visibility with more detail
-      const recentMessages = tester.getMessageLog().slice(-5);
-      if (recentMessages.length > 0) {
-        console.log('\nRecent Messages:');
-        recentMessages.forEach((msg, idx) => {
-          if ('type' in msg) {
-            const timestamp = new Date(msg.timestamp).toISOString().split('T')[1].split('.')[0];
-            console.log(`  ${idx+1}. [${timestamp}] ${msg.type}${msg.type === 'srv_sync_completed' ? ' ✓' : ''}`);
-            
-            // Add extra debug for sync completed message
-            if (msg.type === 'srv_sync_completed') {
-              const syncMsg = msg as ServerSyncCompletedMessage;
-              console.log(`     - startLSN: ${syncMsg.startLSN || 'not set'}`);
-              console.log(`     - finalLSN: ${syncMsg.finalLSN || 'not set'}`);
-              console.log(`     - changeCount: ${syncMsg.changeCount}`);
-              console.log(`     - success: ${syncMsg.success}`);
-            }
-          }
-        });
-      }
-      
-      console.log('\n=================================================');
-    }, 5000);
+    }, 30000);
     
-    // Wait for all required actions or timeout
-    console.log('Waiting for sync actions to complete...');
-    
-    const [changesResult, syncCompletedResult] = await Promise.all([
-      changesReceivedPromise,
-      syncCompletedPromise
-    ]);
-    
-    // Clear the progress reporting interval
-    clearInterval(progressInterval);
-    
-    // Restore original message handler
-    tester.onMessage = originalOnMessage;
-    
-    // Check results and report
-    let syncSuccess = true;
-    
-    if (changesResult === 'timeout' && !actions.changesReceived.received) {
-      console.warn('⚠️ No changes messages received - this may be expected if no changes occurred');
-      // This is not a failure condition, just a warning
-    }
-    
-    if (syncCompletedResult === 'timeout') {
-      console.error('❌ Timed out waiting for sync completed message');
-      syncSuccess = false;
-    }
-    
-    if (!syncSuccess) {
-      throw new Error('Catchup sync timed out waiting for required messages');
-    }
-    
-    console.log('✅ Catchup sync completed with all required messages received!');
-    
-    // Wait a bit more to ensure all final messages are processed
-    console.log('Waiting for any final messages...');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // Print message analysis summary
-    const messages = tester.getMessageLog();
-    console.log('\nMessage Analysis Summary:');
-    console.log(`- Total messages received: ${messages.length}`);
-    console.log(`- Found ${changesMessages} srv_send_changes messages with ${totalChanges} total changes`);
-    
-    // Report sync completion status
-    if (syncCompletedReceived) {
-      console.log(`- Sync completed: ${syncCompletedSuccess ? 'success' : 'failed'}`);
-      console.log(`- Server-reported change count: ${syncCompletedChangeCount}`);
-      console.log(`- Server-reported final LSN: ${syncCompletedFinalLSN}`);
-      
-      // Check if we received additional changes after the sync completion
-      if (changesMessages > 0 && syncCompletedChangeCount === 0) {
-        console.log(`\n⚠️ Important Note: Received ${changesMessages} change messages with ${totalChanges} changes AFTER sync completion`);
-        console.log(`  This indicates that new database changes were processed by the replication system after`);
-        console.log(`  the catchup sync completed, but during our test session. These are live updates, not catchup sync.`);
-        
-        // If the changes received would have advanced the LSN, note that as well
-        if (compareLSN(finalLSN, syncCompletedFinalLSN) > 0) {
-          console.log(`  Final LSN reported (${finalLSN}) is more recent than sync completed LSN (${syncCompletedFinalLSN})`);
-        }
-      }
-    } else {
-      console.log(`- No sync completion message received`);
-    }
+    // Wait for test completion
+    await testFinished;
     
     // Save the new LSN to the file
     const lsnFile = path.join(process.cwd(), '.sync-test-lsn.json');
-    
-    // Always use the sync completed finalLSN when available as this represents 
-    // the server's authoritative position after sync
-    if (syncCompletedReceived && syncCompletedFinalLSN) {
-      // Update to use the server's reported final position
-      finalLSN = syncCompletedFinalLSN;
-      console.log(`Using final LSN from sync completed message: ${finalLSN}`);
-    }
     
     console.log(`Saving LSN to file: ${finalLSN}`);
     try {
@@ -773,36 +800,29 @@ async function testCatchupSync() {
     // Report results
     console.log('\nCatchup Sync Results:');
     console.log('--------------------');
+    console.log(`Test mode: ${testConfig.testMode}`);
     console.log(`Starting LSN: ${startingLSN}`);
     console.log(`Final LSN: ${finalLSN}`);
     console.log(`Client ID: ${tester.getClientId()}`);
-    console.log(`srv_send_changes messages: ${changesMessages}`);
+    console.log(`Total changes created: ${stats.changeTracker.totalChangesCreated}`);
     
-    if (totalChunks > 0) {
-      console.log(`Chunking: ${lastChunk}/${totalChunks}`);
-    }
-    
-    console.log(`Total changes received: ${totalChanges}`);
+    // Calculate total tracked changes received
+    let totalTrackedChanges = 0;
+    Object.entries(stats.changeTracker.pendingChanges).forEach(([entityType, entityChanges]) => {
+      totalTrackedChanges += entityChanges.created.length + entityChanges.updated.length + entityChanges.deleted.length;
+    });
+    console.log(`Total changes received: ${totalTrackedChanges}`);
     
     // Validate LSN advancement
     const lsnAdvanced = compareLSN(finalLSN, startingLSN) > 0;
     console.log(`LSN change: ${startingLSN} → ${finalLSN} (${lsnAdvanced ? 'advanced' : 'unchanged'})`);
-
+    
     // Report sync status
-    if (syncCompletedReceived) {
-      if (syncCompletedChangeCount > 0) {
-        console.log(`Catchup sync completed successfully with ${syncCompletedChangeCount} changes`);
+    if (stats.syncCompletedMessages > 0) {
+      if (totalTrackedChanges > 0) {
+        console.log(`Catchup sync completed successfully with ${totalTrackedChanges} changes`);
       } else {
         console.log(`Sync completed with no changes - client was already up-to-date`);
-      }
-    }
-
-    // Report on changes received
-    if (totalChanges > 0) {
-      console.log(`Received a total of ${totalChanges} changes in ${changesMessages} messages`);
-      
-      if (totalChunks > 0) {
-        console.log(`Changes were delivered in ${lastChunk}/${totalChunks} chunks`);
       }
     }
     
