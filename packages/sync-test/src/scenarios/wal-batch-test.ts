@@ -6,12 +6,12 @@
  * and measures the time it takes to process a batch of WAL changes.
  */
 
-import { DEFAULT_CONFIG } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.ts';
 import * as dotenv from 'dotenv';
 import { neon } from '@neondatabase/serverless';
 import fetch from 'node-fetch';
 import readline from 'readline';
-import { createMixedChanges } from '../changes/entity-changes.js';
+import { createMixedChanges } from '../changes/entity-changes.ts';
 import { QueryResult, neonConfig } from '@neondatabase/serverless';
 
 // Load environment variables from .env file

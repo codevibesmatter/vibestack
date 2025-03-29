@@ -9,7 +9,7 @@
  * 3. Troubleshooting replication issues separately from WebSocket connectivity
  */
 
-import { DEFAULT_CONFIG } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.ts';
 import fetch from 'node-fetch';
 import { config } from 'dotenv';
 

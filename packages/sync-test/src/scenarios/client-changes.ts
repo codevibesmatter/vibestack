@@ -1,5 +1,5 @@
-import { SyncTester } from '../test-sync.js';
-import { DEFAULT_CONFIG } from '../config.js';
+import { SyncTester } from '../test-sync.ts';
+import { DEFAULT_CONFIG } from '../config.ts';
 import type { 
   SrvMessageType, 
   CltMessageType, 
@@ -11,7 +11,7 @@ import type {
   ClientChangesMessage
 } from '@repo/sync-types';
 import { fileURLToPath } from 'url';
-import { generateSingleChange, generateBulkChanges } from '../changes/client-changes.js';
+import { generateSingleChange, generateBulkChanges } from '../changes/client-changes.ts';
 import { Task } from '@repo/dataforge/server-entities';
 import fs from 'fs';
 import path from 'path';

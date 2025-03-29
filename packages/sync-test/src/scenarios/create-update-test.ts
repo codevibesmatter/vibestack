@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import fetch from 'node-fetch';
 import readline from 'readline';
 import { TaskStatus, TaskPriority } from '@repo/dataforge/server-entities';
-import { DEFAULT_CONFIG } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.ts';
 
 // Load environment variables from .env file
 config();

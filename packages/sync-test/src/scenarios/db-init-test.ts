@@ -7,7 +7,7 @@
  * 3. Verifies the change was captured by the replication system
  */
 
-import { DEFAULT_CONFIG } from '../config.js';
+import { DEFAULT_CONFIG } from '../config.ts';
 import fetch from 'node-fetch';
 import { config } from 'dotenv';
 import { neon } from '@neondatabase/serverless';

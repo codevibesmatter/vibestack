@@ -2,4 +2,4 @@
  * Seed functionality exports
  */
 
-export * from './seed-data.js'; 
+export * from './seed-data.ts'; 

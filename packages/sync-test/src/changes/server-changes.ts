@@ -7,7 +7,7 @@ import {
   Comment,
   SERVER_DOMAIN_TABLES
 } from '@repo/dataforge/server-entities';
-import { generateFakeData } from '../utils/fake-data.js';
+import { generateFakeData } from '../utils/fake-data.ts';
 import crypto from 'crypto';
 
 type Entity = Task | Project | User | Comment;

@@ -1,5 +1,5 @@
-import { SyncTester } from '../test-sync.js';
-import { DEFAULT_CONFIG } from '../config.js';
+import { SyncTester } from '../test-sync.ts';
+import { DEFAULT_CONFIG } from '../config.ts';
 import { Task } from '@repo/dataforge/server-entities';
 import { Client } from '@neondatabase/serverless';
 import type { DataSource } from 'typeorm';
@@ -14,8 +14,8 @@ import type {
   CltMessageType,
   ServerCatchupCompletedMessage
 } from '@repo/sync-types';
-import { createServerBulkChanges, createServerChange } from '../changes/server-changes.js';
-import { createMixedChanges } from '../changes/entity-changes.js';
+import { createServerBulkChanges, createServerChange } from '../changes/server-changes.ts';
+import { createMixedChanges } from '../changes/entity-changes.ts';
 import fs from 'fs';
 import path from 'path';
 import { config } from 'dotenv';

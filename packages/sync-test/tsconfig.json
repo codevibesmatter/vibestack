@@ -11,6 +11,9 @@
     "skipLibCheck": true,
     "target": "ESNext",
     "moduleDetection": "force",
-    "declaration": true
+    "declaration": true,
+    "allowImportingTsExtensions": true,
+    "emitDeclarationOnly": false,
+    "noEmit": true
   }
 } 

@@ -11,7 +11,7 @@ import {
   User, Project, Task, Comment, 
   serverEntities
 } from '@repo/dataforge/server-entities';
-import { seedData, clearAllData, SEED_PRESETS, SeedConfig, getDatabaseURL } from './seed-data.js';
+import { seedData, clearAllData, SEED_PRESETS, SeedConfig, getDatabaseURL } from './seed-data.ts';
 
 // Load environment variables
 dotenv.config();

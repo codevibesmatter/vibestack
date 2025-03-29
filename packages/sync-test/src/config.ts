@@ -1,4 +1,4 @@
-import type { Config } from './types.js';
+import type { Config } from './types.ts';
 
 export const DEFAULT_CONFIG: Config = {
   wsUrl: 'ws://localhost:8787/api/sync',

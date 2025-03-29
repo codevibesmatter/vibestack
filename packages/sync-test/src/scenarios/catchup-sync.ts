@@ -1,5 +1,5 @@
-import { SyncTester } from '../test-sync.js';
-import { DEFAULT_CONFIG } from '../config.js';
+import { SyncTester } from '../test-sync.ts';
+import { DEFAULT_CONFIG } from '../config.ts';
 import { Task, Project, User, Comment } from '@repo/dataforge/server-entities';
 import { Client } from '@neondatabase/serverless';
 import type { DataSource } from 'typeorm';
@@ -19,10 +19,10 @@ import { neon } from '@neondatabase/serverless';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
-import { createServerChange } from '../changes/server-changes.js';
-import { generateFakeData } from '../utils/fake-data.js';
+import { createServerChange } from '../changes/server-changes.ts';
+import { generateFakeData } from '../utils/fake-data.ts';
 import inquirer from 'inquirer';
-import { createMixedChanges, type EntityType } from '../changes/entity-changes.js';
+import { createMixedChanges, type EntityType } from '../changes/entity-changes.ts';
 
 // Load environment variables from .env file
 config();

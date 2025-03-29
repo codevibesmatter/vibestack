@@ -6,7 +6,7 @@ import {
   User,
   Comment
 } from '@repo/dataforge/server-entities';
-import { generateFakeData } from '../utils/fake-data.js';
+import { generateFakeData } from '../utils/fake-data.ts';
 
 type Entity = Task | Project | User | Comment;
 type EntityClass = typeof Task | typeof Project | typeof User | typeof Comment;

@@ -1,5 +1,5 @@
-import { SyncTester } from '../test-sync.js';
-import { DEFAULT_CONFIG } from '../config.js';
+import { SyncTester } from '../test-sync.ts';
+import { DEFAULT_CONFIG } from '../config.ts';
 import { SERVER_DOMAIN_TABLES, SERVER_TABLE_HIERARCHY } from '@repo/dataforge/server-entities';
 import type { 
   ServerMessage,

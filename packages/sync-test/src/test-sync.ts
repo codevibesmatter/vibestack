@@ -29,10 +29,10 @@ import {
   SERVER_DOMAIN_TABLES
 } from '@repo/dataforge/server-entities';
 import type { EntityTarget } from 'typeorm';
-import { generateSingleChange, generateBulkChanges } from './changes/client-changes.js';
-import { createServerChange, createServerBulkChanges } from './changes/server-changes.js';
-import type { Config } from './types.js';
-import { DEFAULT_CONFIG } from './config.js';
+import { generateSingleChange, generateBulkChanges } from './changes/client-changes.ts';
+import { createServerChange, createServerBulkChanges } from './changes/server-changes.ts';
+import type { Config } from './types.ts';
+import { DEFAULT_CONFIG } from './config.ts';
 import fs from 'fs';
 import path from 'path';
 

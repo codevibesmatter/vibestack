@@ -285,7 +285,7 @@ Server -> Client: `srv_error`
 - `srv_live_changes` - Changes being sent to client during live sync
 - `srv_changes_received` - Acknowledgment of client changes received
 - `srv_changes_applied` - Notification that client changes were applied
-- `srv_sync_completed` - Notification that catchup sync process is complete
+- `srv_catchup_completed` - Notification that catchup sync process is complete
 - `srv_error` - Error message
 - `srv_heartbeat` - Server heartbeat response
 

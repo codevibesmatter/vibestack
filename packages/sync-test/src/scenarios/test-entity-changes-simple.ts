@@ -3,7 +3,7 @@
  */
 import { config } from 'dotenv';
 import { neon } from '@neondatabase/serverless';
-import { createMixedChanges } from '../changes/entity-changes.js';
+import { createMixedChanges } from '../changes/entity-changes.ts';
 
 // Load environment variables from .env file
 config();
