@@ -3,10 +3,13 @@ import { createLogger } from './logger.ts';
 import { TestConfig } from '../types.ts';
 import { ClientProfileManager } from './client-profile-manager.ts';
 import { ValidationService } from './validation-service.ts';
+import { MessageProcessor, MessageProcessorOptions } from './message-processor.ts';
 import { wsClientFactory, WebSocketClientFactory } from './ws-client-factory.ts';
+import { messageDispatcher } from './message-dispatcher.ts';
 import * as dbService from './db-service.ts';
 import fetch, { RequestInit as FetchRequestInit } from 'node-fetch';
 import { API_CONFIG } from '../config.ts';
+import type { ServerChangesMessage, SrvMessageType } from '@repo/sync-types';
 
 /**
  * Interface defining a test scenario
@@ -47,7 +50,7 @@ export interface StepDefinition {
  * Base action interface - parent type for all actions
  */
 export interface Action {
-  type: 'api' | 'db' | 'ws' | 'interactive' | 'composite';  // Action type
+  type: 'api' | 'db' | 'ws' | 'interactive' | 'composite' | 'validation';  // Added 'validation'
   name?: string;                                            // Optional name for logging/reference
 }
 
@@ -78,13 +81,22 @@ export interface WSAction extends Action {
   type: 'ws';
   operation: string;       // Operation name (createClient, connect, send, etc.)
   clientId?: string;       // Target client ID (if applicable)
-  params?: any;            // Operation parameters
+  params?: any | ((context: OperationContext, operations: Record<string, any>) => Promise<any>);  // Updated
   
   // Optional waiting for response
   waitFor?: {
     type: string;          // Message type to wait for
     timeout?: number;      // Timeout in ms
   };
+}
+
+/**
+ * Validation Action - performs validation operations
+ */
+export interface ValidationAction extends Action {
+  type: 'validation';
+  operation: string;       // Operation name (validate, verifyChanges, etc.)
+  params?: any | ((context: OperationContext, operations: Record<string, any>) => Promise<any>);
 }
 
 /**
@@ -96,7 +108,7 @@ export interface InteractiveAction extends Action {
   maxTimeout: number;          // Maximum time to wait for completion
   
   // Optional initial action
-  initialAction?: ApiAction | DbAction | WSAction;
+  initialAction?: ApiAction | DbAction | WSAction | ValidationAction;
   
   // Message handlers
   handlers: Record<string, (message: any, context: any, operations: any) => Promise<boolean> | boolean>;
@@ -142,16 +154,18 @@ export interface OperationContext {
 export class ScenarioRunner extends EventEmitter {
   protected logger = createLogger('Runner');
   protected validationService: ValidationService;
+  protected messageProcessor: MessageProcessor;
   protected profileManager: ClientProfileManager;
   
   constructor() {
     super(); // Initialize EventEmitter
     
-    // Initialize validation service with default options
+    // Initialize services with default options
     this.validationService = new ValidationService();
+    this.messageProcessor = new MessageProcessor();
     this.profileManager = new ClientProfileManager();
     
-    this.logger.info('ScenarioRunner created with direct implementation');
+    this.logger.info('ScenarioRunner created with validation and message processing capabilities');
   }
   
   /**
@@ -166,11 +180,13 @@ export class ScenarioRunner extends EventEmitter {
         runner: this,
         config: scenario.config,
         state: {
-          clients: new Map(), // Store client IDs
-          lsn: null           // Current LSN
+          clients: [], // Store client IDs as an array
+          lsn: null,   // Current LSN
+          clientChanges: {} // Track changes per client
         },
         logger: this.logger,
         validationService: this.validationService,
+        messageProcessor: this.messageProcessor,
         operations: {
           // API operations
           api: {
@@ -186,7 +202,10 @@ export class ScenarioRunner extends EventEmitter {
             getCurrentLSN: dbService.getCurrentLSN.bind(dbService),
             createChanges: dbService.createChanges.bind(dbService),
             createChangeBatch: dbService.createChangeBatch.bind(dbService),
-            clearDatabase: dbService.clearDatabase.bind(dbService)
+            clearDatabase: dbService.clearDatabase.bind(dbService),
+            verifyEntitiesExist: 'verifyEntitiesExist' in (dbService as any) ? (dbService as any).verifyEntitiesExist.bind(dbService) : undefined,
+            checkEntityExists: 'checkEntityExists' in (dbService as any) ? (dbService as any).checkEntityExists.bind(dbService) : undefined,
+            getEntityById: 'getEntityById' in (dbService as any) ? (dbService as any).getEntityById.bind(dbService) : undefined
           },
           // WebSocket operations
           ws: {
@@ -197,7 +216,18 @@ export class ScenarioRunner extends EventEmitter {
             disconnectClient: wsClientFactory.disconnectClient.bind(wsClientFactory),
             addMessageHandler: wsClientFactory.addMessageHandler.bind(wsClientFactory),
             removeMessageHandler: wsClientFactory.removeMessageHandler.bind(wsClientFactory),
-            waitForCatchup: wsClientFactory.waitForCatchup.bind(wsClientFactory)
+            waitForCatchup: wsClientFactory.waitForCatchup.bind(wsClientFactory),
+            sendChangesAcknowledgment: wsClientFactory.sendChangesAcknowledgment.bind(wsClientFactory),
+            removeAllMessageHandlers: wsClientFactory.removeAllMessageHandlers?.bind(wsClientFactory),
+            updateLSN: wsClientFactory.updateLSN?.bind(wsClientFactory),
+            getClientStatus: wsClientFactory.getClientStatus?.bind(wsClientFactory)
+          },
+          // Message processing operations
+          messages: {
+            process: this.messageProcessor.processWebSocketMessages.bind(this.messageProcessor),
+            processServerMessage: this.messageProcessor.processServerChangesMessage.bind(this.messageProcessor),
+            createSyntheticIds: this.messageProcessor.createSyntheticIdMapping.bind(this.messageProcessor),
+            processTableChanges: this.messageProcessor.processTableChanges.bind(this.messageProcessor)
           }
         }
       };
@@ -242,8 +272,12 @@ export class ScenarioRunner extends EventEmitter {
       
       // Execute actions based on execution mode
       if (step.execution === 'parallel') {
+        // For parallel execution, just log at debug level
+        this.logger.debug(`Executing ${step.actions.length} actions in parallel`);
         await this.executeParallelActions(step.actions, context);
       } else {
+        // For serial execution, just log at debug level
+        this.logger.debug(`Executing ${step.actions.length} actions serially`);
         await this.executeSerialActions(step.actions, context);
       }
       
@@ -289,7 +323,8 @@ export class ScenarioRunner extends EventEmitter {
    * Execute a single action
    */
   async executeAction(action: Action, context: any): Promise<any> {
-    this.logger.info(`Executing action: ${action.name || action.type}`);
+    // Log at debug level to reduce verbosity
+    this.logger.debug(`Executing action: ${action.name || action.type}`);
     
     try {
       switch (action.type) {
@@ -297,9 +332,11 @@ export class ScenarioRunner extends EventEmitter {
           return await this.executeApiAction(action as ApiAction, context);
         
         case 'db':
+          this.logger.debug(`Executing database operation: ${(action as DbAction).operation}`);
           return await this.executeDbAction(action as DbAction, context);
         
         case 'ws':
+          this.logger.debug(`Executing WebSocket operation: ${(action as WSAction).operation}`);
           return await this.executeWSAction(action as WSAction, context);
         
         case 'interactive':
@@ -308,8 +345,12 @@ export class ScenarioRunner extends EventEmitter {
         case 'composite':
           return await this.executeCompositeAction(action as CompositeAction, context);
         
+        case 'validation':
+          this.logger.debug(`Executing validation operation: ${(action as ValidationAction).operation}`);
+          return await this.executeValidationAction(action as ValidationAction, context);
+        
         default:
-          throw new Error(`Unsupported action type: ${(action as any).type}`);
+          throw new Error(`Unknown action type: ${action.type}`);
       }
     } catch (error) {
       this.logger.error(`Action failed: ${action.name || action.type} - ${error instanceof Error ? error.message : String(error)}`);
@@ -372,10 +413,10 @@ export class ScenarioRunner extends EventEmitter {
     
     // Handle standard DB operations
     if (!typedDbService[operation] || typeof typedDbService[operation] !== 'function') {
-      throw new Error(`Unknown DB operation: ${operation}`);
+      throw new Error(`Unsupported DB operation: ${operation}`);
     }
     
-    return await typedDbService[operation](this.processParams(params, context));
+    return await typedDbService[operation](params);
   }
   
   /**
@@ -385,6 +426,16 @@ export class ScenarioRunner extends EventEmitter {
     const { operation, clientId, params, waitFor } = action;
     
     this.logger.info(`Executing WebSocket operation: ${operation}`);
+    
+    // Handle custom function execution
+    if (operation === 'exec' && typeof params === 'function') {
+      try {
+        return await params(context, context.operations);
+      } catch (error) {
+        this.logger.error(`Error in WebSocket operation: ${error}`);
+        throw error;
+      }
+    }
     
     // Handle client ID references
     let resolvedClientId = clientId || '';
@@ -398,8 +449,9 @@ export class ScenarioRunner extends EventEmitter {
       resolvedClientId = value;
     }
     
+    // Handle standard WS operations
     if (!typedWsClientFactory[operation] || typeof typedWsClientFactory[operation] !== 'function') {
-      throw new Error(`Unknown WebSocket operation: ${operation}`);
+      throw new Error(`Unsupported WS operation: ${operation}`);
     }
     
     const result = await typedWsClientFactory[operation](
@@ -416,115 +468,25 @@ export class ScenarioRunner extends EventEmitter {
   }
   
   /**
-   * Execute an interactive action
+   * Execute a validation action
    */
-  async executeInteractiveAction(action: InteractiveAction, context: any): Promise<any> {
-    const { protocol, initialAction, handlers, maxTimeout } = action;
+  async executeValidationAction(action: ValidationAction, context: any): Promise<any> {
+    const { operation, params } = action;
     
-    this.logger.info(`Starting interactive protocol: ${protocol}`);
+    this.logger.info(`Executing validation operation: ${operation}`);
     
-    // Set up message handlers
-    const messagePromise = new Promise<void>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`Interactive protocol timed out after ${maxTimeout}ms`));
-      }, maxTimeout);
-      
-      // Track whether protocol is complete
-      let isComplete = false;
-      
-      // Create wrapper for handlers to provide context and operations
-      const handlerWrappers = new Map();
-      
-      // Define operations object for handlers
-      const operations = {
-        api: context.operations.api,
-        db: context.operations.db,
-        ws: context.operations.ws
-      };
-      
-      // Set up handlers
-      for (const [eventType, handler] of Object.entries(handlers)) {
-        const wrappedHandler = async (message: any) => {
-          if (isComplete) return;
-          
-          try {
-            const result = await handler(message, context, operations);
-            
-            // If handler returns true, protocol is complete
-            if (result === true) {
-              clearTimeout(timeoutId);
-              isComplete = true;
-              resolve();
-            }
-          } catch (error) {
-            clearTimeout(timeoutId);
-            isComplete = true;
-            reject(error);
-          }
-        };
-        
-        // Store in map for cleanup
-        handlerWrappers.set(eventType, wrappedHandler);
-        
-        // Register handler with appropriate component
-        if (eventType.startsWith('ws_')) {
-          // WebSocket message handlers
-          for (const clientId of context.state.clients.values()) {
-            wsClientFactory.addMessageHandler(clientId, wrappedHandler);
-          }
-        } else {
-          // Other event handlers
-          this.on(eventType, wrappedHandler);
-        }
-      }
-      
-      // Cleanup function to remove handlers
-      context.cleanup = () => {
-        clearTimeout(timeoutId);
-        for (const [eventType, handler] of handlerWrappers.entries()) {
-          if (eventType.startsWith('ws_')) {
-            for (const clientId of context.state.clients.values()) {
-              wsClientFactory.removeMessageHandler(clientId, handler);
-            }
-          } else {
-            this.removeListener(eventType, handler);
-          }
-        }
-      };
-    });
-    
-    try {
-      // Execute initial action if specified
-      if (initialAction) {
-        await this.executeAction(initialAction, context);
-      }
-      
-      // Wait for protocol to complete
-      await messagePromise;
-      
-      this.logger.info(`Interactive protocol completed: ${protocol}`);
-    } finally {
-      // Clean up handlers
-      if (context.cleanup) {
-        context.cleanup();
-        delete context.cleanup;
+    // Handle custom function execution
+    if (operation === 'exec' && typeof params === 'function') {
+      try {
+        return await params(context, context.operations);
+      } catch (error) {
+        this.logger.error(`Error in validation operation: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
       }
     }
-  }
-  
-  /**
-   * Execute a composite action
-   */
-  async executeCompositeAction(action: CompositeAction, context: any): Promise<void> {
-    const { execution, actions } = action;
     
-    this.logger.info(`Executing composite action with ${actions.length} sub-actions (${execution})`);
-    
-    if (execution === 'parallel') {
-      await this.executeParallelActions(actions, context);
-    } else {
-      await this.executeSerialActions(actions, context);
-    }
+    // If we get here, we're expecting a standard operation
+    throw new Error(`Validation operations currently only support 'exec' with function parameters`);
   }
   
   /**
@@ -547,74 +509,6 @@ export class ScenarioRunner extends EventEmitter {
       
       this.once(eventName, eventHandler);
     });
-  }
-  
-  /**
-   * Wait for a WebSocket message
-   */
-  async waitForWSMessage(clientId: string, messageType: string, timeout: number): Promise<any> {
-    this.logger.info(`Waiting for WebSocket message: ${messageType} from client ${clientId} (timeout: ${timeout}ms)`);
-    
-    return new Promise<any>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        wsClientFactory.removeMessageHandler(clientId, messageHandler);
-        reject(new Error(`Timeout waiting for message: ${messageType}`));
-      }, timeout);
-      
-      const messageHandler = (message: any) => {
-        if (message.type === messageType) {
-          clearTimeout(timeoutId);
-          wsClientFactory.removeMessageHandler(clientId, messageHandler);
-          resolve(message);
-        }
-      };
-      
-      wsClientFactory.addMessageHandler(clientId, messageHandler);
-    });
-  }
-  
-  /**
-   * Process parameters, resolving references to context values
-   */
-  processParams(params: any, context: any): any {
-    if (!params) return params;
-    
-    if (typeof params === 'string' && params.startsWith('$')) {
-      // Handle string references like $context.state.value
-      const path = params.substring(1).split('.');
-      let value = context;
-      for (const part of path) {
-        value = value[part];
-      }
-      return value;
-    }
-    
-    if (Array.isArray(params)) {
-      return params.map(item => this.processParams(item, context));
-    }
-    
-    if (typeof params === 'object' && params !== null) {
-      const result: Record<string, any> = {};
-      for (const [key, value] of Object.entries(params)) {
-        result[key] = this.processParams(value, context);
-      }
-      return result;
-    }
-    
-    return params;
-  }
-  
-  /**
-   * Process parameters array, resolving references to context values
-   */
-  processParamsArray(params: any, context: any): any[] {
-    if (!params) return [];
-    
-    if (Array.isArray(params)) {
-      return params.map(item => this.processParams(item, context));
-    }
-    
-    return [this.processParams(params, context)];
   }
   
   // API helper methods
@@ -655,4 +549,183 @@ export class ScenarioRunner extends EventEmitter {
       headers 
     }, {});
   }
-} 
+
+  /**
+   * Process parameters, resolving references to context values
+   */
+  processParams(params: any, context: any): any {
+    if (!params) return params;
+    
+    if (typeof params === 'string' && params.startsWith('$')) {
+      // Handle string references like $context.state.value
+      const path = params.substring(1).split('.');
+      let value = context;
+      for (const part of path) {
+        value = value[part];
+      }
+      return value;
+    }
+    
+    if (Array.isArray(params)) {
+      return params.map(item => this.processParams(item, context));
+    }
+    
+    if (typeof params === 'object' && params !== null) {
+      const result: Record<string, any> = {};
+      for (const [key, value] of Object.entries(params)) {
+        result[key] = this.processParams(value, context);
+      }
+      return result;
+    }
+    
+    return params;
+  }
+
+  /**
+   * Process parameters array, resolving references to context values
+   */
+  processParamsArray(params: any, context: any): any[] {
+    if (!params) return [];
+    
+    if (Array.isArray(params)) {
+      return params.map(item => this.processParams(item, context));
+    }
+    
+    return [this.processParams(params, context)];
+  }
+
+  /**
+   * Wait for a WebSocket message
+   */
+  async waitForWSMessage(clientId: string, messageType: string, timeout: number): Promise<any> {
+    this.logger.info(`Waiting for WebSocket message: ${messageType} from client ${clientId} (timeout: ${timeout}ms)`);
+    
+    return new Promise<any>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        wsClientFactory.removeMessageHandler(clientId, messageHandler);
+        reject(new Error(`Timeout waiting for message: ${messageType}`));
+      }, timeout);
+      
+      const messageHandler = (message: any) => {
+        if (message.type === messageType) {
+          clearTimeout(timeoutId);
+          wsClientFactory.removeMessageHandler(clientId, messageHandler);
+          resolve(message);
+        }
+      };
+      
+      wsClientFactory.addMessageHandler(clientId, messageHandler);
+    });
+  }
+
+  /**
+   * Execute an interactive action with protocol-based handlers
+   */
+  async executeInteractiveAction(action: InteractiveAction, context: any): Promise<any> {
+    const { protocol, initialAction, handlers, maxTimeout } = action;
+    
+    this.logger.info(`Starting interactive protocol: ${protocol}`);
+    
+    // Set up message handlers
+    const messagePromise = new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        reject(new Error(`Interactive protocol timed out after ${maxTimeout}ms`));
+      }, maxTimeout);
+      
+      // Track whether protocol is complete
+      let isComplete = false;
+      
+      // Create wrapper for handlers to provide context and operations
+      const handlerWrappers = new Map();
+      
+      // Define operations object for handlers
+      const operations = {
+        api: context.operations.api,
+        db: context.operations.db,
+        ws: context.operations.ws,
+        messages: context.operations.messages
+      };
+      
+      // Set up handlers
+      for (const [eventType, handler] of Object.entries(handlers)) {
+        this.logger.info(`Registering handler for message type: ${eventType}`);
+        
+        const wrappedHandler = async (message: any) => {
+          if (isComplete) return false;
+          
+          try {
+            this.logger.debug(`Executing handler for message type: ${eventType}`);
+            const result = await handler(message, context, operations);
+            
+            // If handler returns true, protocol is complete
+            if (result === true) {
+              this.logger.info(`Protocol ${protocol} completed by handler for ${eventType}`);
+              clearTimeout(timeoutId);
+              isComplete = true;
+              resolve();
+              return true;
+            }
+            return false;
+          } catch (error) {
+            this.logger.error(`Error in handler for ${eventType}: ${error}`);
+            clearTimeout(timeoutId);
+            isComplete = true;
+            reject(error);
+            return false;
+          }
+        };
+        
+        // Store in map for cleanup
+        handlerWrappers.set(eventType, wrappedHandler);
+        
+        // Register handler with the central message dispatcher
+        messageDispatcher.registerHandler(eventType, wrappedHandler);
+        
+        // Log that we're now listening for this event type
+        this.logger.info(`Registered handler for message type: ${eventType}`);
+      }
+      
+      // Cleanup function to remove handlers
+      context.cleanup = () => {
+        clearTimeout(timeoutId);
+        for (const [eventType, handler] of handlerWrappers.entries()) {
+          this.logger.info(`Removing handler for message type: ${eventType}`);
+          messageDispatcher.removeHandler(eventType, handler);
+        }
+      };
+    });
+    
+    try {
+      // Execute initial action if specified
+      if (initialAction) {
+        await this.executeAction(initialAction, context);
+      }
+      
+      // Wait for protocol to complete
+      await messagePromise;
+      
+      this.logger.info(`Interactive protocol completed: ${protocol}`);
+    } finally {
+      // Clean up handlers
+      if (context.cleanup) {
+        context.cleanup();
+        delete context.cleanup;
+      }
+    }
+  }
+
+  /**
+   * Execute a composite action (nested actions)
+   */
+  async executeCompositeAction(action: CompositeAction, context: any): Promise<void> {
+    const { execution, actions } = action;
+    
+    this.logger.info(`Executing composite action with ${actions.length} sub-actions (${execution})`);
+    
+    if (execution === 'parallel') {
+      await this.executeParallelActions(actions, context);
+    } else {
+      await this.executeSerialActions(actions, context);
+    }
+  }
+}

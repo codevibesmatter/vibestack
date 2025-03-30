@@ -9,7 +9,7 @@ import * as dbService from './db-service.ts';
  * Client profile interface
  */
 export interface ClientProfile {
-  id: string;         // UUID for this client
+  id: string;         // UUID for this client - this is also used as the client ID
   name: string;       // Human-readable name
   profileId: number;  // Numeric profile ID (1, 2, 3...)
   lsn: string;        // Last known LSN for this client
@@ -19,6 +19,7 @@ export interface ClientProfile {
     liveSync: number;
     catchup: number;
   };
+  // Removed activeClientId field - we'll use the profile ID directly
 }
 
 /**
@@ -148,6 +149,25 @@ export class ClientProfileManager {
   }
   
   /**
+   * Clear the active client from a profile
+   * This is kept for backward compatibility but simplified
+   * @param clientId The client ID
+   * @param profileId The profile ID
+   */
+  public clearActiveClientId(profileId: number, clientId: string): boolean {
+    const profile = this.profiles.get(profileId);
+    
+    if (!profile) {
+      this.logger.warn(`Profile ${profileId} not found when clearing client ID`);
+      return false;
+    }
+    
+    // Since we're using profile.id as clientId, we just log this action
+    this.logger.info(`Cleared active client ${clientId} from profile ${profileId}`);
+    return true;
+  }
+  
+  /**
    * Record a test run for a client profile
    */
   public recordTestRun(profileId: number, testType: 'initial' | 'liveSync' | 'catchup'): void {
@@ -176,5 +196,22 @@ export class ClientProfileManager {
       this.logger.info(`Deleted client profile ID: ${profileId}`);
     }
     return deleted;
+  }
+  
+  /**
+   * Get client ID from profile
+   * Simplified to just return the profile's ID as the client ID
+   * @param profileId The profile ID to use
+   * @returns The client ID and profile
+   */
+  public async getOrReuseClient(profileId: number = 1): Promise<{clientId: string, profile: ClientProfile}> {
+    // Get the profile first
+    const profile = await this.getProfile(profileId);
+    
+    // Use the profile's ID as the client ID
+    const clientId = profile.id;
+    
+    this.logger.info(`Using client ID ${clientId} for profile ${profileId}`);
+    return { clientId, profile };
   }
 } 

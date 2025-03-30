@@ -273,19 +273,8 @@ export async function performCatchupSync(
             return compareLSN(a.lsn || '0/0', b.lsn || '0/0');
           });
           
-          // Deduplicate changes to avoid processing duplicates
-          const deduplicatedChanges = deduplicateChanges(allChanges);
-          
-          // Log deduplication results
-          syncLogger.info('Deduplicated historical changes', {
-            clientId,
-            originalCount: allChanges.length,
-            deduplicatedCount: deduplicatedChanges.length,
-            reduction: allChanges.length - deduplicatedChanges.length
-          }, MODULE_NAME);
-          
-          // Order changes based on domain hierarchy
-          const orderedChanges = baseOrderChangesByDomain(deduplicatedChanges);
+          // Use the original changes since deduplication already happened in process-changes.ts
+          const orderedChanges = baseOrderChangesByDomain(allChanges);
           
           // Send changes with flow control - wait for acknowledgment after each chunk
           await sendCatchupChanges(
@@ -429,6 +418,9 @@ export async function sendLiveChanges(
     let orderedChanges = changes;
     
     // Deduplicate in case we have overlapping changes
+    // NOTE: Deduplication is now handled in process-changes.ts, keeping this commented
+    // as a reference but skipping the operation to avoid double work
+    /*
     if (changes.length > 1) {
       orderedChanges = deduplicateChanges(changes);
       syncLogger.debug('Deduplicated changes', {
@@ -436,6 +428,7 @@ export async function sendLiveChanges(
         after: orderedChanges.length
       }, MODULE_TAG);
     }
+    */
     
     // Filter out changes that originated from this client
     const originalCount = orderedChanges.length;

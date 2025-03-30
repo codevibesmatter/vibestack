@@ -1,4 +1,4 @@
-import type { TableChange } from '@repo/sync-types';
+import type { TableChange, ServerSyncStatsMessage } from '@repo/sync-types';
 import { replicationLogger } from '../middleware/logger';
 import type { MinimalContext } from '../types/hono';
 import type { WALData, PostgresWALMessage } from '../types/wal';
@@ -19,6 +19,7 @@ type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
 // ====== Constants ======
 const DEFAULT_STORE_BATCH_SIZE = 100;
+const DEFAULT_CHUNK_SIZE = 500; // Added for chunking broadcasts
 
 // ====== Helper Functions ======
 export function shouldTrackTable(tableName: string): boolean {
@@ -93,6 +94,15 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
   // Track latest changes and inserts for optimization
   const latestChanges = new Map<string, TableChange>();
   const insertMap = new Map<string, TableChange>();
+  
+  // Tracking stats for detailed reporting
+  const originalCount = changes.length;
+  const operationCounts: Record<string, number> = {
+    insert: 0,
+    update: 0,
+    delete: 0
+  };
+  const tableStats: Record<string, number> = {};
 
   // First pass - deduplicate and optimize
   for (const change of changes) {
@@ -100,6 +110,12 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
 
     const key = `${change.table}:${change.data.id}`;
     const existing = latestChanges.get(key);
+    
+    // Track operation stats
+    operationCounts[change.operation] = (operationCounts[change.operation] || 0) + 1;
+    
+    // Track table stats
+    tableStats[change.table] = (tableStats[change.table] || 0) + 1;
     
     // Track inserts for optimization
     if (change.operation === 'insert') {
@@ -167,6 +183,23 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
     // For creates/updates, follow hierarchy
     return aLevel - bLevel;
   });
+
+  // Log detailed deduplication statistics
+  const deduplicatedCount = latestChanges.size;
+  replicationLogger.info('Change deduplication results', {
+    originalCount,
+    deduplicatedCount,
+    reduction: originalCount - deduplicatedCount,
+    reductionPercent: originalCount > 0 ? 
+      Math.round(((originalCount - deduplicatedCount) / originalCount) * 100) : 0,
+    operationCounts,
+    tableStats,
+    clientCount: changesByClient.size,
+    clientChangeDetails: Object.fromEntries(
+      Array.from(changesByClient.entries())
+        .map(([id, changes]) => [id || 'system', changes.length])
+    )
+  }, MODULE_NAME);
 
   return {
     deduplicatedChanges: orderedChanges,
@@ -384,32 +417,57 @@ export async function broadcastChangesToClients(
           const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
           const clientDo = env.SYNC.get(clientDoId);
           
-          const response = await clientDo.fetch(
-            `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                changes: allChangesToSend,
-                lsn: lastLSN
-              })
-            }
-          );
+          // Implement chunking for large change sets
+          const chunks = Math.ceil(allChangesToSend.length / DEFAULT_CHUNK_SIZE);
+          let chunkSuccess = true;
           
-          if (response.status === 200) {
-            totalChangesSent += allChangesToSend.length;
+          for (let i = 0; i < chunks; i++) {
+            const start = i * DEFAULT_CHUNK_SIZE;
+            const end = Math.min(start + DEFAULT_CHUNK_SIZE, allChangesToSend.length);
+            const chunkChanges = allChangesToSend.slice(start, end);
             
-            replicationLogger.debug('Client changes sent', { 
+            const response = await clientDo.fetch(
+              `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  changes: chunkChanges,
+                  lsn: lastLSN,
+                  sequence: { chunk: i + 1, total: chunks }
+                })
+              }
+            );
+            
+            if (response.status === 200) {
+              totalChangesSent += chunkChanges.length;
+              
+              replicationLogger.debug('Client changes chunk sent', { 
+                clientId,
+                changeCount: chunkChanges.length,
+                chunk: i + 1,
+                total: chunks,
+                tables: [...new Set(chunkChanges.map(c => c.table))]
+              }, MODULE_NAME);
+            } else {
+              chunkSuccess = false;
+              replicationLogger.warn('Failed to send changes chunk to client', {
+                clientId,
+                status: response.status,
+                chunk: i + 1,
+                total: chunks
+              }, MODULE_NAME);
+              // Don't break, try all chunks
+            }
+          }
+          
+          if (chunkSuccess) {
+            replicationLogger.debug('All client changes sent successfully', { 
               clientId,
-              changeCount: allChangesToSend.length,
-              tables: [...new Set(allChangesToSend.map(c => c.table))]
-            }, MODULE_NAME);
-          } else {
-            replicationLogger.warn('Failed to send changes to client', {
-              clientId,
-              status: response.status
+              totalChunks: chunks,
+              totalChanges: allChangesToSend.length
             }, MODULE_NAME);
           }
         } catch (error) {
@@ -451,6 +509,132 @@ export async function broadcastChangesToClients(
   }
 }
 
+/**
+ * Create a stats message with detailed information about change processing
+ * Can be tailored for a specific client or general system stats
+ */
+function createSyncStatsMessage(
+  clientId: string,
+  syncType: 'live' | 'catchup' | 'initial',
+  originalCount: number,
+  processedCount: number,
+  filteredCount: number,
+  operationCounts: Record<string, number>,
+  tableStats: Record<string, number>,
+  clientStats: Record<string, number>,
+  filterReasons: Record<string, number> = {},
+  deduplicationReasons: Record<string, number> = {},
+  startTime: number,
+  lsnFirst?: string,
+  lsnLast?: string,
+  clientFilteredCount: number = 0, // Additional tracking for client-specific filtering
+  filteredChangeDetails: Array<{id: string, table: string, reason: string}> = [] // Details of filtered changes
+): ServerSyncStatsMessage {
+  const processingTime = Date.now() - startTime;
+  
+  // Calculate deduplication stats
+  const deduplicationStats = {
+    beforeCount: originalCount,
+    afterCount: processedCount,
+    reduction: originalCount - processedCount,
+    reductionPercent: originalCount > 0 ?
+      Math.round(((originalCount - processedCount) / originalCount) * 100) : 0,
+    reasons: deduplicationReasons
+  };
+  
+  // Calculate filtering stats
+  const filteringStats = {
+    beforeCount: originalCount,
+    afterCount: originalCount - filteredCount - clientFilteredCount,
+    filtered: filteredCount + clientFilteredCount,
+    reasons: {
+      ...filterReasons,
+      // Add client-specific filter reason if applicable
+      'client_own_changes': clientFilteredCount
+    },
+    // Include details of filtered changes
+    filteredChanges: filteredChangeDetails
+  };
+  
+  // Create the stats message
+  const statsMessage: ServerSyncStatsMessage = {
+    type: 'srv_sync_stats',
+    messageId: `stats_${Date.now()}`,
+    timestamp: Date.now(),
+    clientId,
+    syncType,
+    originalCount,
+    processedCount,
+    deduplicationStats,
+    filteringStats,
+    contentStats: {
+      operations: operationCounts,
+      tables: tableStats,
+      clients: clientStats
+    },
+    performanceStats: {
+      processingTimeMs: processingTime
+    }
+  };
+  
+  // Add LSN range if available
+  if (lsnFirst && lsnLast) {
+    statsMessage.lsnRange = {
+      first: lsnFirst,
+      last: lsnLast
+    };
+  }
+  
+  return statsMessage;
+}
+
+/**
+ * Send stats message to a client's SyncDO
+ */
+async function sendStatsToClient(
+  env: Env,
+  clientId: string,
+  statsMessage: ServerSyncStatsMessage
+): Promise<boolean> {
+  try {
+    const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
+    const clientDo = env.SYNC.get(clientDoId);
+    
+    const response = await clientDo.fetch(
+      `https://internal/sync-stats?clientId=${encodeURIComponent(clientId)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(statsMessage)
+      }
+    );
+    
+    if (response.status === 200) {
+      replicationLogger.debug('Sent stats message to client', { 
+        clientId,
+        syncType: statsMessage.syncType,
+        originalCount: statsMessage.originalCount,
+        processedCount: statsMessage.processedCount
+      }, MODULE_NAME);
+      return true;
+    } else {
+      replicationLogger.warn('Failed to send stats to client', {
+        clientId,
+        status: response.status
+      }, MODULE_NAME);
+      return false;
+    }
+  } catch (error) {
+    replicationLogger.error('Stats message send failed', {
+      clientId,
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
+    return false;
+  }
+}
+
 // ====== Main Process Function ======
 export async function processChanges(
   changes: WALData[],
@@ -464,6 +648,7 @@ export async function processChanges(
   }
 
   const lastLSN = changes[changes.length - 1].lsn;
+  const startTime = Date.now(); // Track processing time
 
   try {
     // Step 1: Transform
@@ -542,6 +727,114 @@ export async function processChanges(
     
     // Step 5: Broadcast
     await broadcastChangesToClients(env, deduplicatedChanges, changesByClient, lastLSN, stateManager);
+    
+    // Step 6: Send client-specific stats messages
+    // Extract operation and table stats
+    const operationCounts = deduplicatedChanges.reduce((acc, change) => {
+      acc[change.operation] = (acc[change.operation] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    
+    const tableStats = deduplicatedChanges.reduce((acc, change) => {
+      acc[change.table] = (acc[change.table] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    
+    // Extract client stats
+    const clientStats = Object.fromEntries(
+      Array.from(changesByClient.entries())
+        .map(([id, changes]) => [id || 'system', changes.length])
+    );
+    
+    // Get first LSN
+    const firstLSN = deduplicatedChanges.length > 0 ? deduplicatedChanges[0].lsn : undefined;
+    
+    // Get client IDs
+    const clientIds = await getAllClientIds(env);
+    
+    // For each client, calculate specific stats and send a tailored message
+    for (const clientId of clientIds) {
+      // Get changes made by this client (if any)
+      const clientChanges = changesByClient.get(clientId) || [];
+      const clientChangeIds = new Set(clientChanges.map(c => `${c.table}:${c.data.id}`));
+      
+      // Calculate how many changes were filtered out specifically for this client
+      // (excludes client's own changes from being sent back to them)
+      const clientOwnChangesCount = clientChanges.length;
+      
+      // Collect details of client's own filtered changes
+      const clientFilteredChanges: Array<{id: string, table: string, reason: string}> = clientChanges.map(change => ({
+        id: String(change.data.id),
+        table: change.table,
+        reason: 'client_own_change'
+      }));
+      
+      // Also collect system-filtered changes
+      const systemFilteredChanges: Array<{id: string, table: string, reason: string}> = [];
+      
+      // If we have detailed filter reasons from the WAL transformation, add them
+      if (Object.keys(filteredReasons).length > 0) {
+        // This is approximate since we don't track exact changes that were filtered during WAL transformation
+        Object.entries(filteredReasons).forEach(([reason, count]) => {
+          for (let i = 0; i < count; i++) {
+            systemFilteredChanges.push({
+              id: `unknown-${i}`,
+              table: 'unknown',
+              reason
+            });
+          }
+        });
+      }
+      
+      // Combine all filtered change details
+      const allFilteredChanges = [...clientFilteredChanges, ...systemFilteredChanges];
+      
+      // Calculate client-specific tables and operations stats
+      // These should reflect only the changes this client will receive
+      const relevantChanges = deduplicatedChanges.filter(change => {
+        // Skip if this change was made by this client
+        if (change.data.client_id === clientId) {
+          return false;
+        }
+        
+        // Skip if we have another change for this record from this client
+        const changeKey = `${change.table}:${change.data.id}`;
+        return !clientChangeIds.has(changeKey);
+      });
+      
+      // Calculate client-specific operation stats
+      const clientOperationCounts = relevantChanges.reduce((acc, change) => {
+        acc[change.operation] = (acc[change.operation] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
+      // Calculate client-specific table stats
+      const clientTableStats = relevantChanges.reduce((acc, change) => {
+        acc[change.table] = (acc[change.table] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
+      // Create client-specific stats message
+      const statsMessage = createSyncStatsMessage(
+        clientId,
+        'live', // This is always live sync in process-changes
+        tableChanges.length,
+        deduplicatedChanges.length,
+        filteredCount,
+        clientOperationCounts, // Use client-specific operation stats
+        clientTableStats,      // Use client-specific table stats
+        clientStats,
+        filteredReasons,
+        {}, // We don't track specific deduplication reasons yet
+        startTime,
+        firstLSN,
+        lastLSN,
+        clientOwnChangesCount,  // Add client's own changes count for filtering stats
+        allFilteredChanges      // Add details of all filtered changes
+      );
+      
+      await sendStatsToClient(env, clientId, statsMessage);
+    }
     
     return { 
       success: true, 

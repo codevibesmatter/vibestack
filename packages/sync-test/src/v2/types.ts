@@ -25,6 +25,7 @@ export interface EntityChange {
   operation: Operation;
   data?: Record<string, any>;
   timestamp: number;
+  originalId?: string;
 }
 
 export interface MessageStats {
@@ -61,16 +62,29 @@ export interface TestValidationResult {
   };
 }
 
+/**
+ * Interface for missing change reports
+ */
 export interface MissingChangeReport {
-  change: EntityChange;
-  reason: string;
+  id: string;
+  entityType: EntityType | string;
+  operation: Operation | string;
   timestamp: number;
+  reason?: string;
+  change?: EntityChange;
 }
 
+/**
+ * Interface for duplicate change reports
+ */
 export interface DuplicateChangeReport {
-  change: EntityChange;
-  originalChange: EntityChange;
+  id: string;
+  entityType: EntityType | string;
+  operation: Operation | string;
+  count: number;
   timestamp: number;
+  change?: EntityChange;
+  originalChange?: EntityChange;
 }
 
 export interface BatchConfig {
@@ -200,6 +214,7 @@ export enum ServerMessageType {
   SYNC_COMPLETED = 'srv_sync_completed',
   CATCHUP_COMPLETED = 'srv_catchup_completed',
   ERROR = 'srv_error',
+  SYNC_STATS = 'srv_sync_stats',
 }
 
 /**
@@ -258,6 +273,48 @@ export interface ServerCatchupCompletedMessage extends WebSocketMessage {
   changeCount: number;
   startLSN?: string;
   finalLSN: string;
+}
+
+/**
+ * Server sync stats message interface
+ */
+export interface ServerSyncStatsMessage extends WebSocketMessage {
+  type: ServerMessageType.SYNC_STATS;
+  syncType: 'live' | 'catchup' | 'initial';
+  originalCount: number;
+  processedCount: number;
+  deduplicationStats?: {
+    beforeCount: number;
+    afterCount: number;
+    reduction: number;
+    reductionPercent: number;
+    reasons: Record<string, number>;
+  };
+  filteringStats?: {
+    beforeCount: number;
+    afterCount: number;
+    filtered: number;
+    reasons: Record<string, number>;
+    filteredChanges?: Array<{
+      id: string;
+      table: string;
+      reason: string;
+    }>;
+  };
+  contentStats?: {
+    operations: Record<string, number>;
+    tables: Record<string, number>;
+    clients: Record<string, number>;
+  };
+  performanceStats?: {
+    processingTimeMs: number;
+    dbQueryTimeMs?: number;
+    networkTimeMs?: number;
+  };
+  lsnRange?: {
+    first: string;
+    last: string;
+  };
 }
 
 /**

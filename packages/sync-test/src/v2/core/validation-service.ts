@@ -8,6 +8,10 @@ import {
   DuplicateChangeReport
 } from '../types.ts';
 import { createLogger } from './logger.ts';
+import type {
+  TableChange,
+  ServerChangesMessage
+} from '@repo/sync-types';
 
 /**
  * ValidationResult interface for validation checks
@@ -36,12 +40,26 @@ export interface ValidationOptions {
 }
 
 /**
+ * MissingChangeVerificationResult interface for database verification results
+ */
+export interface MissingChangeVerificationResult {
+  change: EntityChange;
+  existsInDatabase: boolean;
+  verificationFailed?: boolean;
+  entityType: EntityType;
+  operation: Operation;
+  error?: string;
+}
+
+/**
  * ValidationService handles tracking and validating changes
  * between database operations and client receipts
  */
 export class ValidationService {
   private logger = createLogger('Validation');
   private sessionId: string;
+  private verbose: boolean = false;
+  private idMapping: Record<string, string> = {}; // Map from synthetic IDs to real IDs
   
   // Change tracking collections
   private expectedChanges: Map<string, EntityChange> = new Map();
@@ -80,15 +98,18 @@ export class ValidationService {
   /**
    * Create a new validation service
    */
-  constructor(options?: Partial<ValidationOptions>) {
+  constructor(options?: Partial<ValidationOptions>, verbose: boolean = false) {
     this.sessionId = uuidv4().substring(0, 8);
+    this.verbose = verbose;
     
     if (options) {
       this.options = { ...this.options, ...options };
     }
     
     this.logger.info(`ValidationService created with session ID: ${this.sessionId}`);
-    this.logger.info(`Options: ${JSON.stringify(this.options)}`);
+    if (this.verbose) {
+      this.logger.info(`Options: ${JSON.stringify(this.options)}`);
+    }
     
     this.reset();
   }
@@ -161,7 +182,9 @@ export class ValidationService {
       this.stats.byOperation.delete++;
     }
     
-    this.logger.debug(`Tracked expected change: ${changeKey} (type: ${change.type}, op: ${change.operation})`);
+    if (this.verbose) {
+      this.logger.debug(`Tracked expected change: ${changeKey} (type: ${change.type}, op: ${change.operation})`);
+    }
   }
   
   /**
@@ -176,8 +199,42 @@ export class ValidationService {
     this.logger.info(`Tracking batch of ${changes.length} expected changes`);
     
     for (const change of changes) {
+      // Skip invalid changes
+      if (!change || !change.id) {
+        this.logger.warn('Invalid change object skipped');
+        continue;
+      }
+      
+      // Store valid entity type
+      if (!change.type || !this.isValidEntityType(change.type)) {
+        this.logger.warn(`Invalid entity type for change ${change.id}: ${change.type}`);
+        
+        // Try to infer type from ID if synthetic
+        if (change.id.includes('-')) {
+          const parts = change.id.split('-');
+          if (parts.length > 1 && this.isValidEntityType(parts[1])) {
+            this.logger.info(`Inferring entity type '${parts[1]}' for change ${change.id}`);
+            change.type = parts[1] as EntityType;
+          }
+        }
+        
+        // If still invalid, skip
+        if (!change.type || !this.isValidEntityType(change.type)) {
+          this.logger.warn(`Skipping change with invalid type: ${change.id}`);
+          continue;
+        }
+      }
+      
+      // Track the change
       this.trackExpectedChange(change);
     }
+  }
+  
+  /**
+   * Check if an entity type is valid
+   */
+  private isValidEntityType(type: string): boolean {
+    return ['user', 'post', 'comment', 'project', 'task'].includes(type);
   }
   
   /**
@@ -201,98 +258,166 @@ export class ValidationService {
     // Store the change
     this.receivedChanges.set(changeKey, change);
     
-    this.logger.debug(`Tracked received change: ${changeKey} (type: ${change.type}, op: ${change.operation})`);
+    if (this.verbose) {
+      this.logger.debug(`Tracked received change: ${changeKey} (type: ${change.type}, op: ${change.operation})`);
+    }
   }
   
   /**
-   * Track a batch of received changes from the client
+   * Track a batch of received changes from server
    */
   public trackReceivedChanges(changes: EntityChange[]): void {
     if (!changes || !Array.isArray(changes) || changes.length === 0) {
-      this.logger.warn('No changes provided to trackReceivedChanges');
+      this.logger.debug('No changes provided to trackReceivedChanges');
       return;
     }
     
     this.logger.info(`Tracking batch of ${changes.length} received changes`);
     
+    // Count duplicates to reduce logging noise
+    let duplicateCount = 0;
+    let newChangeCount = 0;
+    
     for (const change of changes) {
-      this.trackReceivedChange(change);
+      if (!change || !change.id) {
+        this.logger.debug('Invalid change object skipped');
+        continue;
+      }
+      
+      // Get a consistent change key
+      const changeKey = this.getChangeKey(change);
+      
+      // Check if this change was already received (duplicate)
+      if (this.receivedChanges.has(changeKey)) {
+        // Add to duplicates
+        if (!this.duplicateChanges.has(changeKey)) {
+          this.duplicateChanges.set(changeKey, []);
+        }
+        this.duplicateChanges.get(changeKey)!.push(change);
+        
+        // Count but don't log each duplicate individually
+        duplicateCount++;
+      } else {
+        // New change
+        this.receivedChanges.set(changeKey, change);
+        newChangeCount++;
+      }
     }
+    
+    // Log summary of duplicates instead of individual messages
+    if (duplicateCount > 0) {
+      this.logger.warn(`Received ${duplicateCount} duplicate changes out of ${changes.length} total`);
+    }
+    
+    this.logger.info(`Tracked ${newChangeCount} new changes, ignored ${duplicateCount} duplicates`);
   }
   
   /**
-   * Validate changes to see if all expected changes were received
+   * Get missing changes that were expected but not received
+   */
+  public getMissingChanges(): EntityChange[] {
+    const missing: EntityChange[] = [];
+    
+    // Loop through expected changes and check if they were received
+    for (const [changeKey, change] of this.expectedChanges.entries()) {
+      if (!this.receivedChanges.has(changeKey)) {
+        // Add safety check to ensure entity type is preserved
+        if (!change.type) {
+          this.logger.warn(`Expected change missing entity type: ${JSON.stringify(change)}`);
+          // Try to infer the type from the change key
+          const keyParts = changeKey.split(':');
+          if (keyParts.length > 0) {
+            this.logger.info(`Inferring entity type '${keyParts[0]}' from change key: ${changeKey}`);
+            change.type = keyParts[0] as EntityType;
+          }
+        }
+        
+        missing.push(change);
+      }
+    }
+    
+    // Log summary
+    if (missing.length > 0) {
+      const byType: Record<string, number> = {};
+      const byOperation: Record<string, number> = {};
+      
+      for (const change of missing) {
+        // Safety check before incrementing counts
+        const type = change.type || 'unknown';
+        const operation = change.operation || 'unknown';
+        
+        byType[type] = (byType[type] || 0) + 1;
+        byOperation[operation] = (byOperation[operation] || 0) + 1;
+      }
+      
+      this.logger.warn(`❌ Validation failed! Missing ${missing.length} changes.`);
+      this.logger.warn(`Missing by type: ${JSON.stringify(byType)}`);
+      this.logger.warn(`Missing by operation: ${JSON.stringify(byOperation)}`);
+    }
+    
+    return missing;
+  }
+  
+  /**
+   * Validate the changes to see if all expected changes were received
    */
   public validate(): ValidationResult {
     this.endTime = Date.now();
     const duration = this.endTime - this.startTime;
     
     this.logger.info(`Validating changes after ${duration}ms`);
-    this.logger.info(`Expected: ${this.expectedChanges.size}, Received: ${this.receivedChanges.size}`);
     
-    // Find missing changes
+    // Get the number of expected and received changes
+    const totalExpected = this.expectedChanges.size;
+    const totalReceived = this.receivedChanges.size;
+    
+    this.logger.info(`Expected: ${totalExpected}, Received: ${totalReceived}`);
+    
+    // Check for missing changes
     const missingChanges: MissingChangeReport[] = [];
+    const missingEntities = this.getMissingChanges();
     
-    for (const [changeKey, expectedChange] of this.expectedChanges.entries()) {
-      if (!this.receivedChanges.has(changeKey)) {
-        missingChanges.push({
-          change: expectedChange,
-          reason: 'Not received',
-          timestamp: Date.now()
-        });
-      }
-    }
-    
-    // Find duplicate changes
-    const duplicateChangeReports: DuplicateChangeReport[] = [];
-    
-    for (const [changeKey, duplicates] of this.duplicateChanges.entries()) {
-      const originalChange = this.receivedChanges.get(changeKey) || duplicates[0];
+    for (const change of missingEntities) {
+      // Ensure we have a type, use unknown if missing
+      const entityType = change.type || 'unknown';
+      const operation = change.operation || 'unknown';
       
-      for (const duplicate of duplicates) {
-        duplicateChangeReports.push({
-          change: duplicate,
-          originalChange,
-          timestamp: Date.now()
+      missingChanges.push({
+        id: change.id,
+        entityType, 
+        operation,
+        timestamp: change.timestamp || 0
+      });
+    }
+    
+    // Check for duplicate changes
+    const duplicateChanges: DuplicateChangeReport[] = [];
+    for (const [key, changes] of this.duplicateChanges.entries()) {
+      if (changes.length > 0) {
+        const change = changes[0];
+        duplicateChanges.push({
+          id: change.id,
+          entityType: change.type || 'unknown',
+          operation: change.operation || 'unknown',
+          count: changes.length,
+          timestamp: change.timestamp || 0
         });
       }
     }
     
-    // Generate full validation result
-    const result: ValidationResult = {
-      success: missingChanges.length === 0,
-      totalExpected: this.expectedChanges.size,
-      totalReceived: this.receivedChanges.size,
+    // Success is when we have no missing changes
+    const success = missingChanges.length === 0;
+    
+    return {
+      success,
+      totalExpected,
+      totalReceived,
       missingChanges,
-      duplicateChanges: duplicateChangeReports,
-      stats: { ...this.stats },
-      completedAt: new Date(),
+      duplicateChanges,
+      stats: this.stats,
+      completedAt: new Date(this.endTime),
       duration
     };
-    
-    // Log validation results
-    if (result.success) {
-      this.logger.info(`✅ Validation successful! All ${result.totalExpected} changes received.`);
-    } else {
-      this.logger.warn(`❌ Validation failed! Missing ${missingChanges.length} changes.`);
-      
-      // Log detailed missing changes info by type and operation
-      const missingByType: Record<string, number> = {};
-      const missingByOp: Record<string, number> = {};
-      
-      for (const missing of missingChanges) {
-        const type = missing.change.type;
-        const op = missing.change.operation;
-        
-        missingByType[type] = (missingByType[type] || 0) + 1;
-        missingByOp[op] = (missingByOp[op] || 0) + 1;
-      }
-      
-      this.logger.warn(`Missing by type: ${JSON.stringify(missingByType)}`);
-      this.logger.warn(`Missing by operation: ${JSON.stringify(missingByOp)}`);
-    }
-    
-    return result;
   }
   
   /**
@@ -345,7 +470,7 @@ export class ValidationService {
       
       for (let i = 0; i < Math.min(10, result.missingChanges.length); i++) {
         const missing = result.missingChanges[i];
-        summary.push(`  - ${missing.change.type}.${missing.change.operation}: ${missing.change.id}`);
+        summary.push(`  - ${missing.entityType}.${missing.operation}: ${missing.id}`);
       }
       
       if (result.missingChanges.length > 10) {
@@ -417,5 +542,228 @@ export class ValidationService {
     }
     
     return `${change.type}:${change.id}:${change.operation}`;
+  }
+  
+  /**
+   * Set ID mapping for database verification
+   * This allows the validation service to correctly verify IDs in the database
+   * when synthetic IDs are used for tracking
+   */
+  public setIdMapping(mapping: Record<string, string>): void {
+    this.idMapping = mapping || {};
+    if (this.verbose) {
+      this.logger.info(`Set ID mapping with ${Object.keys(this.idMapping).length} entries`);
+    }
+  }
+  
+  /**
+   * Process verification result considering operation type
+   * @param result Initial verification result
+   * @returns Updated verification result with operation-aware validity
+   */
+  private processDatabaseVerificationResult(result: MissingChangeVerificationResult): MissingChangeVerificationResult {
+    // For delete operations, entity SHOULD NOT exist in database if deletion was successful
+    if (result.operation === 'delete') {
+      return {
+        ...result,
+        // For deletes, NOT finding the entity means success, finding it means failure
+        existsInDatabase: !result.existsInDatabase
+      };
+    }
+    // For create/update operations, entity SHOULD exist in database
+    return result;
+  }
+  
+  /**
+   * Verify missing changes against database
+   */
+  public async verifyMissingChangesInDatabase(
+    missingChanges: EntityChange[],
+    dbConnection: any
+  ): Promise<MissingChangeVerificationResult[]> {
+    if (!missingChanges || !missingChanges.length) {
+      return [];
+    }
+    
+    this.logger.info(`Verifying ${missingChanges.length} missing changes in database...`);
+    
+    // Group missing changes by entity type for efficient querying
+    const changesByType: Record<string, EntityChange[]> = {};
+    
+    for (const missingChange of missingChanges) {
+      // Skip if missing change has no type
+      if (!missingChange.type) {
+        this.logger.warn(`Missing type for change: ${JSON.stringify(missingChange)}`);
+        continue;
+      }
+      
+      const entityType = missingChange.type;
+      if (!changesByType[entityType]) {
+        changesByType[entityType] = [];
+      }
+      changesByType[entityType].push(missingChange);
+    }
+    
+    // Get table mapping
+    const tableMap: Record<string, string> = {
+      task: 'tasks',
+      project: 'projects',
+      user: 'users',
+      comment: 'comments'
+    };
+    
+    // Verify each entity type in database
+    const verificationResults: MissingChangeVerificationResult[] = [];
+    
+    for (const [entityType, changes] of Object.entries(changesByType)) {
+      // Skip if we don't have a table mapping
+      if (!tableMap[entityType]) {
+        this.logger.warn(`No table mapping for entity type: ${entityType}`);
+        continue;
+      }
+      
+      const table = tableMap[entityType];
+      
+      // Use actual IDs directly instead of mapping synthetic IDs
+      for (const change of changes) {
+        if (!change.id || change.id === '') {
+          this.logger.warn(`Missing ID for change: ${JSON.stringify(change)}`);
+          continue;
+        }
+        
+        try {
+          // Use the checkEntityExists method from db-service
+          let existsInDb = false;
+          
+          if (dbConnection.checkEntityExists) {
+            // Use the helper method for better separation of concerns
+            existsInDb = await dbConnection.checkEntityExists(table, change.id);
+          } else if (dbConnection.verifyEntitiesExist) {
+            // Backward compatibility with the deprecated method
+            const existingIds = await dbConnection.verifyEntitiesExist(table, [change.id]);
+            existsInDb = existingIds.includes(change.id);
+          } else {
+            // No database verification method available
+            this.logger.warn('No database verification method available');
+            verificationResults.push({
+              change,
+              existsInDatabase: false,
+              verificationFailed: true,
+              entityType: entityType as EntityType,
+              operation: change.operation,
+              error: 'Database verification methods not available'
+            });
+            continue;
+          }
+          
+          // Create the base verification result
+          const baseResult: MissingChangeVerificationResult = {
+            change,
+            existsInDatabase: existsInDb,
+            entityType: entityType as EntityType,
+            operation: change.operation
+          };
+          
+          // Process result based on operation type
+          const processedResult = this.processDatabaseVerificationResult(baseResult);
+          verificationResults.push(processedResult);
+          
+          // Determine if entity is truly valid based on operation
+          const isActuallyValid = 
+            (change.operation === 'delete' && !existsInDb) || // Delete success: not in DB
+            (change.operation !== 'delete' && existsInDb);
+          
+          if (this.verbose) {
+            const status = isActuallyValid ? 'VALID' : 'INVALID';
+            this.logger.info(`Change ${change.id} (${entityType}.${change.operation}): ${status} (DB existence: ${existsInDb ? 'TRUE' : 'FALSE'})`);
+          }
+        } catch (error) {
+          this.logger.error(`Error verifying change in database: ${change.id} (${entityType}): ${error}`);
+          
+          // Add failed verification result
+          verificationResults.push({
+            change,
+            existsInDatabase: false,
+            verificationFailed: true,
+            entityType: entityType as EntityType,
+            operation: change.operation,
+            error: String(error)
+          });
+        }
+      }
+    }
+    
+    return verificationResults;
+  }
+  
+  /**
+   * Generate detailed missing changes report with database verification
+   */
+  public async getDetailedMissingReport(
+    dbConnection: any,
+    tableMap: Record<EntityType, string>
+  ): Promise<string> {
+    const missingChanges = this.getMissingChanges();
+    const dbVerification = await this.verifyMissingChangesInDatabase(missingChanges, dbConnection);
+    const validationResult = this.validate();
+    
+    const summary = [
+      `Detailed Missing Changes Report`,
+      `------------------------------`,
+      `Total Expected: ${validationResult.totalExpected}`,
+      `Total Received: ${validationResult.totalReceived}`,
+      `Missing: ${validationResult.missingChanges.length}`,
+      ``
+    ];
+    
+    // Group verification results by entity type
+    const resultsByType: Record<string, MissingChangeVerificationResult[]> = {};
+    
+    for (const result of dbVerification) {
+      if (!resultsByType[result.entityType]) {
+        resultsByType[result.entityType] = [];
+      }
+      resultsByType[result.entityType].push(result);
+    }
+    
+    // Add detailed breakdown by entity type
+    if (Object.keys(resultsByType).length === 0) {
+      summary.push(`No missing changes to verify`);
+    } else {
+      for (const [entityType, results] of Object.entries(resultsByType)) {
+        summary.push(`${entityType}:`);
+        
+        // Group by operation
+        const byOperation: Record<string, MissingChangeVerificationResult[]> = {};
+        for (const result of results) {
+          if (!byOperation[result.operation]) {
+            byOperation[result.operation] = [];
+          }
+          byOperation[result.operation].push(result);
+        }
+        
+        // Report by operation
+        for (const [operation, opResults] of Object.entries(byOperation)) {
+          summary.push(`  ${operation}:`);
+          
+          for (const result of opResults) {
+            const status = result.verificationFailed 
+              ? '❓ VERIFICATION FAILED' 
+              : result.existsInDatabase 
+                ? '✅ EXISTS IN DB'
+                : '❌ MISSING FROM DB';
+            
+            // Simply display the change ID
+            const idDisplay = result.change.id;
+              
+            summary.push(`    - ${idDisplay}: ${status}`);
+          }
+        }
+        
+        summary.push(``);
+      }
+    }
+    
+    return summary.join('\n');
   }
 } 

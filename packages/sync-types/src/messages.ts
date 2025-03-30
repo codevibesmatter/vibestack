@@ -14,7 +14,8 @@ export type SrvMessageType =
   | 'srv_changes_received' // Server acknowledges receipt of changes
   | 'srv_changes_applied'  // Server signals changes were applied
   | 'srv_sync_completed'   // Generic sync completion (for live sync)
-  | 'srv_catchup_completed'; // Catchup sync completion
+  | 'srv_catchup_completed'
+  | 'srv_sync_stats';      // Server sends sync statistics
 
 export type CltMessageType =
   | 'clt_sync_request'      // Client requests sync
@@ -116,6 +117,72 @@ export interface ServerCatchupCompletedMessage extends ServerMessage {
   changeCount: number;    // Total number of changes sent
   success: boolean;       // Whether catchup sync completed successfully
   error?: string;         // Error message if any
+}
+
+/**
+ * Statistics message for synchronization operations
+ * Provides detailed metrics on filtering and deduplication
+ */
+export interface ServerSyncStatsMessage extends ServerMessage {
+  type: 'srv_sync_stats';
+  syncType: 'live' | 'catchup' | 'initial';
+  
+  // Basic stats
+  originalCount: number;   // Total number of changes before processing
+  processedCount: number;  // Total number of changes after processing
+  
+  // Deduplication stats
+  deduplicationStats?: {
+    beforeCount: number;
+    afterCount: number;
+    reduction: number;
+    reductionPercent: number;
+    
+    // Reasons for deduplication (e.g. "newer version exists", "merged with insert", etc.)
+    reasons: Record<string, number>;
+  };
+  
+  // Filtering stats  
+  filteringStats?: {
+    beforeCount: number;
+    afterCount: number;
+    filtered: number;
+    
+    // Reasons for filtering (e.g. "client's own change", "system table", etc.)
+    reasons: Record<string, number>;
+    
+    // Optional list of changes that were filtered out (for verification)
+    filteredChanges?: Array<{
+      id: string;
+      table: string;
+      reason: string;
+    }>;
+  };
+  
+  // Content stats
+  contentStats?: {
+    // Changes by operation type
+    operations: Record<string, number>;
+    
+    // Changes by table
+    tables: Record<string, number>;
+    
+    // Changes by client
+    clients: Record<string, number>;
+  };
+  
+  // Performance stats
+  performanceStats?: {
+    processingTimeMs: number;
+    dbQueryTimeMs?: number;
+    networkTimeMs?: number;
+  };
+  
+  // LSN range
+  lsnRange?: {
+    first: string;
+    last: string;
+  };
 }
 
 // Client message interfaces

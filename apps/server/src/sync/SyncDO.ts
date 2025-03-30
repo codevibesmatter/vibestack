@@ -16,7 +16,8 @@ import { processClientChanges } from './client-changes';
 import type { 
   ServerMessage, 
   ClientMessage,
-  ClientChangesMessage
+  ClientChangesMessage,
+  ServerSyncStatsMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
@@ -137,6 +138,9 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       } else if (path === '/api/sync/metrics' || path === '/metrics') {
         // Handle both paths for metrics too
         return this.handleMetrics();
+      } else if (path === '/sync-stats' || path === '/api/sync/sync-stats') {
+        // Handle sync stats messages from process-changes
+        return this.handleSyncStats(request);
       } else {
         // No route matched
         return new Response('Not found', { status: 404 });
@@ -814,5 +818,70 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         timeout: timeoutMs
       }, MODULE_NAME);
     });
+  }
+
+  /**
+   * Handle sync stats messages
+   * This is used by the replication module to send detailed processing statistics
+   */
+  private async handleSyncStats(request: Request): Promise<Response> {
+    // Extract client ID from query params
+    const clientId = getQueryParam(request, 'clientId');
+    
+    if (!clientId) {
+      return new Response('Missing clientId parameter', { status: 400 });
+    }
+    
+    try {
+      // Parse the request body to get the stats message
+      const statsMessage = await request.json() as ServerSyncStatsMessage;
+      
+      // Ensure client ID is set in the message (should already be from process-changes)
+      if (!statsMessage.clientId) {
+        statsMessage.clientId = clientId;
+      }
+      
+      // Forward stats message to connected WebSocket client
+      if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
+        this.webSocket.send(JSON.stringify(statsMessage));
+        
+        syncLogger.debug('Forwarded sync stats to client', {
+          clientId,
+          syncType: statsMessage.syncType,
+          deduped: statsMessage.deduplicationStats?.reduction || 0,
+          filtered: statsMessage.filteringStats?.filtered || 0
+        }, MODULE_NAME);
+        
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } else {
+        syncLogger.warn('Could not forward sync stats - WebSocket not connected', {
+          clientId
+        }, MODULE_NAME);
+        
+        return new Response(JSON.stringify({ 
+          success: false,
+          error: 'WebSocket not connected'
+        }), {
+          status: 200, // Still return 200 to avoid retries
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    } catch (error) {
+      syncLogger.error('Error handling sync stats', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      
+      return new Response(JSON.stringify({ 
+        success: false,
+        error: error instanceof Error ? error.message : String(error)
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   }
 } 

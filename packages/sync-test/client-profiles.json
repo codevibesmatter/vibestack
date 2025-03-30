@@ -3,36 +3,65 @@
     "id": "b4ee9b2e-f46e-4469-ac13-38358fdd23da",
     "name": "Client 1",
     "profileId": 1,
-    "lsn": "0/9835610",
-    "timestamp": 1743221530133,
+    "lsn": "0/A047DB0",
+    "timestamp": 1743298874302,
     "testHistory": {
       "initial": 0,
       "liveSync": 1,
       "catchup": 0
-    }
+    },
+    "activeClientId": "6d54ab11-ed40-4eb4-b3d9-38286d9a3454"
   },
   {
     "id": "e459b073-92fa-479f-8375-179cc2aa97da",
     "name": "Client 2",
     "profileId": 2,
-    "lsn": "0/9835610",
-    "timestamp": 1743223641490,
+    "lsn": "0/9E501A8",
+    "timestamp": 1743297218945,
     "testHistory": {
       "initial": 0,
       "liveSync": 0,
       "catchup": 0
-    }
+    },
+    "activeClientId": "3197e765-9d4e-4130-982d-6f221e065cd7"
   },
   {
     "id": "ed60e303-9777-4930-8040-10c64f302701",
     "name": "Client 3",
     "profileId": 3,
-    "lsn": "0/9835610",
-    "timestamp": 1743225630527,
+    "lsn": "0/9E501A8",
+    "timestamp": 1743297218946,
     "testHistory": {
       "initial": 0,
       "liveSync": 0,
       "catchup": 0
-    }
+    },
+    "activeClientId": "05d10060-a29c-4a28-82eb-0f35b684717a"
+  },
+  {
+    "id": "637325c7-0d87-4a28-9ef6-b473e19b82f5",
+    "name": "Client 4",
+    "profileId": 4,
+    "lsn": "0/9E501A8",
+    "timestamp": 1743297218943,
+    "testHistory": {
+      "initial": 0,
+      "liveSync": 0,
+      "catchup": 0
+    },
+    "activeClientId": "4d64b736-7559-4d71-b718-cc8108c74073"
+  },
+  {
+    "id": "fcd20497-5686-422a-9cbb-896916da8666",
+    "name": "Client 5",
+    "profileId": 5,
+    "lsn": "0/9E501A8",
+    "timestamp": 1743297218947,
+    "testHistory": {
+      "initial": 0,
+      "liveSync": 0,
+      "catchup": 0
+    },
+    "activeClientId": "f2ef1074-3b28-4131-a1e2-4549536e2740"
   }
 ]

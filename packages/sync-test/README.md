@@ -1,49 +1,64 @@
 # Sync Test
 
-A test framework for the bi-directional sync infrastructure in VibeStack.
+A testing framework for validating synchronization functionality between clients and servers.
 
-## Test Scenarios
+## Architecture
 
-This package provides test scenarios for various sync workflows:
+The sync-test package has been refactored to follow a modular approach with clear separation of concerns:
 
-- **Initial Sync**: Tests the complete database synchronization process for new clients
-- **Catchup Sync**: Tests the synchronization process for clients reconnecting after being offline
-- **Client Changes**: Tests changes made by clients being properly synchronized with the server
-- **Live Sync**: Tests real-time update propagation between server and clients
+### Core Components
 
-## LSN State
+1. **MessageProcessor** (`packages/sync-test/src/v2/core/message-processor.ts`)
+   - Handles parsing and transformation of WebSocket messages
+   - Converts between `ServerChangesMessage` and `EntityChange` formats
+   - Supports ID mapping for tracking synthetic IDs
+   - Imports message types from `@repo/sync-types`
 
-The last known Log Sequence Number (LSN) is stored in `.sync-test-lsn.json` at the root of this package.
+2. **ValidationService** (`packages/sync-test/src/v2/core/validation-service.ts`)
+   - Tracks expected and received changes
+   - Validates that all changes were received properly
+   - Generates validation reports
+   - Verifies changes in the database
 
-This file is written during the initial sync test and read during the catchup sync test to track the PostgreSQL WAL position.
+3. **ScenarioRunner** (`packages/sync-test/src/v2/core/scenario-runner.ts`)
+   - Orchestrates test scenarios 
+   - Manages test steps and actions
+   - Handles test flow and reporting
 
-## Seed Data
+### Scenarios
 
-The package includes a seed data generator to create realistic test data with interconnected relationships:
+Scenarios like `live-sync.ts` orchestrate tests by:
+- Setting up database connections
+- Creating WebSocket clients
+- Generating test changes
+- Tracking and validating change synchronization
 
-```bash
-# Interactive seed data generator
-pnpm seed
+## Types
 
-# Generate data with preset sizes
-pnpm seed:small   # 25 users  - clears existing data
-pnpm seed:medium  # 200 users - clears existing data  
-pnpm seed:large   # 1000 users - clears existing data
-```
+The system uses types from two sources:
 
-**Note:** The seed functionality assumes your database schema is already set up through migrations. It only handles populating data, not creating or modifying schema.
+1. **Internal Types** (`packages/sync-test/src/v2/types.ts`)
+   - `EntityChange`: Standardized format for tracking changes
+   - `ValidationResult`: Results from validation checks
+   - `MissingChangeReport`: Information on missing changes
 
-For more information, see the [Seed Data Generator documentation](./src/seed/README.md).
+2. **Sync Types** (`@repo/sync-types`)
+   - `ServerChangesMessage`: Format of messages from server
+   - `TableChange`: Format of table changes in the database
+   - `ClientReceivedMessage`: Client message acknowledging receipt
 
 ## Running Tests
 
 ```bash
-# Run all tests
-pnpm test:all
+# Run a live sync test with 3 clients and 10 changes per client
+npm run test:live-sync -- 3 10
+```
 
-# Run a specific scenario
-pnpm test:initial
-pnpm test:catchup
-pnpm test:changes
-pnpm test:live
-``` 
+## Contributing
+
+When making changes to this codebase:
+
+1. Follow the modular architecture - keep concerns separated
+2. Use types from `@repo/sync-types` for messaging
+3. Use the local `types.ts` for internal data structures
+4. Add tests for any new functionality 

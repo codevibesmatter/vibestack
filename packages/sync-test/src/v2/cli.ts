@@ -84,11 +84,18 @@ async function runLiveSyncTest(clientCount: number, changeCount: number): Promis
       console.log('\n✅ Live sync test completed successfully!');
     } else {
       console.log('\n❌ Some live sync tests failed. Check the logs above for details.');
-      process.exit(1);
+      // Force exit with short delay to ensure logs are written
+      setTimeout(() => process.exit(1), 500);
+      return;
     }
+    
+    // Force exit after a short delay to ensure logs are written and cleanup happens
+    console.log('Test completed, forcing exit in 1 second...');
+    setTimeout(() => process.exit(0), 1000);
   } catch (error) {
     console.error('\n❌ Test failed:', error);
-    process.exit(1);
+    // Force exit with short delay to ensure logs are written
+    setTimeout(() => process.exit(1), 500);
   }
 }
 
