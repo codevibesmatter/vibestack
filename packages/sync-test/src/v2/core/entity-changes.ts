@@ -11,6 +11,7 @@ import {
   UserRole,
   User, Project, Task, Comment
 } from '@repo/dataforge/server-entities';
+import { ENTITY_OPERATIONS } from '../config.ts';
 
 // Define the SqlQueryFunction type based on what neon() returns
 type SqlQueryFunction = any;
@@ -167,7 +168,7 @@ export async function createMixedEntityChanges(
   sql: SqlQueryFunction,
   entityType: EntityType,
   count: number, 
-  operations: {create: number, update: number, delete: number} = {create: 0.4, update: 0.4, delete: 0.2}
+  operations: {create: number, update: number, delete: number} = {create: 0.45, update: 0.45, delete: 0.1}
 ): Promise<{created: string[], updated: string[], deleted: string[]}> {
   // Calculate counts for each operation type
   const createCount = Math.floor(count * operations.create);
@@ -176,12 +177,78 @@ export async function createMixedEntityChanges(
   
   console.log(`Creating balanced mix of ${entityType} changes: ${createCount} creates, ${updateCount} updates, ${deleteCount} deletes`);
   
-  // Execute operations in parallel for efficiency
-  const [created, updated, deleted] = await Promise.all([
-    createBulkEntityChanges(sql, entityType, createCount),
-    updateBulkEntityChanges(sql, entityType, updateCount),
-    deleteBulkEntityChanges(sql, entityType, deleteCount)
-  ]);
+  // Execute operations sequentially to allow connection pool to be released between operations
+  let created: string[] = [];
+  let updated: string[] = [];
+  let deleted: string[] = [];
+  
+  if (createCount > 0) {
+    created = await createBulkEntityChanges(sql, entityType, createCount);
+    // Small delay to ensure connection is properly released
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  
+  if (updateCount > 0) {
+    updated = await updateBulkEntityChanges(sql, entityType, updateCount);
+    // Small delay to ensure connection is properly released
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  
+  if (deleteCount > 0) {
+    deleted = await deleteBulkEntityChanges(sql, entityType, deleteCount);
+    // Small delay to ensure connection is properly released
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  
+  // Generate duplicate changes to test deduplication with scaled approach based on count
+  const duplicates: string[] = [];
+  
+  // Make additional changes to recently created records (if any)
+  if (created.length >= 2) {
+    // Choose at least 2 created records to update again (for deduplication testing)
+    // Limit the duplicate count to a reasonable maximum of 8 to avoid excessive load
+    const dupeRecordCount = Math.min(8, Math.min(created.length, Math.max(2, Math.floor(created.length * 0.3))));
+    const recordsToUpdate = created.slice(0, dupeRecordCount);
+    console.log(`Creating duplicate changes for ${recordsToUpdate.length} ${entityType}s to test deduplication`);
+    
+    // Update these records in smaller batches to avoid connection pooling issues
+    const batchSize = 2;
+    for (let i = 0; i < recordsToUpdate.length; i += batchSize) {
+      const batch = recordsToUpdate.slice(i, i + batchSize);
+      for (const id of batch) {
+        try {
+          const duplicateUpdates = await updateEntityRecord(sql, entityType, id);
+          if (duplicateUpdates.length > 0) {
+            duplicates.push(...duplicateUpdates);
+          }
+        } catch (error) {
+          console.error(`Error creating duplicate update for ${entityType} ${id}:`, error);
+        }
+      }
+      // Small delay between batches to ensure connection release
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  } else if (updated.length >= 2) {
+    // If no creates, use updates
+    const recordsToUpdateAgain = updated.slice(0, Math.min(updated.length, Math.max(2, Math.floor(updated.length * 0.3))));
+    console.log(`Creating duplicate changes for ${recordsToUpdateAgain.length} ${entityType}s to test deduplication`);
+    
+    for (const id of recordsToUpdateAgain) {
+      try {
+        const duplicateUpdates = await updateEntityRecord(sql, entityType, id);
+        if (duplicateUpdates.length > 0) {
+          duplicates.push(...duplicateUpdates);
+          updated.push(...duplicateUpdates); // Add to updated list
+        }
+      } catch (error) {
+        console.error(`Error creating duplicate update for ${entityType} ${id}:`, error);
+      }
+    }
+  }
+  
+  if (duplicates.length > 0) {
+    console.log(`Created ${duplicates.length} duplicate changes for ${entityType} deduplication testing`);
+  }
   
   console.log(`Completed mixed ${entityType} changes: ${created.length} creates, ${updated.length} updates, ${deleted.length} deletes`);
   
@@ -193,6 +260,171 @@ export async function createMixedEntityChanges(
 }
 
 /**
+ * Update a specific entity record to create duplicate changes
+ * Helper function for deduplication testing
+ */
+async function updateEntityRecord(
+  sql: SqlQueryFunction,
+  entityType: EntityType,
+  id: string
+): Promise<string[]> {
+  switch (entityType) {
+    case 'task':
+      return updateTaskRecord(sql, id);
+    case 'project':
+      return updateProjectRecord(sql, id);
+    case 'user':
+      return updateUserRecord(sql, id);
+    case 'comment':
+      return updateCommentRecord(sql, id);
+    default:
+      return [];
+  }
+}
+
+/**
+ * Update a task record with a minimal change to test deduplication
+ */
+async function updateTaskRecord(sql: SqlQueryFunction, id: string): Promise<string[]> {
+  try {
+    // First get the current title to check its length
+    const currentTasks = await sql`SELECT title FROM tasks WHERE id = ${id}`;
+    if (!currentTasks || currentTasks.length === 0) {
+      console.warn(`Task not found for ID: ${id}`);
+      return [];
+    }
+    
+    const currentTitle = currentTasks[0].title || '';
+    
+    // Calculate safe update strings based on available space (limit is 100 chars)
+    const maxLength = 100;
+    const update1 = ' (U1)'; // Shortened update marker
+    const update2 = ' (U2)'; // Shortened update marker
+    
+    let newTitle1, newTitle2;
+    
+    if (currentTitle.length + update1.length > maxLength) {
+      // If current title is already close to the limit, truncate it
+      newTitle1 = currentTitle.substring(0, maxLength - update1.length) + update1;
+    } else {
+      newTitle1 = currentTitle + update1;
+    }
+    
+    if (newTitle1.length + update2.length - update1.length > maxLength) {
+      // If after first update we'd exceed limit, truncate again
+      newTitle2 = newTitle1.substring(0, maxLength - update2.length + update1.length) + update2;
+    } else {
+      // Replace update1 marker with update2
+      newTitle2 = newTitle1.replace(update1, update2);
+    }
+    
+    // Make two distinct updates to the same record with minor differences
+    // First update with safe title
+    await sql`
+      UPDATE tasks 
+      SET title = ${newTitle1},
+          status = ${faker.helpers.arrayElement(Object.values(TaskStatus))}
+      WHERE id = ${id}
+    `;
+    
+    // Second update to same record with safe title
+    await sql`
+      UPDATE tasks 
+      SET title = ${newTitle2},
+          priority = ${faker.helpers.arrayElement(Object.values(TaskPriority))}
+      WHERE id = ${id}
+    `;
+    
+    return [id, id]; // Return the ID twice to represent two updates
+  } catch (error) {
+    console.error(`Error updating task record ${id}:`, error);
+    return [];
+  }
+}
+
+/**
+ * Update a project record with a minimal change to test deduplication
+ */
+async function updateProjectRecord(sql: SqlQueryFunction, id: string): Promise<string[]> {
+  try {
+    // First update
+    await sql`
+      UPDATE projects 
+      SET name = CONCAT(name, ' (Updated 1)'),
+          status = ${faker.helpers.arrayElement(Object.values(ProjectStatus))}
+      WHERE id = ${id}
+    `;
+    
+    // Second update to same record
+    await sql`
+      UPDATE projects 
+      SET name = CONCAT(name, ' (Updated 2)'),
+          description = CONCAT(description, ' With additional details.')
+      WHERE id = ${id}
+    `;
+    
+    return [id, id]; // Return the ID twice to represent two updates
+  } catch (error) {
+    console.error(`Error updating project record ${id}:`, error);
+    return [];
+  }
+}
+
+/**
+ * Update a user record with a minimal change to test deduplication
+ */
+async function updateUserRecord(sql: SqlQueryFunction, id: string): Promise<string[]> {
+  try {
+    // First update
+    await sql`
+      UPDATE users 
+      SET name = CONCAT(name, ' (Updated 1)'),
+          role = ${faker.helpers.arrayElement(Object.values(UserRole))}
+      WHERE id = ${id}
+    `;
+    
+    // Second update to same record
+    await sql`
+      UPDATE users 
+      SET name = CONCAT(name, ' (Updated 2)'),
+          avatar_url = ${faker.internet.avatar()}
+      WHERE id = ${id}
+    `;
+    
+    return [id, id]; // Return the ID twice to represent two updates
+  } catch (error) {
+    console.error(`Error updating user record ${id}:`, error);
+    return [];
+  }
+}
+
+/**
+ * Update a comment record with a minimal change to test deduplication
+ */
+async function updateCommentRecord(sql: SqlQueryFunction, id: string): Promise<string[]> {
+  try {
+    // First update
+    await sql`
+      UPDATE comments 
+      SET content = CONCAT(content, ' (Updated 1)')
+      WHERE id = ${id}
+    `;
+    
+    // Second update to same record
+    await sql`
+      UPDATE comments 
+      SET content = CONCAT(content, ' (Updated 2)')
+      WHERE id = ${id}
+    `;
+    
+    return [id, id]; // Return the ID twice to represent two updates
+  } catch (error) {
+    console.error(`Error updating comment record ${id}:`, error);
+    return [];
+  }
+}
+
+/**
  * Create multiple entity types mixed together
  * This is the most realistic scenario for testing WAL processing
  */
@@ -201,171 +433,283 @@ export async function createMixedChanges(
   count: number,
   distribution: {[key in EntityType]?: number} = {task: 0.5, project: 0.2, user: 0.2, comment: 0.1}
 ): Promise<{[key in EntityType]?: {created: string[], updated: string[], deleted: string[]}}> {
-  console.log(`Creating mixed changes across entity types, total count: ${count}`);
+  // Validate distribution
+  const distSum = Object.values(distribution).reduce((acc, val) => acc + val, 0);
+  if (Math.abs(distSum - 1) > 0.0001) {
+    console.warn(`Distribution sum (${distSum}) is not 1, normalizing...`);
+    // Normalize
+    const normFactor = 1 / distSum;
+    Object.keys(distribution).forEach(key => {
+      const typedKey = key as EntityType;
+      distribution[typedKey] = (distribution[typedKey] || 0) * normFactor;
+    });
+  }
   
-  // Normalize distribution to ensure it sums to 1
+  // Calculate entity counts based on distribution
+  const entityCounts: {[key in EntityType]?: number} = {};
+  const entityTypes = Object.keys(distribution) as EntityType[];
+  let remaining = count;
+  
+  // Distribute values
+  for (let i = 0; i < entityTypes.length; i++) {
+    const type = entityTypes[i];
+    const isLast = i === entityTypes.length - 1;
+    
+    if (isLast) {
+      // Last item gets whatever is left
+      entityCounts[type] = remaining;
+    } else {
+      // Calculate count based on distribution
+      const entityCount = Math.max(1, Math.floor(count * (distribution[type] || 0)));
+      entityCounts[type] = entityCount;
+      remaining -= entityCount;
+    }
+  }
+  
+  // Default operations distribution
+  const operations = {
+    create: ENTITY_OPERATIONS.OPERATION_DISTRIBUTION.create,
+    update: ENTITY_OPERATIONS.OPERATION_DISTRIBUTION.update,
+    delete: ENTITY_OPERATIONS.OPERATION_DISTRIBUTION.delete
+  };
+  
+  // Create and track changes
+  const changes: {[key in EntityType]?: {
+    created: string[], 
+    updated: string[], 
+    deleted: string[]
+  }} = {};
+  
+  // Process each entity type sequentially - avoid connection pool exhaustion
+  for (const entityType of entityTypes) {
+    if (entityCounts[entityType] && entityCounts[entityType]! > 0) {
+      console.log(`Creating mixed changes for ${entityType}, count: ${entityCounts[entityType]}`);
+      
+      // Create changes for this entity type
+      changes[entityType] = await createMixedEntityChanges(
+        sql, 
+        entityType,
+        entityCounts[entityType]!,
+        operations
+      );
+      
+      // Allow connection pool to clear between entity types
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  
+  return changes;
+}
+
+/**
+ * Generate a set of mixed changes in memory without database interaction
+ * @param count Total number of changes to generate
+ * @param distribution Distribution of changes across entity types
+ * @param operations Distribution of operations (create, update, delete)
+ * @returns Generated changes object
+ */
+export async function generateMixedChangesInMemory(
+  count: number,
+  distribution: {[key in EntityType]?: number} = {task: 0.5, project: 0.2, user: 0.2, comment: 0.1},
+  operations: {create: number, update: number, delete: number} = {create: 0.45, update: 0.45, delete: 0.1}
+): Promise<{
+  changes: {
+    [key in EntityType]?: {
+      create: any[],
+      update: any[],
+      delete: any[]
+    }
+  },
+  count: number
+}> {
+  console.log(`Generating ${count} mixed changes in memory (no database interaction)`);
+  
+  // Normalize the distribution to make sure it sums to 1
   const totalWeight = Object.values(distribution).reduce((sum, weight) => sum + weight, 0);
-  const normalizedDistribution = Object.fromEntries(
+  const normalizedDist = Object.fromEntries(
     Object.entries(distribution).map(([key, weight]) => [key, weight / totalWeight])
   ) as {[key in EntityType]?: number};
   
-  // Calculate counts for each entity type
+  // Calculate counts per entity type
   const entityCounts: {[key in EntityType]?: number} = {};
   let remainingCount = count;
   
-  Object.entries(normalizedDistribution).forEach(([entityType, weight], index, arr) => {
-    if (index === arr.length - 1) {
-      // Last item gets remainder to ensure we use exactly the requested count
+  Object.entries(normalizedDist).forEach(([entityType, weight], index, arr) => {
+      if (index === arr.length - 1) {
+      // Last item gets remainder to ensure total count is exact
       entityCounts[entityType as EntityType] = remainingCount;
-    } else {
+      } else {
       const entityCount = Math.floor(count * (weight ?? 0));
       entityCounts[entityType as EntityType] = entityCount;
       remainingCount -= entityCount;
     }
   });
   
-  // First attempt: Execute operations for each entity type in parallel
-  const entityPromises = Object.entries(entityCounts).map(async ([entityType, entityCount]) => {
-    if (!entityCount) return [entityType, { created: [], updated: [], deleted: [] }];
-    
-    // Create one less than requested to account for the duplicate we'll add
-    const baseCount = Math.max(1, entityCount - 1);
-    const result = await createMixedEntityChanges(
-      sql, 
-      entityType as EntityType,
-      baseCount
-    );
-    
-    // Force a duplicate change for this entity type
-    // We'll duplicate the last created entity if available, otherwise the last updated
-    let duplicateId: string | undefined;
-    if (result.created && result.created.length > 0) {
-      duplicateId = result.created[result.created.length - 1];
-    } else if (result.updated && result.updated.length > 0) {
-      duplicateId = result.updated[result.updated.length - 1];
-    }
-    
-    if (duplicateId) {
-      console.log(`Forcing duplicate change for ${entityType} with ID: ${duplicateId}`);
-      
-      // Create a duplicate change based on the original operation type
-      if (result.created && result.created.includes(duplicateId)) {
-        // If it was created, create it again
-        const duplicateResult = await createBulkEntityChanges(sql, entityType as EntityType, 1);
-        if (duplicateResult.length > 0) {
-          result.created.push(duplicateResult[0]);
-        }
-      } else if (result.updated && result.updated.includes(duplicateId)) {
-        // If it was updated, update it again
-        const duplicateResult = await updateBulkEntityChanges(sql, entityType as EntityType, 1);
-        if (duplicateResult.length > 0) {
-          result.updated.push(duplicateResult[0]);
-        }
+  // Initialize result structure
+  const result: {
+    changes: {
+      [key in EntityType]?: {
+        create: any[],
+        update: any[],
+        delete: any[]
       }
-    }
-    
-    return [entityType, result];
-  });
-  
-  const results = await Promise.all(entityPromises);
-  
-  // Convert results to desired format
-  const mixedResults = Object.fromEntries(results) as {
-    [key in EntityType]?: {created: string[], updated: string[], deleted: string[]}
+    },
+    count: number
+  } = {
+    changes: {},
+    count: 0
   };
   
-  // Calculate how many operations we actually performed vs. requested
-  let actualTotal = 0;
-  Object.values(mixedResults).forEach((result) => {
-    if (result) {
-      actualTotal += (result.created?.length || 0) + (result.updated?.length || 0) + (result.deleted?.length || 0);
+  // Generate changes for each entity type
+  for (const [entityType, entityCount] of Object.entries(entityCounts)) {
+    if (!entityCount) continue;
+    
+    const typedEntityType = entityType as EntityType;
+    console.log(`Generating ${entityCount} in-memory changes for ${typedEntityType}`);
+    
+    // Initialize entity type in results
+    result.changes[typedEntityType] = {
+      create: [],
+      update: [],
+      delete: []
+    };
+    
+    // Calculate operation counts
+    const createCount = Math.floor(entityCount * operations.create);
+    const updateCount = Math.floor(entityCount * operations.update);
+    const deleteCount = entityCount - createCount - updateCount;
+    
+    // Generate create operations
+    for (let i = 0; i < createCount; i++) {
+      const fakeData = generateFakeEntityData(typedEntityType);
+      result.changes[typedEntityType]!.create.push(fakeData);
     }
-  });
-  
-  // If we have a shortfall, compensate with additional create operations 
-  // to reach the requested total
-  const shortfall = count - actualTotal;
-  if (shortfall > 0) {
-    console.log(`Operation shortfall detected: ${shortfall}. Adding exact compensation with create operations.`);
     
-    // Instead of distributing by weight (which can overshoot), we'll distribute exact counts
-    let remainingCompensation = shortfall;
-    const compensationCounts: {[key in EntityType]?: number} = {};
-    
-    // First pass: distribute compensation based on weights while tracking the running total
-    Object.entries(normalizedDistribution).forEach(([entityType, weight], index, arr) => {
-      const entityTypeKey = entityType as EntityType;
-      if (index === arr.length - 1) {
-        // Last item gets the exact remainder to ensure we hit exactly the shortfall
-        compensationCounts[entityTypeKey] = remainingCompensation;
-      } else {
-        // Calculate exact count (floored to ensure we don't exceed)
-        const exactCount = Math.floor(shortfall * weight);
-        compensationCounts[entityTypeKey] = exactCount;
-        remainingCompensation -= exactCount;
-      }
-    });
-    
-    // Execute compensation operations in parallel
-    const compensationPromises = Object.entries(compensationCounts).map(async ([entityType, compensationCount]) => {
-      const entityTypeKey = entityType as EntityType;
-      if (compensationCount <= 0) return [entityType, { created: [] }];
-      
-      // Execute compensation operations - only creates for reliability
-      const additionalCreated = await createBulkEntityChanges(sql, entityTypeKey, compensationCount);
-      
-      // Return the extra operations
-      return [entityType, { created: additionalCreated }];
-    });
-    
-    const compensationResults = await Promise.all(compensationPromises);
-    
-    // Merge the compensation results with the original results
-    compensationResults.forEach(([entityType, compensation]) => {
-      const entityTypeKey = entityType as EntityType;
-      const typedCompensation = compensation as { created: string[] };
-      
-      if (mixedResults[entityTypeKey]) {
-        // Add compensation operations to existing results
-        mixedResults[entityTypeKey]!.created = [
-          ...mixedResults[entityTypeKey]!.created,
-          ...typedCompensation.created
-        ];
-        
-        // Log what we added as compensation
-        console.log(`Added compensation for ${entityTypeKey}: ${typedCompensation.created.length} creates`);
-      }
-    });
-    
-    // Verify we hit our target
-    let compensatedTotal = 0;
-    Object.values(mixedResults).forEach((result) => {
-      if (result) {
-        compensatedTotal += (result.created?.length || 0) + (result.updated?.length || 0) + (result.deleted?.length || 0);
-      }
-    });
-    
-    if (compensatedTotal !== count) {
-      console.log(`Note: After compensation, total operations (${compensatedTotal}) differ from requested (${count}) by ${compensatedTotal - count}`);
-    } else {
-      console.log(`✅ Exact compensation successful: ${compensatedTotal} total operations created (requested: ${count})`);
+    // Generate update operations (with fake IDs since we won't query the DB)
+    for (let i = 0; i < updateCount; i++) {
+      const fakeData = generateFakeEntityData(typedEntityType);
+      result.changes[typedEntityType]!.update.push(fakeData);
     }
+    
+    // Generate delete operations (just fake IDs)
+    for (let i = 0; i < deleteCount; i++) {
+      const fakeId = generateFakeId();
+      result.changes[typedEntityType]!.delete.push({ id: fakeId });
+    }
+    
+    // Update total count
+    result.count += createCount + updateCount + deleteCount;
   }
   
-  // Log summary
-  console.log('Mixed changes summary:');
-  Object.entries(mixedResults).forEach(([entityType, result]) => {
-    if (result) {
-      const entityTotal = 
-        (result.created?.length || 0) + 
-        (result.updated?.length || 0) + 
-        (result.deleted?.length || 0);
-      
-      console.log(`- ${entityType}: ${entityTotal} changes (${result.created?.length || 0} created, ${result.updated?.length || 0} updated, ${result.deleted?.length || 0} deleted)`);
-    }
-  });
+  console.log(`Successfully generated ${result.count} changes in memory`);
+  return result;
+}
+
+/**
+ * Generate fake entity data for a specific entity type
+ * @param entityType Type of entity to generate data for
+ * @returns Fake entity data with ID
+ */
+export function generateFakeEntityData(entityType: EntityType): any {
+  const id = generateFakeId();
   
-  return mixedResults;
+  switch (entityType) {
+    case 'task':
+      return generateFakeTaskData(id);
+    case 'project':
+      return generateFakeProjectData(id);
+    case 'user':
+      return generateFakeUserData(id);
+    case 'comment':
+      return generateFakeCommentData(id);
+    default:
+      throw new Error(`Unsupported entity type: ${entityType}`);
+  }
+}
+
+/**
+ * Generate a fake UUID
+ * @returns UUID string
+ */
+function generateFakeId(): string {
+  return uuidv4();
+}
+
+/**
+ * Generate fake task data
+ * @param id Optional ID to use
+ * @returns Fake task data
+ */
+function generateFakeTaskData(id: string = uuidv4()): any {
+  return {
+    id,
+    title: faker.lorem.sentence({ min: 3, max: 5 }),
+    description: faker.lorem.paragraph(),
+    status: faker.helpers.arrayElement(Object.values(TaskStatus)),
+    priority: faker.helpers.arrayElement(Object.values(TaskPriority)),
+    due_date: faker.date.future(),
+    completed_at: Math.random() > 0.7 ? faker.date.recent() : null,
+    tags: Array.from({ length: Math.floor(Math.random() * 3) }, () => faker.lorem.word()),
+    project_id: uuidv4(),
+    assignee_id: Math.random() > 0.2 ? uuidv4() : null,
+    client_id: uuidv4(),
+    created_at: faker.date.past(),
+    updated_at: new Date()
+  };
+}
+
+/**
+ * Generate fake project data
+ * @param id Optional ID to use
+ * @returns Fake project data
+ */
+function generateFakeProjectData(id: string = uuidv4()): any {
+  return {
+    id,
+    name: faker.company.name(),
+    description: faker.lorem.paragraph(),
+    status: faker.helpers.arrayElement(Object.values(ProjectStatus)),
+    owner_id: uuidv4(),
+    client_id: uuidv4(),
+    created_at: faker.date.past(),
+    updated_at: new Date()
+  };
+}
+
+/**
+ * Generate fake user data
+ * @param id Optional ID to use
+ * @returns Fake user data
+ */
+function generateFakeUserData(id: string = uuidv4()): any {
+  return {
+    id,
+    name: faker.person.fullName(),
+    email: faker.internet.email(),
+    role: faker.helpers.arrayElement(Object.values(UserRole)),
+    avatar_url: faker.image.avatar(),
+    client_id: uuidv4(),
+    created_at: faker.date.past(),
+    updated_at: new Date()
+  };
+}
+
+/**
+ * Generate fake comment data
+ * @param id Optional ID to use
+ * @returns Fake comment data
+ */
+function generateFakeCommentData(id: string = uuidv4()): any {
+  return {
+    id,
+    content: faker.lorem.paragraph(),
+    entityType: faker.helpers.arrayElement(['task', 'project']),
+    entityId: uuidv4(),
+    authorId: uuidv4(),
+    parentId: Math.random() > 0.8 ? uuidv4() : null,
+    createdAt: faker.date.past(),
+    updatedAt: new Date()
+  };
 }
 
 /* Individual entity implementations */

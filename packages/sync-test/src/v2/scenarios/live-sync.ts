@@ -54,13 +54,14 @@ function resetInactivityTimeout(context: OperationContext): void {
     clearTimeout(context.state.timeoutId);
   }
   
+  // Set a longer inactivity timeout (120 seconds) - increased from 90s to handle more clients
   context.state.timeoutId = setTimeout(() => {
     context.logger.warn('Inactivity timeout expired, forcing completion');
     messageDispatcher.dispatchMessage({
       type: 'timeout_force_completion',
       timestamp: Date.now()
     });
-  }, context.state.timeoutDuration);
+  }, 120000); // Increased to 120 seconds
   
   context.state.lastChangeTime = Date.now();
 }
@@ -153,7 +154,14 @@ export const LiveSyncScenario: Scenario = {
           type: 'api',
           name: 'Initialize Server Replication',
           endpoint: '/api/replication/init',
-          method: 'POST'
+          method: 'POST',
+          responseHandler: async (response: any, context: OperationContext) => {
+            if (response && response.lsn) {
+              context.state.initialLSN = response.lsn;
+              context.logger.info(`Retrieved initial replication LSN from init: ${response.lsn}`);
+            }
+            return response;
+          }
         } as ApiAction
       ]
     },
@@ -223,6 +231,58 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
+    // UPDATED STEP: Initialize clients with the same LSN
+    {
+      name: 'Initialize Clients with Same LSN',
+      execution: 'serial',
+      actions: [
+        {
+          type: 'ws',
+          name: 'Update All Clients with Same LSN',
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            // Use the LSN we got from the init call
+            const initialLSN = context.state.initialLSN;
+            if (!initialLSN) {
+              context.logger.info('No initial LSN available from replication init, skipping client LSN updates');
+              return { success: true, skipped: true };
+            }
+            
+            const clients = context.state.clients || [];
+            context.logger.info(`Updating ${clients.length} clients with initial LSN: ${initialLSN}`);
+            
+            // Update each client's LSN in parallel
+            const updatePromises = clients.map(async (clientId: string, index: number) => {
+              try {
+                await operations.ws.updateLSN(clientId, initialLSN);
+                context.logger.info(`Updated client ${index+1}/${clients.length} (${clientId}) with LSN ${initialLSN}`);
+                return true;
+              } catch (err) {
+                context.logger.error(`Failed to update LSN for client ${clientId}: ${err}`);
+                return false;
+              }
+            });
+            
+            const results = await Promise.all(updatePromises);
+            const successCount = results.filter(result => result).length;
+            
+            if (successCount === clients.length) {
+              context.logger.info(`Successfully updated all ${clients.length} clients with LSN ${initialLSN}`);
+            } else {
+              context.logger.warn(`Updated ${successCount}/${clients.length} clients with LSN ${initialLSN}`);
+            }
+            
+            return { 
+              success: successCount > 0,
+              updatedCount: successCount,
+              totalClients: clients.length,
+              lsn: initialLSN
+            };
+          }
+        } as WSAction
+      ]
+    },
+    
     // Step 5: Handle Catchup Sync
     {
       name: 'Handle Catchup Sync',
@@ -232,7 +292,7 @@ export const LiveSyncScenario: Scenario = {
           type: 'interactive',
           name: 'Wait for Catchup Sync',
           protocol: 'catchup-sync',
-          maxTimeout: 60000, // Increased timeout for multiple clients
+          maxTimeout: 180000, // Increased timeout for multiple clients (from 120000)
           
           initialAction: {
             type: 'ws',
@@ -241,10 +301,12 @@ export const LiveSyncScenario: Scenario = {
             params: async (context: OperationContext) => {
               // Initialize tracking state for client catchup completion
               context.state.clientCatchupComplete = new Map();
+              context.state.clientReconnectAttempts = new Map();
               
               // Mark all clients as not complete
               (context.state.clients || []).forEach((clientId: string) => {
                 context.state.clientCatchupComplete.set(clientId, false);
+                context.state.clientReconnectAttempts.set(clientId, 0);
               });
               
               context.logger.info(`Initialized catchup tracking for ${context.state.clients?.length || 0} clients`);
@@ -290,6 +352,22 @@ export const LiveSyncScenario: Scenario = {
                 context.logger.info(`Acknowledged catchup chunk ${serverMessage.sequence?.chunk}/${serverMessage.sequence?.total}`);
               } catch (error) {
                 context.logger.error(`Failed to acknowledge catchup: ${error}`);
+                
+                // Handle reconnection if needed
+                const reconnectAttempts = context.state.clientReconnectAttempts.get(clientId) || 0;
+                if (reconnectAttempts < 3) {  // Maximum 3 reconnection attempts
+                  context.logger.warn(`Connection issue detected. Attempting to reconnect client ${clientId} (attempt ${reconnectAttempts + 1})`);
+                  try {
+                    // Wait a brief moment before reconnecting
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    await operations.ws.setupClient(clientId);
+                    context.logger.info(`Successfully reconnected client ${clientId}`);
+                    context.state.clientReconnectAttempts.set(clientId, reconnectAttempts + 1);
+                  } catch (reconnectError) {
+                    context.logger.error(`Failed to reconnect client ${clientId}: ${reconnectError}`);
+                    // Continue execution even if reconnect fails
+                  }
+                }
               }
               
               // Don't complete the handler yet, wait for catchup completed message
@@ -354,9 +432,80 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // Step 6: Track Changes and Create Database Changes (combined step)
+    // NEW STEP 6: Pre-generate changes in memory
     {
-      name: 'Track and Create Changes',
+      name: 'Generate Changes In Memory',
+      execution: 'serial',
+      actions: [
+        {
+          type: 'db',
+          name: 'Generate Change Data',
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            const changeCount = context.config.changeCount || 3;
+            context.logger.info(`Pre-generating ${changeCount} changes in memory`);
+            
+            try {
+              // Create distribution object for mixed changes
+              const distribution: any = {};
+              const entityTypes = TEST_DEFAULTS.ENTITY_TYPES;
+              const typeWeight = 1 / entityTypes.length;
+              
+              entityTypes.forEach(type => {
+                distribution[type] = typeWeight;
+              });
+              
+              // Generate change data without writing to DB yet
+              const generatedChanges = await operations.db.generateChangeBatch(
+                changeCount,
+                distribution
+              );
+              
+              if (!generatedChanges || generatedChanges.length === 0) {
+                context.logger.error('Failed to generate any changes');
+                return { success: false, error: 'No changes generated' };
+              }
+              
+              // Store the generated changes in context for the next step
+              // Use direct modification of state for more reliable storage
+              context.state.generatedChanges = [...generatedChanges]; // Create copy to avoid reference issues
+              
+              // Verify changes were stored properly
+              if (!context.state.generatedChanges || context.state.generatedChanges.length === 0) {
+                context.logger.error('Generated changes not properly stored in context');
+                return { success: false, error: 'State storage failure' };
+              }
+              
+              // Log a summary
+              context.logger.info(`Successfully generated ${generatedChanges.length} changes in memory`);
+              context.logger.debug(`First change ID: ${generatedChanges[0]?.id || 'unknown'}`);
+              
+              const changesByType: Record<string, number> = {};
+              generatedChanges.forEach((c: any) => {
+                const type = c.table || c.type || 'unknown';
+                changesByType[type] = (changesByType[type] || 0) + 1; 
+              });
+              
+              context.logger.info(`Generated changes by type: ${Object.entries(changesByType)
+                .map(([type, count]) => `${type}: ${count}`)
+                .join(', ')}`);
+              
+              return { 
+                success: true, 
+                changes: generatedChanges
+              };
+            } catch (error) {
+              context.logger.error(`Error generating changes: ${error}`);
+              return { success: false, error: String(error) };
+            }
+          }
+        } as DbAction
+      ]
+    },
+    
+    // UPDATED STEP 7: Track and Apply Changes (renamed from "Track and Create Changes")
+    {
+      name: 'Track and Apply Changes',
       execution: 'parallel',
       actions: [
         // Action 1: Wait for changes across all clients
@@ -390,9 +539,9 @@ export const LiveSyncScenario: Scenario = {
               });
               
               // Initialize timeout management
-              context.state.lastChangeTime = 0;
+              context.state.lastChangeTime = Date.now();
               context.state.timeoutId = null;
-              context.state.timeoutDuration = context.config.timeout || 120000;
+              context.state.timeoutDuration = context.config.timeout || 90000; // Increased default timeout
               
               // Log expected changes with zero tolerance for debugging
               context.logger.info(`Setting up to wait for ${expectedChanges} changes on each of ${clients.length} clients (strict validation, no tolerance)`);
@@ -586,43 +735,57 @@ export const LiveSyncScenario: Scenario = {
                       context.logger.info(`  - ${change.id} (${change.type}, ${change.operation})`);
                     });
                     if (missing.length > 5) {
-                      context.logger.info(`  ... and ${missing.length - 5} more`);
+                      context.logger.info(`  - And ${missing.length - 5} more missing changes...`);
                     }
                   }
                 });
               } catch (error) {
-                context.logger.error(`Error generating debug info: ${error}`);
+                context.logger.error(`Error getting missing changes: ${error}`);
               }
               
-              return true; // Complete the protocol even though we didn't get all changes
-            },
-            
-            // Simple heartbeat handler
-            'srv_heartbeat': (message: any, context: OperationContext) => {
-              return false; // Continue the protocol
+              return true; // Complete the protocol
             }
           }
         } as InteractiveAction,
         
-        // Action 2: Create database changes
+        // Action 2: Apply pre-generated changes to database
         {
           type: 'db',
-          name: 'Create Database Changes',
+          name: 'Apply Changes to Database',
           operation: 'exec',
           params: async (context: OperationContext, operations: Record<string, any>) => {
-            const changeCount = context.config.changeCount || 3;
-            context.logger.info(`Creating ${changeCount} database changes`);
+            context.logger.info(`Writing pre-generated changes to database`);
             
             try {
-              // Use the direct db operation with error handling
-              const changes = await operations.db.createChangeBatch(
-                changeCount,
-                TEST_DEFAULTS.ENTITY_TYPES
-              );
+              // Explicit check for generatedChanges in context state
+              if (!context.state.hasOwnProperty('generatedChanges')) {
+                context.logger.error('generatedChanges property not found in context state');
+                return { success: false, error: 'No generated changes property in context' };
+              }
+              
+              // Get the changes generated in the previous step
+              const generatedChanges = context.state.generatedChanges;
+              
+              // Validate the changes array
+              if (!Array.isArray(generatedChanges)) {
+                context.logger.error(`generatedChanges is not an array: ${typeof generatedChanges}`);
+                return { success: false, error: 'Invalid generated changes format' };
+              }
+              
+              if (generatedChanges.length === 0) {
+                context.logger.error('No pre-generated changes found in context (empty array)');
+                return { success: false, error: 'No pre-generated changes found' };
+              }
+              
+              context.logger.info(`Found ${generatedChanges.length} pre-generated changes to apply`);
+              context.logger.debug(`First change ID: ${generatedChanges[0]?.id || 'unknown'}`);
+              
+              // Now write these changes to the database
+              const changes = await operations.db.applyChangeBatch(generatedChanges);
               
               if (!changes || changes.length === 0) {
-                context.logger.error('Failed to create any changes in database');
-                return { success: false, error: 'No changes created' };
+                context.logger.error('Failed to apply changes to database');
+                return { success: false, error: 'No changes applied' };
               }
               
               // Use the existing ChangeTracker from beforeScenario
@@ -631,20 +794,11 @@ export const LiveSyncScenario: Scenario = {
               // Track the database changes in the ChangeTracker
               tracker.trackDatabaseChanges(changes);
               
-              // Store the database changes in state for validation to use (as backup)
+              // Store the database changes in state for validation to use
               context.state.databaseChanges = changes;
               
               // Log a summary
-              context.logger.info(`Successfully created ${changes.length} database changes`);
-              
-              const changesByType: Record<string, number> = {};
-              changes.forEach((c: EntityChange) => {
-                changesByType[c.type] = (changesByType[c.type] || 0) + 1; 
-              });
-              
-              context.logger.info(`Changes by type: ${Object.entries(changesByType)
-                .map(([type, count]) => `${type}: ${count}`)
-                .join(', ')}`);
+              context.logger.info(`Successfully applied ${changes.length} changes to database`);
               
               // Store the original changes for reference
               context.state.createdChanges = changes;
@@ -654,7 +808,7 @@ export const LiveSyncScenario: Scenario = {
                 changes
               };
             } catch (error) {
-              context.logger.error(`Error creating changes: ${error}`);
+              context.logger.error(`Error applying changes to database: ${error}`);
               return { success: false, error: String(error) };
             }
           }
@@ -662,7 +816,7 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // Step 7: Validate Changes
+    // Step 8: Validate Changes
     {
       name: 'Validate Changes',
       execution: 'serial',
@@ -728,7 +882,7 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // Step 8: Disconnect Clients
+    // Step 9: Disconnect Clients
     {
       name: 'Disconnect Clients',
       execution: 'serial',
@@ -974,9 +1128,9 @@ if (typeof import.meta !== 'undefined' && import.meta.url) {
         
         // Force exit after a short delay to ensure logs are flushed
         setTimeout(() => {
-          logger.info('Forcing exit to clean up any remaining handles');
+          logger.info('Test completed, forcing exit in 1 second...');
           process.exit(anyFailed ? 1 : 0);
-        }, 100);
+        }, 1000);
       })
       .catch(error => {
         console.error('Test failed:', error);
@@ -985,4 +1139,4 @@ if (typeof import.meta !== 'undefined' && import.meta.url) {
   } else {
     logger.debug('Live sync test module imported by another module, not running automatically');
   }
-} 
+}

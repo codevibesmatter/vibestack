@@ -13,6 +13,7 @@ const MODULE_NAME = 'process-changes';
 type ProcessedChanges = {
   deduplicatedChanges: TableChange[];
   changesByClient: Map<string | null, TableChange[]>;
+  deduplicationReasons: Record<string, number>;
 };
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
@@ -104,6 +105,14 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
   };
   const tableStats: Record<string, number> = {};
 
+  // Add tracking for specific deduplication reasons
+  const deduplicationReasons: Record<string, number> = {
+    'duplicate_update': 0,
+    'duplicate_insert': 0,
+    'duplicate_delete': 0,
+    'newer_version': 0
+  };
+
   // First pass - deduplicate and optimize
   for (const change of changes) {
     if (!change.data?.id) continue;
@@ -122,9 +131,20 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
       insertMap.set(key, change);
     }
     
-    // Keep latest change
-    if (!existing || new Date(change.updated_at) >= new Date(existing.updated_at)) {
+    // Keep latest change - modified to track deduplication reasons
+    if (!existing) {
       latestChanges.set(key, change);
+    } else {
+      // We have a duplicate - track the reason
+      if (new Date(change.updated_at) >= new Date(existing.updated_at)) {
+        // This is a newer version replacing older one
+        deduplicationReasons['newer_version']++;
+        latestChanges.set(key, change);
+      } else {
+        // This is an older duplicate we're discarding
+        const reasonKey = `duplicate_${change.operation}`;
+        deduplicationReasons[reasonKey] = (deduplicationReasons[reasonKey] || 0) + 1;
+      }
     }
   }
   
@@ -184,26 +204,32 @@ function processAndGroupChanges(changes: TableChange[]): ProcessedChanges {
     return aLevel - bLevel;
   });
 
-  // Log detailed deduplication statistics
+  // Calculate deduplication metrics
   const deduplicatedCount = latestChanges.size;
+  const reduction = originalCount - deduplicatedCount;
+  const reductionPercent = originalCount > 0 ? 
+    Math.round((reduction / originalCount) * 100) : 0;
+
+  // Log detailed deduplication statistics
   replicationLogger.info('Change deduplication results', {
     originalCount,
     deduplicatedCount,
-    reduction: originalCount - deduplicatedCount,
-    reductionPercent: originalCount > 0 ? 
-      Math.round(((originalCount - deduplicatedCount) / originalCount) * 100) : 0,
+    reduction,
+    reductionPercent,
     operationCounts,
     tableStats,
     clientCount: changesByClient.size,
     clientChangeDetails: Object.fromEntries(
       Array.from(changesByClient.entries())
         .map(([id, changes]) => [id || 'system', changes.length])
-    )
+    ),
+    deduplicationReasons // Include deduplication reasons in the log
   }, MODULE_NAME);
 
   return {
     deduplicatedChanges: orderedChanges,
-    changesByClient
+    changesByClient,
+    deduplicationReasons // Return deduplication reasons for use in stats
   };
 }
 
@@ -690,13 +716,14 @@ export async function processChanges(
     }
 
     // Step 3: Process and group changes for broadcast
-    const { deduplicatedChanges, changesByClient } = processAndGroupChanges(tableChanges);
+    const { deduplicatedChanges, changesByClient, deduplicationReasons } = processAndGroupChanges(tableChanges);
     
-    // Log detailed processing results
+    // Log detailed processing results with deduplication info
     replicationLogger.info('Change processing results', {
       originalCount: changes.length,
       validCount: tableChanges.length,
       deduplicatedCount: deduplicatedChanges.length,
+      deduplicationReasons, // Include deduplication reasons
       changesByClient: Object.fromEntries(
         Array.from(changesByClient.entries())
           .map(([id, changes]) => [id || 'system', changes.length])
@@ -814,7 +841,7 @@ export async function processChanges(
         return acc;
       }, {} as Record<string, number>);
       
-      // Create client-specific stats message
+      // Create client-specific stats message with deduplication reasons
       const statsMessage = createSyncStatsMessage(
         clientId,
         'live', // This is always live sync in process-changes
@@ -825,7 +852,7 @@ export async function processChanges(
         clientTableStats,      // Use client-specific table stats
         clientStats,
         filteredReasons,
-        {}, // We don't track specific deduplication reasons yet
+        deduplicationReasons, // Pass the actual deduplication reasons
         startTime,
         firstLSN,
         lastLSN,

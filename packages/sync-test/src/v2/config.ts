@@ -192,4 +192,20 @@ export function getConfig(): Config {
     changeWaitTime: parseInt(process.env.CHANGE_WAIT_TIME || '') || DEFAULT_CONFIG.changeWaitTime,
     chunkTimeout: parseInt(process.env.CHUNK_TIMEOUT || '') || DEFAULT_CONFIG.chunkTimeout
   };
-} 
+}
+
+export const ENTITY_OPERATIONS = {
+  // Default ratio for operation types
+  OPERATION_DISTRIBUTION: {
+    create: 0.45,
+    update: 0.45,
+    delete: 0.1
+  },
+  
+  // Percentage of records that should have duplicate operations
+  // This is used to test deduplication logic
+  DUPLICATE_PERCENTAGE: 0.5, // 50% of records will have duplicates (increased for better testing)
+  
+  // Minimum number of records needed to generate duplicates
+  MIN_RECORDS_FOR_DUPLICATES: 3
+}; 
