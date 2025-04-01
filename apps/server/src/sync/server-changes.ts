@@ -5,7 +5,8 @@ import type {
   ServerStateChangeMessage,
   ServerLSNUpdateMessage,
   ServerSyncCompletedMessage,
-  ServerCatchupCompletedMessage
+  ServerCatchupCompletedMessage,
+  ServerSyncStatsMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
@@ -178,148 +179,23 @@ export async function performCatchupSync(
     serverLSN
   }, MODULE_NAME);
 
-  let changeCount = 0; // Track total changes sent for reporting
-  let finalLSN = clientLSN; // This will track the final LSN after changes
-  
   try {
-    // SyncDO has already determined that client needs catchup sync
-    // We can immediately start fetching changes
-    syncLogger.info('Retrieving changes from history', {
+    // Use the shared fetchAndProcessChanges function with isLiveSync=false
+    const result = await fetchAndProcessChanges(
+      context,
+      clientId,
       clientLSN,
-      serverLSN
-    }, MODULE_NAME);
-    
-    try {
-      const client = getDBClient(context);
-      await client.connect();
-      
-      try {
-        // Set a timeout for the query to avoid WebSocket connection timeout
-        // - 20 second query timeout is shorter than typical WebSocket timeout of 30s
-        // - This prevents the database from holding a transaction open too long
-        await client.query('SET statement_timeout = 20000'); // 20 seconds timeout
-        
-        // Paginate through the changes to avoid memory issues
-        const pageSize = 500;
-        let lastSeenLSN = clientLSN; // Start from client LSN
-        let hasMoreChanges = true;
-        let allChanges: TableChange[] = [];
-        
-        // Track query start time
-        const queryStartTime = Date.now();
-        
-        while (hasMoreChanges) {
-          // Check elapsed time and break if getting close to WebSocket timeout
-          // - 25 second timeout is a safety margin before WebSocket typically closes at 30s
-          // - This allows time to process any changes already retrieved before connection closes
-          if (Date.now() - queryStartTime > 25000) { // 25 seconds
-            syncLogger.warn('Query taking too long, stopping pagination to avoid WebSocket timeout', {
-              clientId,
-              timeElapsed: Date.now() - queryStartTime,
-              changesRetrieved: allChanges.length
-            }, MODULE_NAME);
-            break;
-          }
-          
-          // Query changes from history table using proper LSN comparison
-          // Using keyset pagination for better performance than OFFSET on large datasets
-          const queryStart = Date.now();
-          const result = await client.query(`
-            SELECT lsn, table_name, operation, data, timestamp 
-            FROM change_history 
-            WHERE 
-              lsn::pg_lsn > $1::pg_lsn AND 
-              lsn::pg_lsn <= $2::pg_lsn
-            ORDER BY lsn::pg_lsn ASC
-            LIMIT $3
-          `, [lastSeenLSN, serverLSN, pageSize]);
-          const queryDuration = Date.now() - queryStart;
-          
-          // Log query performance
-          syncLogger.debug('Retrieved changes from history', {
-            lastSeenLSN,
-            serverLSN,
-            limit: pageSize,
-            resultCount: result.rows.length,
-            queryDuration
-          }, MODULE_NAME);
-          
-          // Convert to TableChange format
-          const changes: TableChange[] = result.rows.map(row => ({
-            table: row.table_name,
-            operation: row.operation,
-            data: row.data,
-            lsn: row.lsn,
-            updated_at: row.timestamp || new Date().toISOString()
-          }));
-          
-          // Add to our collection
-          allChanges = allChanges.concat(changes);
-          
-          // Update paging logic - if we got fewer rows than pageSize, we're done
-          hasMoreChanges = changes.length === pageSize;
-          
-          // Update the last seen LSN if we have rows - use for next page query
-          if (changes.length > 0) {
-            lastSeenLSN = changes[changes.length - 1].lsn || lastSeenLSN;
-            finalLSN = compareLSN(lastSeenLSN, finalLSN) > 0 ? lastSeenLSN : finalLSN;
-          }
-        }
-        
-        // If we found changes, process and send them
-        if (allChanges.length > 0) {
-          // Sort by LSN (this should already be sorted, but just to be sure)
-          allChanges.sort((a, b) => {
-            return compareLSN(a.lsn || '0/0', b.lsn || '0/0');
-          });
-          
-          // Use the original changes since deduplication already happened in process-changes.ts
-          const orderedChanges = baseOrderChangesByDomain(allChanges);
-          
-          // Send changes with flow control - wait for acknowledgment after each chunk
-          await sendCatchupChanges(
-            orderedChanges, 
-            finalLSN, 
-            clientId, 
-            messageHandler
-          );
-          
-          // Update the change count for final reporting
-          changeCount = orderedChanges.length;
-          
-          // Log at debug level instead of info to reduce noise
-          syncLogger.debug('Sent historical changes to client', {
-            clientId,
-            changeCount,
-            finalLSN
-          }, MODULE_NAME);
-        } else {
-          syncLogger.debug('No historical changes found', {
-            clientId,
-            clientLSN,
-            serverLSN
-          }, MODULE_NAME);
-        }
-      } finally {
-        await client.end();
-      }
-    } catch (historyError) {
-      // Log the error but continue with sync process
-      syncLogger.error('Failed to retrieve historical changes', {
-        clientId,
-        error: historyError instanceof Error ? historyError.message : String(historyError)
-      }, MODULE_NAME);
-    }
-    
-    // No need to check for new changes during sync - that will be handled by the
-    // live sync process after catchup completes
+      serverLSN,
+      messageHandler,
+      false // This is catchup sync, not live sync
+    );
     
     // Complete the sync
     const syncCompletedMsg = createCatchupSyncCompletion(
       clientId,
       clientLSN,
-      finalLSN,
-      changeCount
+      result.finalLSN,
+      result.changeCount
     );
     
     await messageHandler.send(syncCompletedMsg);
@@ -327,8 +203,9 @@ export async function performCatchupSync(
     syncLogger.info('Catchup sync completed', {
       clientId,
       clientLSN,
-      finalLSN,
-      changeCount
+      finalLSN: result.finalLSN,
+      changeCount: result.changeCount,
+      success: result.success
     }, MODULE_NAME);
   } catch (error) {
     syncLogger.error('Catchup sync failed', {
@@ -573,4 +450,214 @@ export function createLiveSyncConfirmation(
     changeCount: 0, // No changes were sent
     success: true
   };
+}
+
+/**
+ * Fetch changes from the database, process them, and send them to the client
+ * This is a unified function for both live updates and catchup sync
+ */
+export async function fetchAndProcessChanges(
+  context: MinimalContext,
+  clientId: string,
+  clientLSN: string,
+  serverLSN: string,
+  messageHandler: WebSocketHandler,
+  isLiveSync: boolean = true
+): Promise<{
+  success: boolean;
+  changeCount: number;
+  finalLSN: string;
+}> {
+  const startTime = Date.now();
+  let allChanges: TableChange[] = [];
+  
+  try {
+    syncLogger.info(`Fetching changes for ${isLiveSync ? 'live' : 'catchup'} sync`, {
+      clientId,
+      clientLSN,
+      serverLSN
+    }, MODULE_NAME);
+    
+    // Query changes from database
+    const client = getDBClient(context);
+    await client.connect();
+    
+    try {
+      // Set a timeout for the query to avoid WebSocket connection timeout
+      await client.query('SET statement_timeout = 20000'); // 20 seconds timeout
+      
+      const queryStart = Date.now();
+      const result = await client.query(`
+        SELECT lsn, table_name, operation, data, timestamp 
+        FROM change_history 
+        WHERE 
+          lsn::pg_lsn > $1::pg_lsn AND
+          lsn::pg_lsn <= $2::pg_lsn AND
+          (data->>'client_id' IS NULL OR data->>'client_id' != $3)
+        ORDER BY lsn::pg_lsn ASC
+        LIMIT 500
+      `, [clientLSN, serverLSN, clientId]);
+      const queryDuration = Date.now() - queryStart;
+      
+      // Convert to TableChange format
+      allChanges = result.rows.map(row => ({
+        table: row.table_name,
+        operation: row.operation,
+        data: row.data,
+        lsn: row.lsn,
+        updated_at: row.timestamp || new Date().toISOString()
+      }));
+      
+      syncLogger.debug('Retrieved changes from history', {
+        clientId,
+        clientLSN,
+        serverLSN,
+        count: allChanges.length,
+        queryDuration
+      }, MODULE_NAME);
+    } finally {
+      await client.end();
+    }
+    
+    // If no changes, return early
+    if (allChanges.length === 0) {
+      syncLogger.info('No changes found for sync', {
+        clientId,
+        clientLSN,
+        serverLSN
+      }, MODULE_NAME);
+      
+      return {
+        success: true,
+        changeCount: 0,
+        finalLSN: clientLSN
+      };
+    }
+    
+    // Process changes (deduplicate and order)
+    const processedChanges = deduplicateChanges(allChanges);
+    
+    // Track metrics for stats message
+    const originalCount = allChanges.length;
+    const processedCount = processedChanges.length;
+    const operationCounts = processedChanges.reduce((acc, change) => {
+      acc[change.operation] = (acc[change.operation] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    
+    const tableStats = processedChanges.reduce((acc, change) => {
+      acc[change.table] = (acc[change.table] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    
+    // Send changes to client using the appropriate method
+    let sendResult: { success: boolean; lsn: string };
+    
+    if (isLiveSync) {
+      // For live updates, use sendLiveChanges
+      sendResult = await sendLiveChanges(
+        context,
+        clientId,
+        processedChanges,
+        messageHandler,
+        serverLSN
+      );
+    } else {
+      // For catchup sync, use sendCatchupChanges with client acknowledgment
+      const success = await sendCatchupChanges(
+        processedChanges,
+        serverLSN,
+        clientId,
+        messageHandler
+      );
+      
+      sendResult = {
+        success,
+        lsn: success ? serverLSN : clientLSN
+      };
+    }
+    
+    // Extract final LSN from the result
+    const finalLSN = sendResult.success ? sendResult.lsn : clientLSN;
+    
+    // Create and send stats message
+    const statsMessage: ServerSyncStatsMessage = {
+      type: 'srv_sync_stats',
+      messageId: `stats_${Date.now()}`,
+      timestamp: Date.now(),
+      clientId,
+      syncType: isLiveSync ? 'live' : 'catchup',
+      originalCount,
+      processedCount,
+      deduplicationStats: {
+        beforeCount: originalCount,
+        afterCount: processedCount,
+        reduction: originalCount - processedCount,
+        reductionPercent: originalCount > 0 ?
+          Math.round(((originalCount - processedCount) / originalCount) * 100) : 0,
+        reasons: {}
+      },
+      filteringStats: {
+        beforeCount: originalCount,
+        afterCount: processedCount,
+        filtered: 0,
+        reasons: {}
+      },
+      contentStats: {
+        operations: operationCounts,
+        tables: tableStats,
+        clients: {}
+      },
+      performanceStats: {
+        processingTimeMs: Date.now() - startTime
+      }
+    };
+    
+    if (allChanges.length > 0 && finalLSN) {
+      statsMessage.lsnRange = {
+        first: allChanges[0].lsn || clientLSN,
+        last: finalLSN
+      };
+    }
+    
+    // Send stats message
+    try {
+      await messageHandler.send(statsMessage);
+    } catch (statsError) {
+      syncLogger.error('Failed to send stats', {
+        clientId,
+        error: statsError instanceof Error ? statsError.message : String(statsError)
+      }, MODULE_NAME);
+      // Continue even if stats sending fails
+    }
+    
+    syncLogger.info(`${isLiveSync ? 'Live' : 'Catchup'} sync completed`, {
+      clientId,
+      changeCount: processedChanges.length,
+      success: sendResult.success,
+      clientLSN,
+      finalLSN,
+      duration: Date.now() - startTime
+    }, MODULE_NAME);
+    
+    return {
+      success: sendResult.success,
+      changeCount: processedChanges.length,
+      finalLSN
+    };
+  } catch (error) {
+    syncLogger.error(`${isLiveSync ? 'Live' : 'Catchup'} sync failed`, {
+      clientId,
+      clientLSN,
+      serverLSN,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    }, MODULE_NAME);
+    
+    return {
+      success: false,
+      changeCount: 0,
+      finalLSN: clientLSN
+    };
+  }
 } 

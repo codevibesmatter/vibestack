@@ -4,7 +4,7 @@
     "name": "Client 1",
     "profileId": 1,
     "lsn": "0/A36EB18",
-    "timestamp": 1743364322726,
+    "timestamp": 1743521896188,
     "testHistory": {
       "initial": 0,
       "liveSync": 1,
@@ -16,8 +16,8 @@
     "id": "e459b073-92fa-479f-8375-179cc2aa97da",
     "name": "Client 2",
     "profileId": 2,
-    "lsn": "0/A2A2EB8",
-    "timestamp": 1743361785224,
+    "lsn": "0/A3FC1F8",
+    "timestamp": 1743521896400,
     "testHistory": {
       "initial": 0,
       "liveSync": 0,

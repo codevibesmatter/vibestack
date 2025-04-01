@@ -407,125 +407,71 @@ export async function broadcastChangesToClients(
   
   try {
     const clientIds = await getAllClientIds(env);
-    let totalChangesSent = 0;
     
-    // For each client, send only the changes not made by that client
+    // Simplified notification logic - just tell clients to check for changes
+    replicationLogger.info('Notifying clients of new changes', {
+      clientCount: clientIds.length,
+      lastLSN
+    }, MODULE_NAME);
+    
+    // Track successful notifications
+    let successCount = 0;
+    let failureCount = 0;
+    
+    // For each client, send notification to check for changes
     for (const clientId of clientIds) {
-      // Get changes made by this client (if any)
-      const clientChanges = changesByClient.get(clientId) || [];
-      const clientChangeIds = new Set(clientChanges.map(c => `${c.table}:${c.data.id}`));
-      
-      // Filter out self-changes and get only non-system changes
-      const changesToSend = changes.filter(change => {
-        // Skip system changes (they'll be handled separately)
-        if (typeof change.data.client_id !== 'string') {
-          return false;
-        }
+      try {
+        // Get the client's SyncDO
+        const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
+        const clientDo = env.SYNC.get(clientDoId);
         
-        // Skip if this change was made by this client
-        if (change.data.client_id === clientId) {
-          return false;
-        }
+        // Send notification to check for changes (only clientId and lastLSN)
+        const response = await clientDo.fetch(
+          `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              lsn: lastLSN,
+              sequence: { chunk: 1, total: 1 }
+            })
+          }
+        );
         
-        // Skip if we have another change for this record from this client
-        // (prevents race conditions where client already has a newer version)
-        const changeKey = `${change.table}:${change.data.id}`;
-        return !clientChangeIds.has(changeKey);
-      });
-      
-      // Add system changes to the changes to send
-      const systemChanges = changesByClient.get(null) || [];
-      const allChangesToSend = [...changesToSend, ...systemChanges];
-      
-      if (allChangesToSend.length > 0) {
-        try {
-          // Get the client's SyncDO
-          const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
-          const clientDo = env.SYNC.get(clientDoId);
+        if (response.status === 200) {
+          successCount++;
           
-          // Implement chunking for large change sets
-          const chunks = Math.ceil(allChangesToSend.length / DEFAULT_CHUNK_SIZE);
-          let chunkSuccess = true;
-          
-          for (let i = 0; i < chunks; i++) {
-            const start = i * DEFAULT_CHUNK_SIZE;
-            const end = Math.min(start + DEFAULT_CHUNK_SIZE, allChangesToSend.length);
-            const chunkChanges = allChangesToSend.slice(start, end);
-            
-            const response = await clientDo.fetch(
-              `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
-              {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                  changes: chunkChanges,
-                  lsn: lastLSN,
-                  sequence: { chunk: i + 1, total: chunks }
-                })
-              }
-            );
-            
-            if (response.status === 200) {
-              totalChangesSent += chunkChanges.length;
-              
-              replicationLogger.debug('Client changes chunk sent', { 
-                clientId,
-                changeCount: chunkChanges.length,
-                chunk: i + 1,
-                total: chunks,
-                tables: [...new Set(chunkChanges.map(c => c.table))]
-              }, MODULE_NAME);
-            } else {
-              chunkSuccess = false;
-              replicationLogger.warn('Failed to send changes chunk to client', {
-                clientId,
-                status: response.status,
-                chunk: i + 1,
-                total: chunks
-              }, MODULE_NAME);
-              // Don't break, try all chunks
-            }
-          }
-          
-          if (chunkSuccess) {
-            replicationLogger.debug('All client changes sent successfully', { 
-              clientId,
-              totalChunks: chunks,
-              totalChanges: allChangesToSend.length
-            }, MODULE_NAME);
-          }
-        } catch (error) {
-          replicationLogger.error('Client notification failed', {
+          replicationLogger.debug('Client notification sent', { 
             clientId,
-            error: error instanceof Error ? error.message : String(error)
+            lastLSN
+          }, MODULE_NAME);
+        } else {
+          failureCount++;
+          replicationLogger.warn('Failed to notify client', {
+            clientId,
+            status: response.status
           }, MODULE_NAME);
         }
+      } catch (error) {
+        failureCount++;
+        replicationLogger.error('Client notification failed', {
+          clientId,
+          error: error instanceof Error ? error.message : String(error)
+        }, MODULE_NAME);
       }
     }
     
-    // Log high-level broadcast status
-    replicationLogger.info('Broadcast complete', {
-      totalChanges: changes.length,
-      clientCount: clientIds.length,
-      totalChangesSent
-    }, MODULE_NAME);
-    
-    // Log detailed broadcast info at debug level
-    replicationLogger.debug('Broadcast details', {
+    // Log notification summary
+    replicationLogger.info('Client notification complete', {
       totalClients: clientIds.length,
-      changesByClientCount: Object.fromEntries(
-        Array.from(changesByClient.entries())
-          .map(([id, changes]) => [id || 'system', changes.length])
-      ),
-      lsnRange: {
-        first: changes[0].lsn,
-        last: lastLSN
-      }
+      successCount,
+      failureCount,
+      lastLSN
     }, MODULE_NAME);
     
-    return true;
+    return successCount > 0; // Consider successful if at least one client was notified
   } catch (error) {
     replicationLogger.error('Broadcast failed', {
       error: error instanceof Error ? error.message : String(error),

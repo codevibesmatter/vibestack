@@ -11,7 +11,7 @@
 
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
-import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation } from './server-changes';
+import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation, fetchAndProcessChanges } from './server-changes';
 import { processClientChanges } from './client-changes';
 import type { 
   ServerMessage, 
@@ -23,7 +23,9 @@ import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
 import { syncLogger } from '../middleware/logger';
 import type { WebSocketHandler } from './types';
-import { compareLSN } from '../lib/sync-common';
+import { compareLSN, deduplicateChanges } from '../lib/sync-common';
+import { getDBClient } from '../lib/db';
+import type { TableChange } from '@repo/sync-types';
 
 // WebSocket ready states
 const WS_READY_STATE = {
@@ -454,7 +456,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     const clientId = getQueryParam(request, 'clientId');
     const lsnFromUrl = getQueryParam(request, 'lsn');
 
-    syncLogger.info('Received new changes request', {
+    syncLogger.info('Received new changes notification', {
       clientId,
       lsnFromUrl
     }, MODULE_NAME);
@@ -481,46 +483,37 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       });
     }
 
-    // Parse the request body to get the changes
+    // Parse the request body to get the serverLSN
     let requestData;
-    let changes;
+    let serverLSN;
     try {
       requestData = await request.json() as { 
-        changes: any[],
-        lastLSN?: string 
+        lsn?: string,
+        sequence?: { chunk: number, total: number }
       };
       
-      // Extract changes array from request data
-      changes = requestData.changes || [];
+      // Extract server LSN from request data
+      serverLSN = requestData.lsn;
       
-      if (!Array.isArray(changes)) {
-        throw new Error('Expected array of changes');
+      if (!serverLSN) {
+        throw new Error('No server LSN provided');
       }
       
-      syncLogger.info('Received client notification request', {
+      if (!isValidLSN(serverLSN)) {
+        throw new Error('Invalid server LSN format');
+      }
+      
+      syncLogger.info('Processing changes notification', {
         clientId,
-        changeCount: changes.length,
-        connectionActive: this.isConnected(),
-        receivedLSN: requestData.lastLSN || 'not provided'
+        serverLSN,
+        connectionActive: this.isConnected()
       }, MODULE_NAME);
     } catch (error) {
       return new Response(JSON.stringify({
-        error: 'Invalid changes format',
+        error: 'Invalid request format',
         details: error instanceof Error ? error.message : String(error)
       }), {
         status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // If no changes, return success immediately
-    if (changes.length === 0) {
-      return new Response(JSON.stringify({
-        success: true,
-        notified: false,
-        message: 'No changes to notify'
-      }), {
-        status: 200,
         headers: { 'Content-Type': 'application/json' }
       });
     }
@@ -540,80 +533,72 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       });
     }
 
-    // Get client LSN - prefer URL parameter, fallback to request body, then state manager
-    let lsn = lsnFromUrl;
-    
-    // If not in URL params, try the request body
-    if (!lsn && requestData.lastLSN) {
-      lsn = requestData.lastLSN;
-    }
-    
-    // If still not found, fallback to state manager
-    if (!lsn) {
-      try {
-        // Use getLSN from state manager if clientId matches current clientId
-        if (this.clientId === clientId) {
-          lsn = this.stateManager.getLSN();
-          if (!lsn) {
-            syncLogger.warn('No LSN available for client', {
-              clientId
-            }, MODULE_NAME);
-            // Don't throw here, but use 0/0 as a last resort
-            lsn = '0/0';
-          }
-        } else {
-          syncLogger.warn('Client ID mismatch, cannot get LSN from state manager', {
-            requestClientId: clientId,
-            currentClientId: this.clientId
-          }, MODULE_NAME);
-          // For consistency with previous implementation
-          lsn = '0/0';
-        }
-      } catch (error) {
-        syncLogger.error('Failed to get client LSN', {
-          clientId,
-          error: error instanceof Error ? error.message : String(error)
+    // Get client's last known LSN
+    let clientLSN: string;
+    try {
+      // Use getLSN from state manager if this SyncDO is for the requested clientId
+      if (this.clientId === clientId) {
+        clientLSN = this.stateManager.getLSN() || '0/0';
+      } else {
+        syncLogger.warn('Client ID mismatch, cannot get LSN from state manager', {
+          requestClientId: clientId,
+          currentClientId: this.clientId
         }, MODULE_NAME);
-        // For consistency with previous implementation
-        lsn = '0/0';
+        // Default to 0/0 if we can't get the client's LSN
+        clientLSN = '0/0';
       }
+    } catch (error) {
+      syncLogger.error('Failed to get client LSN', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      clientLSN = '0/0';
     }
 
-    // Send changes to client
-    const ctx = this.getContext();
-    
-    syncLogger.debug('Using LSN for sync', {
+    syncLogger.debug('Using LSNs for sync', {
       clientId,
-      providedLSN: lsn,
-      source: lsnFromUrl ? 'url' : (requestData.lastLSN ? 'request body' : 'state-manager')
+      clientLSN,
+      serverLSN
     }, MODULE_NAME);
-    
-    const result = await sendLiveChanges(
-      ctx,          // Context for logging/environment
-      clientId,     // Client ID
-      changes,      // The changes to send 
-      this,         // WebSocketHandler (this instance)
-      lsn           // LSN from request or state manager
-    );
 
-    if (result.success) {
+    const ctx = this.getContext();
+
+    try {
+      // Use the new unified fetchAndProcessChanges function
+      const result = await fetchAndProcessChanges(
+        ctx,
+        clientId,
+        clientLSN,
+        serverLSN,
+        this,
+        true // This is a live sync
+      );
+      
+      // Update client's LSN if successful and this is our client
+      if (result.success && this.clientId === clientId) {
+        await this.stateManager.updateClientLSN(clientId, result.finalLSN);
+      }
+      
       return new Response(JSON.stringify({
-        success: true,
-        notified: true,
-        lsn: result.lsn
+        success: result.success,
+        notified: result.success,
+        changeCount: result.changeCount,
+        lsn: result.finalLSN
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' }
       });
-    } else {
-      syncLogger.warn('Failed to send live changes', {
-        clientId
+    } catch (error) {
+      syncLogger.error('Failed to process changes notification', {
+        clientId,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
       }, MODULE_NAME);
       
       return new Response(JSON.stringify({
         success: false,
-        error: 'Failed to send live changes',
-        partialSuccess: true
+        error: 'Failed to process changes',
+        details: error instanceof Error ? error.message : String(error)
       }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
