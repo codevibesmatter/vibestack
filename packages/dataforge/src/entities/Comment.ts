@@ -15,12 +15,12 @@ import { Project } from './Project.js';
 
 /**
  * Universal Comment entity that can be associated with any entity type
- * Uses a polymorphic association pattern with entity_type and entity_id
+ * Uses a polymorphic association pattern with entityType and entityId
  * Categorized as a domain entity for replication purposes
  */
 @Entity('comments')
 @TableCategory('domain')
-@Index(['entity_type', 'entity_id']) // Index for faster lookups by entity
+@Index("IDX_comments_entity_type_entity_id", ["entityType", "entityId"]) // Index for faster lookups by entity
 export class Comment {
   @PrimaryGeneratedColumn('uuid')
   @IsUUID(4)
@@ -35,44 +35,44 @@ export class Comment {
   /**
    * The type of entity this comment is associated with (e.g., 'task', 'project')
    */
-  @Column({ type: "varchar" })
+  @Column({ type: "varchar", name: "entity_type" })
   @IsString()
-  entity_type!: string;
+  entityType!: string;
   
   /**
    * The ID of the entity this comment is associated with
    */
-  @Column({ type: "uuid" })
+  @Column({ type: "uuid", name: "entity_id" })
   @IsUUID(4)
-  entity_id!: string;
+  entityId!: string;
   
-  @Column({ type: "uuid" })
+  @Column({ type: "uuid", name: "author_id" })
   @IsUUID(4)
-  author_id!: string;
+  authorId!: string;
   
   /**
    * Optional parent comment ID for threaded comments
    */
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "parent_id" })
   @IsOptional()
   @IsUUID(4)
-  parent_id?: string;
+  parentId?: string;
   
   /**
    * Client ID for replication tracking
    */
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "client_id" })
   @IsOptional()
   @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  client_id?: string;
+  clientId?: string;
   
-  @CreateDateColumn({ type: "timestamptz" })
+  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
   @IsDate()
-  created_at!: Date;
+  createdAt!: Date;
   
-  @UpdateDateColumn({ type: "timestamptz" })
+  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
   @IsDate()
-  updated_at!: Date;
+  updatedAt!: Date;
   
   // Relationship fields with explicit JoinColumn decorators
   @ManyToOne(() => User)
@@ -84,7 +84,7 @@ export class Comment {
   parent?: Relation<Comment>;
   
   // Note: For polymorphic relationships, we need application code to determine
-  // which relationship to use based on entity_type
+  // which relationship to use based on entityType
   @ManyToOne(() => Task, { createForeignKeyConstraints: false })
   @JoinColumn([
     { name: "entity_id", referencedColumnName: "id" }

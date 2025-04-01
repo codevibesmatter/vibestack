@@ -47,8 +47,8 @@ async function getNextSchemaVersion(dataSource: DataSource): Promise<string> {
   // Get the latest schema version from existing migrations
   const result = await dataSource.manager
     .createQueryBuilder(ClientMigration, "migration")
-    .select("migration.schema_version")
-    .orderBy("migration.schema_version", "DESC")
+    .select("migration.schemaVersion")
+    .orderBy("migration.schemaVersion", "DESC")
     .getOne();
 
   if (!result) {
@@ -56,7 +56,7 @@ async function getNextSchemaVersion(dataSource: DataSource): Promise<string> {
   }
 
   // Parse version and increment minor version
-  const [major, minor, patch] = result.schema_version.split('.').map(Number);
+  const [major, minor, patch] = result.schemaVersion.split('.').map(Number);
   return `${major}.${minor + 1}.${patch}`;
 }
 
@@ -67,7 +67,7 @@ async function uploadClientMigrations() {
 
     // Get existing migrations from server
     const existingMigrations = await serverDataSource.manager.find(ClientMigration);
-    const existingMigrationNames = new Set(existingMigrations.map(m => m.migration_name));
+    const existingMigrationNames = new Set(existingMigrations.map(m => m.migrationName));
 
     // Get all client migration files
     const pattern = path.join(process.cwd(), 'src/migrations/client/*.ts');
@@ -109,13 +109,13 @@ async function uploadClientMigrations() {
 
       // Create migration record
       const clientMigration = new ClientMigration();
-      clientMigration.migration_name = instance.name;
-      clientMigration.schema_version = schemaVersion;
+      clientMigration.migrationName = instance.name;
+      clientMigration.schemaVersion = schemaVersion;
       clientMigration.dependencies = [];
-      clientMigration.migration_type = MigrationType.SCHEMA;
+      clientMigration.migrationType = MigrationType.SCHEMA;
       clientMigration.state = MigrationState.PENDING;
-      clientMigration.up_queries = up;
-      clientMigration.down_queries = down;
+      clientMigration.upQueries = up;
+      clientMigration.downQueries = down;
       clientMigration.timestamp = timestamp;
       clientMigration.description = `Client migration ${instance.name}`;
 
@@ -124,9 +124,9 @@ async function uploadClientMigrations() {
         await serverDataSource.manager.createQueryBuilder()
           .update(ClientMigration)
           .set({
-            schema_version: schemaVersion,
-            up_queries: up,
-            down_queries: down,
+            schemaVersion: schemaVersion,
+            upQueries: up,
+            downQueries: down,
             state: MigrationState.PENDING // Reset state for re-application
           })
           .where("migration_name = :name", { name: instance.name })

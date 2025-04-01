@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { createLogger } from './logger.ts';
 import { WS_CONFIG } from '../config.ts';
 import { ClientProfileManager, ClientProfile } from './client-profile-manager.ts';
-import * as dbService from './db-service.ts';
+import * as apiService from './api-service.ts';
 import { messageDispatcher } from './message-dispatcher.ts';
 import type { ServerChangesMessage, SrvMessageType, TableChange } from '@repo/sync-types';
 import { MessageProcessor } from './message-processor.ts';

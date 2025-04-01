@@ -1,8 +1,27 @@
-// Load environment variables from .env file
+#!/usr/bin/env node
 import { config as dotenvConfig } from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import inquirer from 'inquirer';
+import { createLogger } from './core/logger.ts';
+
+// Set up global error handlers to ensure we never hang
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('\n\n❌ Unhandled Promise Rejection:');
+  console.error(reason);
+  console.error('\nFORCING EXIT due to unhandled error');
+  process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('\n\n❌ Uncaught Exception:');
+  console.error(error);
+  console.error('\nFORCING EXIT due to uncaught exception');
+  process.exit(1);
+});
+
+// Create logger
+const logger = createLogger('cli');
 
 // Calculate the directory path in ES modules (replacement for __dirname)
 const __filename = fileURLToPath(import.meta.url);
@@ -70,6 +89,12 @@ function parseCommandOptions(args: string[]): Record<string, string | number> {
  * Run a live sync test with specified parameters
  */
 async function runLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
+  // Set a global timeout to ensure the process exits even if something hangs
+  const globalTimeout = setTimeout(() => {
+    console.error('\n⚠️ Global timeout reached! Forcing exit.');
+    process.exit(1);
+  }, 180000); // 3 minutes max run time
+  
   try {
     // We use dynamic import to prevent auto-execution when the module is loaded
     const { runLiveSyncTest } = await import('./scenarios/live-sync.ts');
@@ -84,18 +109,21 @@ async function runLiveSyncTest(clientCount: number, changeCount: number): Promis
       console.log('\n✅ Live sync test completed successfully!');
     } else {
       console.log('\n❌ Some live sync tests failed. Check the logs above for details.');
-      // Force exit with short delay to ensure logs are written
-      setTimeout(() => process.exit(1), 500);
+      // Force exit immediately to avoid hanging
+      clearTimeout(globalTimeout);
+      process.exit(1);
       return;
     }
     
-    // Force exit after a short delay to ensure logs are written and cleanup happens
-    console.log('Test completed, forcing exit in 1 second...');
-    setTimeout(() => process.exit(0), 1000);
+    // Clear the global timeout and exit cleanly
+    clearTimeout(globalTimeout);
+    console.log('Test completed, exiting...');
+    process.exit(0);
   } catch (error) {
     console.error('\n❌ Test failed:', error);
-    // Force exit with short delay to ensure logs are written
-    setTimeout(() => process.exit(1), 500);
+    // Force exit immediately to avoid hanging
+    clearTimeout(globalTimeout);
+    process.exit(1);
   }
 }
 

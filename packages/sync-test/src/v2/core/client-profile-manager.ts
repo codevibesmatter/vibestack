@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { LSN_STATE } from '../config.ts';
 import { createLogger } from './logger.ts';
-import * as dbService from './db-service.ts';
+import * as apiService from './api-service.ts';
 
 /**
  * Client profile interface
@@ -101,7 +101,7 @@ export class ClientProfileManager {
     // Get current server LSN instead of using 0/0
     let lsn = '0/0';
     try {
-      lsn = await dbService.getCurrentLSN();
+      lsn = await apiService.getCurrentLSN();
       this.logger.info(`Using current server LSN for new profile: ${lsn}`);
     } catch (error) {
       this.logger.error(`Failed to get current server LSN, using 0/0: ${error}`);

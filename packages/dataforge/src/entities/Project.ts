@@ -1,4 +1,4 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, OneToMany, ManyToMany, JoinTable, Relation } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, OneToMany, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
@@ -54,28 +54,29 @@ export class Project {
   @IsEnum(ProjectStatus)
   status!: ProjectStatus;
   
-  @Column({ type: "uuid" })
+  @Column({ type: "uuid", name: "owner_id" })
   @IsUUID(4, { message: "Owner ID must be a valid UUID" })
-  owner_id!: string;
+  ownerId!: string;
   
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "client_id" })
   @IsOptional()
   @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  client_id?: string;
+  clientId?: string;
   
-  @CreateDateColumn({ type: "timestamptz" })
+  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
   @IsDate({ message: "Created date must be a valid date" })
-  created_at!: Date;
+  createdAt!: Date;
   
-  @UpdateDateColumn({ type: "timestamptz" })
+  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
   @IsDate({ message: "Updated date must be a valid date" })
-  updated_at!: Date;
+  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
-  @ManyToOne(() => User, (user) => user.owned_projects)
+  @ManyToOne(() => User, (user) => user.ownedProjects)
+  @JoinColumn({ name: "owner_id" })
   owner!: Relation<User>;
   
-  @ManyToMany(() => User, (user) => user.member_projects)
+  @ManyToMany(() => User, (user) => user.memberProjects)
   @JoinTable({
     name: 'project_members',
     joinColumn: {

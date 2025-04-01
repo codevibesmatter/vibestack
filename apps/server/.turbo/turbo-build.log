@@ -1,6 +1,4 @@
 
-
 > @repo/server@0.1.0 build /home/benfreed/dev/tinytest/vibestack/apps/server
 > tsc --noEmit && wrangler deploy --outdir=dist
 
-[41m[30m ELIFECYCLE [39m[49m [31mCommand failed.[39m

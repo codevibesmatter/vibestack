@@ -1,4 +1,4 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, ManyToMany, JoinTable, Relation } from 'typeorm';
+import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
@@ -63,56 +63,58 @@ export class Task {
   @IsEnum(TaskPriority)
   priority!: TaskPriority;
   
-  @Column({ type: "timestamptz", nullable: true })
+  @Column({ type: "timestamptz", nullable: true, name: "due_date" })
   @IsOptional()
   @IsDate()
-  due_date?: Date;
+  dueDate?: Date;
   
-  @Column({ type: "timestamptz", nullable: true })
+  @Column({ type: "timestamptz", nullable: true, name: "completed_at" })
   @IsOptional()
   @IsDate()
-  completed_at?: Date;
+  completedAt?: Date;
 
-  @Column({ type: "tsrange", nullable: true })
+  @Column({ type: "tsrange", nullable: true, name: "time_range" })
   @IsOptional()
-  time_range?: string;
+  timeRange?: string;
 
-  @Column({ type: "interval", nullable: true })
+  @Column({ type: "interval", nullable: true, name: "estimated_duration" })
   @IsOptional()
-  estimated_duration?: string;
+  estimatedDuration?: string;
   
   @Column("text", { array: true, default: [] })
   @IsArray()
   @IsString({ each: true })
   tags!: string[];
   
-  @Column({ type: "uuid" })
+  @Column({ type: "uuid", name: "project_id" })
   @IsUUID(4)
-  project_id!: string;
+  projectId!: string;
   
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "assignee_id" })
   @IsOptional()
   @IsUUID(4)
-  assignee_id?: string;
+  assigneeId?: string;
   
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "client_id" })
   @IsOptional()
   @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  client_id?: string;
+  clientId?: string;
   
-  @CreateDateColumn({ type: "timestamptz" })
+  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
   @IsDate()
-  created_at!: Date;
+  createdAt!: Date;
   
-  @UpdateDateColumn({ type: "timestamptz" })
+  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
   @IsDate()
-  updated_at!: Date;
+  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @ManyToOne(() => Project, (project) => project.tasks)
+  @JoinColumn({ name: "project_id" })
   project!: Relation<Project>;
   
   @ManyToOne(() => User, (user) => user.tasks, { nullable: true })
+  @JoinColumn({ name: "assignee_id" })
   assignee?: Relation<User>;
   
   @ManyToMany(() => Task)

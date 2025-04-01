@@ -19,8 +19,8 @@ export class ChangeHistory {
   @Column({ type: 'text', nullable: false })
   lsn!: string;
 
-  @Column({ type: 'text', nullable: false })
-  table_name!: string;
+  @Column({ type: 'text', nullable: false, name: 'table_name' })
+  tableName!: string;
 
   @Column({ type: 'text', nullable: false })
   operation!: string;

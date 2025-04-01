@@ -31,10 +31,10 @@ export class LocalChanges {
   @IsString()
   lsn!: string;
 
-  @Column({ type: 'timestamptz' })
-  updated_at!: Date;
+  @Column({ type: 'timestamptz', name: 'updated_at' })
+  updatedAt!: Date;
 
-  @Column({ type: 'boolean', default: false })
+  @Column({ type: 'boolean', default: false, name: 'processed_sync' })
   @IsBoolean()
-  processed_sync!: boolean;
+  processedSync!: boolean;
 } 

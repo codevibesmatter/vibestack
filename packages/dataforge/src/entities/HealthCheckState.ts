@@ -9,9 +9,9 @@ export class HealthCheckState {
   @IsUUID(4)
   id!: string;
 
-  @Column({ type: 'timestamp' })
+  @Column({ type: 'timestamp', name: 'last_run_timestamp' })
   @IsDate()
-  last_run_timestamp!: Date;
+  lastRunTimestamp!: Date;
 
   @Column({ type: 'text' })
   @IsString()
@@ -22,6 +22,6 @@ export class HealthCheckState {
   @IsOptional()
   metrics?: Record<string, unknown>;
 
-  @CreateDateColumn({ type: 'timestamp' })
-  created_at!: Date;
+  @CreateDateColumn({ type: 'timestamp', name: 'created_at' })
+  createdAt!: Date;
 } 

@@ -47,42 +47,42 @@ export class User {
   @IsEmail({}, { message: "Please provide a valid email address" })
   email!: string;
   
-  @Column({ type: "varchar", length: 255, nullable: true })
+  @Column({ type: "varchar", length: 255, nullable: true, name: "avatar_url" })
   @IsOptional()
   @IsUrl({}, { message: "Avatar URL must be a valid URL" })
-  avatar_url?: string;
+  avatarUrl?: string;
   
   @Column({ type: "enum", enum: UserRole, default: UserRole.MEMBER })
   @IsEnum(UserRole)
   role!: UserRole;
   
   @ServerOnly()
-  @Column({ type: "varchar", length: 255, select: false, nullable: true })
+  @Column({ type: "varchar", length: 255, select: false, nullable: true, name: "password_hash" })
   @IsOptional()
   @IsString()
   @MinLength(8, { message: "Password hash must be at least 8 characters long" })
-  password_hash?: string;
+  passwordHash?: string;
   
-  @Column({ type: "uuid", nullable: true })
+  @Column({ type: "uuid", nullable: true, name: "client_id" })
   @IsOptional()
   @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  client_id?: string;
+  clientId?: string;
   
-  @CreateDateColumn({ type: "timestamptz" })
+  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
   @IsDate()
-  created_at!: Date;
+  createdAt!: Date;
   
-  @UpdateDateColumn({ type: "timestamptz" })
+  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
   @IsDate()
-  updated_at!: Date;
+  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @OneToMany(() => Task, (task) => task.assignee)
   tasks!: Relation<Task[]>;
   
   @OneToMany(() => Project, (project) => project.owner)
-  owned_projects!: Relation<Project[]>;
+  ownedProjects!: Relation<Project[]>;
   
   @ManyToMany(() => Project, (project) => project.members)
-  member_projects!: Relation<Project[]>;
+  memberProjects!: Relation<Project[]>;
 } 

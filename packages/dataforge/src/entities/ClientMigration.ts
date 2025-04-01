@@ -29,12 +29,12 @@ export enum MigrationState {
 export class ClientMigration {
   @PrimaryColumn({ type: 'text', name: 'migration_name' })
   @IsString()
-  migration_name!: string;
+  migrationName!: string;
 
   @Column({ type: 'text', name: 'schema_version' })
   @Matches(/^\d+\.\d+\.\d+$/)
   @Index()
-  schema_version!: string;  // Semver of schema after this migration
+  schemaVersion!: string;  // Semver of schema after this migration
 
   @Column({ type: 'text', array: true, default: [] })
   @IsString({ each: true })
@@ -42,7 +42,7 @@ export class ClientMigration {
 
   @Column({ type: 'enum', enum: MigrationType, name: 'migration_type' })
   @IsEnum(MigrationType)
-  migration_type!: MigrationType;
+  migrationType!: MigrationType;
 
   @Column({ type: 'enum', enum: MigrationState, default: MigrationState.PENDING })
   @IsEnum(MigrationState)
@@ -51,12 +51,12 @@ export class ClientMigration {
   @Column({ type: 'text', array: true, name: 'up_queries' })
   @IsArray()
   @IsString({ each: true })
-  up_queries!: string[];  // SQL commands to apply migration
+  upQueries!: string[];  // SQL commands to apply migration
 
   @Column({ type: 'text', array: true, name: 'down_queries' })
   @IsArray()
   @IsString({ each: true })
-  down_queries!: string[];  // SQL commands to rollback migration
+  downQueries!: string[];  // SQL commands to rollback migration
 
   @Column({ type: 'text', nullable: true })
   @IsOptional()
@@ -68,5 +68,5 @@ export class ClientMigration {
   timestamp!: number;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
-  created_at!: Date;
+  createdAt!: Date;
 } 

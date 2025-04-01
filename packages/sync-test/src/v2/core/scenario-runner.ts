@@ -6,7 +6,8 @@ import { ValidationService } from './validation-service.ts';
 import { MessageProcessor, MessageProcessorOptions } from './message-processor.ts';
 import { wsClientFactory, WebSocketClientFactory } from './ws-client-factory.ts';
 import { messageDispatcher } from './message-dispatcher.ts';
-import * as dbService from './db-service.ts';
+import * as apiService from './api-service.ts';
+import * as entityChanges from './entity-changes.ts';
 import fetch, { RequestInit as FetchRequestInit } from 'node-fetch';
 import { API_CONFIG } from '../config.ts';
 import type { ServerChangesMessage, SrvMessageType } from '@repo/sync-types';
@@ -50,7 +51,7 @@ export interface StepDefinition {
  * Base action interface - parent type for all actions
  */
 export interface Action {
-  type: 'api' | 'db' | 'ws' | 'interactive' | 'composite' | 'validation';  // Added 'validation'
+  type: 'api' | 'changes' | 'ws' | 'interactive' | 'composite' | 'validation';  // Changed from 'db' to 'changes'
   name?: string;                                            // Optional name for logging/reference
 }
 
@@ -66,10 +67,10 @@ export interface ApiAction extends Action {
 }
 
 /**
- * Database Action - performs database operations
+ * Changes Action - performs database operations (formerly DbAction)
  */
-export interface DbAction extends Action {
-  type: 'db';
+export interface ChangesAction extends Action {
+  type: 'changes';
   operation: string;       // Operation name (createChanges, etc.)
   params?: any;            // Operation parameters or function for 'exec' operation
 }
@@ -108,7 +109,7 @@ export interface InteractiveAction extends Action {
   maxTimeout: number;          // Maximum time to wait for completion
   
   // Optional initial action
-  initialAction?: ApiAction | DbAction | WSAction | ValidationAction;
+  initialAction?: ApiAction | ChangesAction | WSAction | ValidationAction;
   
   // Message handlers
   handlers: Record<string, (message: any, context: any, operations: any) => Promise<boolean> | boolean>;
@@ -123,10 +124,18 @@ export interface CompositeAction extends Action {
   actions: Array<Action>;            // Sub-actions to execute
 }
 
-// Create a type for DB operations
-type DbServiceType = typeof dbService & {
+// Define service types for dynamic operations
+type ApiServiceType = typeof apiService & {
   [key: string]: (...args: any[]) => Promise<any>;
 };
+
+type EntityChangesType = typeof entityChanges & {
+  [key: string]: (...args: any[]) => Promise<any>;
+};
+
+// Replace this line
+const typedApiService = apiService as ApiServiceType;
+const typedEntityChanges = entityChanges as EntityChangesType;
 
 // Type for dynamic WS client operations
 type WsClientFactoryType = WebSocketClientFactory & {
@@ -134,7 +143,6 @@ type WsClientFactoryType = WebSocketClientFactory & {
 };
 
 // Cast services to indexable types
-const typedDbService = dbService as DbServiceType;
 const typedWsClientFactory = wsClientFactory as WsClientFactoryType;
 
 /**
@@ -195,17 +203,21 @@ export class ScenarioRunner extends EventEmitter {
             put: this.apiPut.bind(this),
             delete: this.apiDelete.bind(this)
           },
-          // DB operations
-          db: {
-            initialize: dbService.initializeDatabase.bind(dbService),
-            initializeReplication: dbService.initializeReplication.bind(dbService),
-            getCurrentLSN: dbService.getCurrentLSN.bind(dbService),
-            createChanges: dbService.createChanges.bind(dbService),
-            createChangeBatch: dbService.createChangeBatch.bind(dbService),
-            clearDatabase: dbService.clearDatabase.bind(dbService),
-            verifyEntitiesExist: 'verifyEntitiesExist' in (dbService as any) ? (dbService as any).verifyEntitiesExist.bind(dbService) : undefined,
-            checkEntityExists: 'checkEntityExists' in (dbService as any) ? (dbService as any).checkEntityExists.bind(dbService) : undefined,
-            getEntityById: 'getEntityById' in (dbService as any) ? (dbService as any).getEntityById.bind(dbService) : undefined
+          // Changes operations (formerly DB operations)
+          changes: {
+            // API operations - use api-service directly
+            initializeReplication: apiService.initializeReplication.bind(apiService),
+            getCurrentLSN: apiService.getCurrentLSN.bind(apiService),
+            
+            // Entity operations - use entity-changes directly
+            initialize: entityChanges.initialize.bind(entityChanges),
+            createBulkEntityChanges: entityChanges.createEntities.bind(entityChanges),
+            updateBulkEntityChanges: entityChanges.updateEntities.bind(entityChanges),
+            deleteBulkEntityChanges: entityChanges.deleteEntities.bind(entityChanges),
+            createMixedEntityChanges: entityChanges.generateAndApplyChanges.bind(entityChanges),
+            generateMixedChangesInMemory: entityChanges.generateChanges.bind(entityChanges),
+            applyChangeBatch: entityChanges.applyChangeBatch.bind(entityChanges),
+            generateAndApplyChanges: entityChanges.generateAndApplyChanges.bind(entityChanges)
           },
           // WebSocket operations
           ws: {
@@ -291,9 +303,22 @@ export class ScenarioRunner extends EventEmitter {
         await context.runner.hooks.afterStep(step, context);
       }
       
+      // Check for exit flag after step completion
+      if (context.state.shouldExit) {
+        this.logger.error(`Critical error detected in step '${step.name}', forcing exit`);
+        process.exit(1);
+      }
+      
       this.logger.info(`Step completed: ${step.name}`);
     } catch (error) {
       this.logger.error(`Step failed: ${step.name} - ${error instanceof Error ? error.message : String(error)}`);
+      
+      // Force exit if shouldExit is set
+      if (context.state.shouldExit) {
+        this.logger.error(`Critical error detected in step '${step.name}', forcing exit`);
+        process.exit(1);
+      }
+      
       throw error;
     }
   }
@@ -331,9 +356,9 @@ export class ScenarioRunner extends EventEmitter {
         case 'api':
           return await this.executeApiAction(action as ApiAction, context);
         
-        case 'db':
-          this.logger.debug(`Executing database operation: ${(action as DbAction).operation}`);
-          return await this.executeDbAction(action as DbAction, context);
+        case 'changes':
+          this.logger.debug(`Executing database operation: ${(action as ChangesAction).operation}`);
+          return await this.executeChangesAction(action as ChangesAction, context);
         
         case 'ws':
           this.logger.debug(`Executing WebSocket operation: ${(action as WSAction).operation}`);
@@ -396,7 +421,7 @@ export class ScenarioRunner extends EventEmitter {
   /**
    * Execute a database action
    */
-  async executeDbAction(action: DbAction, context: OperationContext): Promise<any> {
+  async executeChangesAction(action: ChangesAction, context: OperationContext): Promise<any> {
     const { operation, params } = action;
     
     this.logger.info(`Executing DB operation: ${operation}`);
@@ -407,16 +432,59 @@ export class ScenarioRunner extends EventEmitter {
         return await params(context, context.operations);
       } catch (error) {
         this.logger.error(`Error in custom DB execution: ${error instanceof Error ? error.message : String(error)}`);
+        
+        // Force exit on critical errors if shouldExit flag is set
+        if (context.state.shouldExit) {
+          this.logger.error('CRITICAL ERROR DETECTED - Forcing exit');
+          process.exit(1);
+        }
+        
         throw error;
       }
     }
     
-    // Handle standard DB operations
-    if (!typedDbService[operation] || typeof typedDbService[operation] !== 'function') {
-      throw new Error(`Unsupported DB operation: ${operation}`);
+    // Check if this is an API operation
+    if (operation === 'initializeReplication' || operation === 'getCurrentLSN') {
+      if (!typedApiService[operation] || typeof typedApiService[operation] !== 'function') {
+        this.logger.error(`CRITICAL ERROR: Unsupported API operation: ${operation}`);
+        process.exit(1); // Force exit on missing operation
+      }
+      
+      try {
+        // These API functions don't take parameters
+        return await typedApiService[operation]();
+      } catch (error) {
+        this.logger.error(`Error in API operation ${operation}: ${error instanceof Error ? error.message : String(error)}`);
+        
+        // Force exit on critical errors if shouldExit flag is set
+        if (context.state.shouldExit) {
+          this.logger.error('CRITICAL ERROR DETECTED - Forcing exit');
+          process.exit(1);
+        }
+        
+        throw error;
+      }
     }
     
-    return await typedDbService[operation](params);
+    // Otherwise, try entity changes operations
+    if (!typedEntityChanges[operation] || typeof typedEntityChanges[operation] !== 'function') {
+      this.logger.error(`CRITICAL ERROR: Unsupported entity operation: ${operation}`);
+      process.exit(1); // Force exit on missing operation
+    }
+    
+    try {
+      return await typedEntityChanges[operation](params);
+    } catch (error) {
+      this.logger.error(`Error in entity operation ${operation}: ${error instanceof Error ? error.message : String(error)}`);
+      
+      // Force exit on critical errors if shouldExit flag is set
+      if (context.state.shouldExit) {
+        this.logger.error('CRITICAL ERROR DETECTED - Forcing exit');
+        process.exit(1);
+      }
+      
+      throw error;
+    }
   }
   
   /**

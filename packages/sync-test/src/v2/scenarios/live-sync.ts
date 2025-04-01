@@ -14,7 +14,18 @@ dotenv.config({ path: resolve(rootDir, '.env') });
 
 import { DB_TABLES, TEST_DEFAULTS, API_CONFIG } from '../config.ts';
 import { createLogger } from '../core/logger.ts';
-import { ScenarioRunner, Scenario, DbAction, WSAction, ApiAction, InteractiveAction, CompositeAction, OperationContext, ValidationAction } from '../core/scenario-runner.ts';
+import { 
+  ScenarioRunner, 
+  Scenario, 
+  Action, 
+  StepDefinition, 
+  ApiAction, 
+  ChangesAction, 
+  WSAction, 
+  ValidationAction,
+  InteractiveAction,
+  OperationContext 
+} from '../core/scenario-runner.ts';
 import { MessageProcessor } from '../core/message-processor.ts';
 import { EntityType, EntityChange, Operation } from '../types.ts';
 import { messageDispatcher } from '../core/message-dispatcher.ts';
@@ -33,6 +44,9 @@ import { ChangeTracker } from '../core/change-tracker.ts';
 
 // Logger for this module
 const logger = createLogger('live-sync');
+
+// Default options for live sync test
+const defaultOptions: LiveSyncOptions = {};
 
 // Log environment status
 logger.info(`Loaded environment from ${resolve(rootDir, '.env')}`);
@@ -64,6 +78,16 @@ function resetInactivityTimeout(context: OperationContext): void {
   }, 120000); // Increased to 120 seconds
   
   context.state.lastChangeTime = Date.now();
+}
+
+/**
+ * Default options for live sync test
+ */
+interface LiveSyncOptions {
+  errorOnTimeout?: boolean;
+  timeoutMs?: number;
+  logLevel?: string;
+  initializeParams?: any;
 }
 
 /**
@@ -123,6 +147,14 @@ export const LiveSyncScenario: Scenario = {
         // This handler is just to prevent warnings - the actual processing happens in the protocol handler
         return true;
       });
+    },
+    
+    // Add a hook to check for fatal errors after each step
+    afterStep: async (step, context) => {
+      if (context.state.shouldExit) {
+        context.logger.error(`Critical error in step "${step.name}", exiting scenario`);
+        throw new Error(`Step "${step.name}" encountered a fatal error, terminating scenario`);
+      }
     }
   },
   
@@ -133,10 +165,11 @@ export const LiveSyncScenario: Scenario = {
       execution: 'serial',
       actions: [
         {
-          type: 'db',
+          type: 'changes',
           name: 'Initialize Database',
-          operation: 'initializeDatabase'
-        } as DbAction
+          operation: 'initialize',
+          params: defaultOptions?.initializeParams
+        } as ChangesAction
       ]
     },
     
@@ -146,10 +179,10 @@ export const LiveSyncScenario: Scenario = {
       execution: 'serial',
       actions: [
         {
-          type: 'db',
+          type: 'changes',
           name: 'Initialize Replication',
           operation: 'initializeReplication'
-        } as DbAction,
+        } as ChangesAction,
         {
           type: 'api',
           name: 'Initialize Server Replication',
@@ -316,8 +349,8 @@ export const LiveSyncScenario: Scenario = {
           
           handlers: {
             // Handle server changes during catchup
-            'srv_catchup_changes': async (message, context, operations) => {
-              const serverMessage = message as ServerChangesMessage;
+            'srv_catchup_changes': async (message: ServerChangesMessage, context: OperationContext, operations: Record<string, any>) => {
+              const serverMessage = message;
               const clientId = message.clientId || context.state.clients[0]; // Get client ID from message or use first client
               
               context.logger.info(`Received catchup changes: chunk ${serverMessage.sequence?.chunk}/${serverMessage.sequence?.total} with ${serverMessage.changes?.length || 0} changes`);
@@ -375,15 +408,15 @@ export const LiveSyncScenario: Scenario = {
             },
             
             // Also handle heartbeats to keep the test active while waiting
-            'srv_heartbeat': async (message, context, operations) => {
+            'srv_heartbeat': async (message: { type: string, clientId?: string }, context: OperationContext, operations: Record<string, any>) => {
               // Just log heartbeats but don't complete the protocol
               context.logger.debug(`Received server heartbeat`);
               return false;
             },
             
             // Handle catchup completion
-            'srv_catchup_completed': async (message, context, operations) => {
-              const catchupCompletedMsg = message as ServerCatchupCompletedMessage;
+            'srv_catchup_completed': async (message: ServerCatchupCompletedMessage, context: OperationContext, operations: Record<string, any>) => {
+              const catchupCompletedMsg = message;
               const clientId = message.clientId || context.state.clients[0]; // Get client ID from message or use first client
               
               context.logger.info(`Catchup sync completed for client ${clientId}: startLSN=${catchupCompletedMsg.startLSN}, finalLSN=${catchupCompletedMsg.finalLSN}, changes=${catchupCompletedMsg.changeCount}, success=${catchupCompletedMsg.success}`);
@@ -432,83 +465,67 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // NEW STEP 6: Pre-generate changes in memory
+    // Step 6: Generate and Apply Changes
     {
-      name: 'Generate Changes In Memory',
+      name: 'Generate and Apply Changes',
       execution: 'serial',
       actions: [
         {
-          type: 'db',
-          name: 'Generate Change Data',
+          type: 'changes',
+          name: 'Generate and Apply Changes',
           operation: 'exec',
           params: async (context: OperationContext, operations: Record<string, any>) => {
             const changeCount = context.config.changeCount || 3;
-            context.logger.info(`Pre-generating ${changeCount} changes in memory`);
             
             try {
-              // Create distribution object for mixed changes
-              const distribution: any = {};
-              const entityTypes = TEST_DEFAULTS.ENTITY_TYPES;
-              const typeWeight = 1 / entityTypes.length;
-              
-              entityTypes.forEach(type => {
-                distribution[type] = typeWeight;
+              // Create a simple distribution config
+              const distribution: Record<string, number> = {};
+              TEST_DEFAULTS.ENTITY_TYPES.forEach(type => {
+                distribution[type] = 1/TEST_DEFAULTS.ENTITY_TYPES.length;
               });
               
-              // Generate change data without writing to DB yet
-              const generatedChanges = await operations.db.generateChangeBatch(
-                changeCount,
-                distribution
-              );
+              // Generate and apply changes in a single operation
+              context.logger.info(`Generating and applying ${changeCount} changes`);
               
-              if (!generatedChanges || generatedChanges.length === 0) {
-                context.logger.error('Failed to generate any changes');
-                return { success: false, error: 'No changes generated' };
+              // Call the entity-changes module to handle everything
+              const result = await operations.changes.generateAndApplyChanges(changeCount, distribution);
+              
+              if (!result || !result.success) {
+                context.logger.error('Failed to generate and apply changes');
+                context.state.shouldExit = true;
+                return { success: false, error: result?.error || 'Unknown error' };
               }
               
-              // Store the generated changes in context for the next step
-              // Use direct modification of state for more reliable storage
-              context.state.generatedChanges = [...generatedChanges]; // Create copy to avoid reference issues
+              // Store the applied changes for validation
+              context.state.databaseChanges = result.changes;
               
-              // Verify changes were stored properly
-              if (!context.state.generatedChanges || context.state.generatedChanges.length === 0) {
-                context.logger.error('Generated changes not properly stored in context');
-                return { success: false, error: 'State storage failure' };
+              // Track the database changes for validation
+              if (context.state.changeTracker) {
+                context.state.changeTracker.trackDatabaseChanges(result.changes);
               }
               
-              // Log a summary
-              context.logger.info(`Successfully generated ${generatedChanges.length} changes in memory`);
-              context.logger.debug(`First change ID: ${generatedChanges[0]?.id || 'unknown'}`);
-              
-              const changesByType: Record<string, number> = {};
-              generatedChanges.forEach((c: any) => {
-                const type = c.table || c.type || 'unknown';
-                changesByType[type] = (changesByType[type] || 0) + 1; 
-              });
-              
-              context.logger.info(`Generated changes by type: ${Object.entries(changesByType)
-                .map(([type, count]) => `${type}: ${count}`)
-                .join(', ')}`);
+              context.logger.info(`Successfully applied ${result.changes.length} changes to database`);
               
               return { 
-                success: true, 
-                changes: generatedChanges
+                success: true,
+                changes: result.changes
               };
             } catch (error) {
-              context.logger.error(`Error generating changes: ${error}`);
+              context.logger.error(`Error generating and applying changes: ${error}`);
+              context.state.shouldExit = true;
               return { success: false, error: String(error) };
             }
           }
-        } as DbAction
+        } as ChangesAction
       ]
     },
     
-    // UPDATED STEP 7: Track and Apply Changes (renamed from "Track and Create Changes")
+    // Step 7: Track and Apply Changes (updated to just Track Changes)
     {
-      name: 'Track and Apply Changes',
+      name: 'Track Changes',
       execution: 'parallel',
       actions: [
-        // Action 1: Wait for changes across all clients
+        // Action: Wait for changes across all clients
         {
           type: 'interactive',
           name: 'Wait for Change Messages on All Clients',
@@ -746,73 +763,7 @@ export const LiveSyncScenario: Scenario = {
               return true; // Complete the protocol
             }
           }
-        } as InteractiveAction,
-        
-        // Action 2: Apply pre-generated changes to database
-        {
-          type: 'db',
-          name: 'Apply Changes to Database',
-          operation: 'exec',
-          params: async (context: OperationContext, operations: Record<string, any>) => {
-            context.logger.info(`Writing pre-generated changes to database`);
-            
-            try {
-              // Explicit check for generatedChanges in context state
-              if (!context.state.hasOwnProperty('generatedChanges')) {
-                context.logger.error('generatedChanges property not found in context state');
-                return { success: false, error: 'No generated changes property in context' };
-              }
-              
-              // Get the changes generated in the previous step
-              const generatedChanges = context.state.generatedChanges;
-              
-              // Validate the changes array
-              if (!Array.isArray(generatedChanges)) {
-                context.logger.error(`generatedChanges is not an array: ${typeof generatedChanges}`);
-                return { success: false, error: 'Invalid generated changes format' };
-              }
-              
-              if (generatedChanges.length === 0) {
-                context.logger.error('No pre-generated changes found in context (empty array)');
-                return { success: false, error: 'No pre-generated changes found' };
-              }
-              
-              context.logger.info(`Found ${generatedChanges.length} pre-generated changes to apply`);
-              context.logger.debug(`First change ID: ${generatedChanges[0]?.id || 'unknown'}`);
-              
-              // Now write these changes to the database
-              const changes = await operations.db.applyChangeBatch(generatedChanges);
-              
-              if (!changes || changes.length === 0) {
-                context.logger.error('Failed to apply changes to database');
-                return { success: false, error: 'No changes applied' };
-              }
-              
-              // Use the existing ChangeTracker from beforeScenario
-              const tracker = context.state.changeTracker;
-              
-              // Track the database changes in the ChangeTracker
-              tracker.trackDatabaseChanges(changes);
-              
-              // Store the database changes in state for validation to use
-              context.state.databaseChanges = changes;
-              
-              // Log a summary
-              context.logger.info(`Successfully applied ${changes.length} changes to database`);
-              
-              // Store the original changes for reference
-              context.state.createdChanges = changes;
-              
-              return { 
-                success: true, 
-                changes
-              };
-            } catch (error) {
-              context.logger.error(`Error applying changes to database: ${error}`);
-              return { success: false, error: String(error) };
-            }
-          }
-        } as DbAction
+        } as InteractiveAction
       ]
     },
     
@@ -1139,4 +1090,17 @@ if (typeof import.meta !== 'undefined' && import.meta.url) {
   } else {
     logger.debug('Live sync test module imported by another module, not running automatically');
   }
+}
+
+/**
+ * Main live sync test definition
+ */
+export function liveSyncTest(
+  clients: number = 1, 
+  count: number = 3,
+  options: LiveSyncOptions = {}
+): Scenario {
+  // Implementation of the function
+  // This is a placeholder and should be replaced with the actual implementation
+  throw new Error('liveSyncTest function not implemented');
 }
