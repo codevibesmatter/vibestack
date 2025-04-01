@@ -766,7 +766,7 @@ async function createBulkComments(sql: SqlQueryFunction, count: number): Promise
 async function updateBulkTasks(sql: SqlQueryFunction, count: number): Promise<string[]> {
   // Fetch existing task IDs
   try {
-    const tasks = await sql`SELECT id FROM tasks LIMIT ${count * 2}`; // Fetch extra in case some fail
+    const tasks = await sql`SELECT id FROM tasks LIMIT ${count * 2}`;
     if (!tasks || tasks.length === 0) {
       console.warn('No existing tasks found to update');
       return [];
@@ -787,8 +787,8 @@ async function updateBulkTasks(sql: SqlQueryFunction, count: number): Promise<st
           const taskUpdates = {
             title: faker.hacker.phrase().substring(0, 100),
             status: faker.helpers.arrayElement(Object.values(TaskStatus)),
-            priority: faker.helpers.arrayElement(Object.values(TaskPriority))
-            // updated_at is handled by database trigger
+            priority: faker.helpers.arrayElement(Object.values(TaskPriority)),
+            updated_at: new Date() // Explicitly set updated_at since we removed the trigger
           };
           
           await sql`
@@ -796,7 +796,8 @@ async function updateBulkTasks(sql: SqlQueryFunction, count: number): Promise<st
             SET 
               title = ${taskUpdates.title}, 
               status = ${taskUpdates.status}, 
-              priority = ${taskUpdates.priority}
+              priority = ${taskUpdates.priority},
+              updated_at = ${taskUpdates.updated_at}
             WHERE id = ${taskId}
           `;
           
@@ -840,15 +841,16 @@ async function updateBulkProjects(sql: SqlQueryFunction, count: number): Promise
           // Generate random updates
           const projectUpdates = {
             name: faker.company.catchPhrase(),
-            status: faker.helpers.arrayElement(Object.values(ProjectStatus))
-            // updated_at is handled by database trigger
+            status: faker.helpers.arrayElement(Object.values(ProjectStatus)),
+            updated_at: new Date() // Explicitly set updated_at since we removed the trigger
           };
           
           await sql`
             UPDATE projects 
             SET 
               name = ${projectUpdates.name}, 
-              status = ${projectUpdates.status}
+              status = ${projectUpdates.status},
+              updated_at = ${projectUpdates.updated_at}
             WHERE id = ${projectId}
           `;
           
@@ -892,15 +894,16 @@ async function updateBulkUsers(sql: SqlQueryFunction, count: number): Promise<st
           // Generate random updates
           const userUpdates = {
             name: faker.person.fullName(),
-            role: faker.helpers.arrayElement(Object.values(UserRole))
-            // updated_at is handled by database trigger
+            role: faker.helpers.arrayElement(Object.values(UserRole)),
+            updated_at: new Date() // Explicitly set updated_at since we removed the trigger
           };
           
           await sql`
             UPDATE users 
             SET 
               name = ${userUpdates.name}, 
-              role = ${userUpdates.role}
+              role = ${userUpdates.role},
+              updated_at = ${userUpdates.updated_at}
             WHERE id = ${userId}
           `;
           
@@ -943,11 +946,14 @@ async function updateBulkComments(sql: SqlQueryFunction, count: number): Promise
         try {
           // Generate new content for the update
           const content = faker.lorem.paragraph();
+          const now = new Date();
           
-          // Only update the content field - leave updated_at to be handled by the database trigger
+          // Update content and explicitly set updated_at
           await sql`
             UPDATE comments 
-            SET content = ${content}
+            SET 
+              content = ${content},
+              updated_at = ${now}
             WHERE id = ${commentId}
           `;
           

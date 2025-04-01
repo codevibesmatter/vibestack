@@ -4,7 +4,6 @@ import { DataSource } from 'typeorm';
  * Creates trigger functions for domain entities (Task, Project, User).
  * These functions handle:
  * 1. Resetting client_id when unchanged in updates
- * 2. Updating updated_at timestamp on changes
  */
 export async function createTriggerFunctions(dataSource: DataSource) {
   // Reset client_id when it hasn't changed in an update
@@ -19,24 +18,12 @@ export async function createTriggerFunctions(dataSource: DataSource) {
     END;
     $$ LANGUAGE plpgsql;
   `);
-
-  // Update the updated_at timestamp on any change
-  await dataSource.query(`
-    CREATE OR REPLACE FUNCTION update_updated_at()
-    RETURNS trigger AS $$
-    BEGIN
-      NEW.updated_at = CURRENT_TIMESTAMP;
-      RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-  `);
 }
 
 /**
  * Creates triggers for domain entities (Task, Project, User).
  * These triggers handle:
  * 1. Resetting client_id when unchanged in updates
- * 2. Updating updated_at timestamp on changes
  */
 export async function createTriggers(dataSource: DataSource) {
   // Domain entities that have client_id and updated_at fields
@@ -49,14 +36,6 @@ export async function createTriggers(dataSource: DataSource) {
       BEFORE UPDATE ON "${table}"
       FOR EACH ROW
       EXECUTE FUNCTION reset_client_id();
-    `);
-
-    // Create trigger for updated_at timestamp
-    await dataSource.query(`
-      CREATE TRIGGER update_updated_at_trigger
-      BEFORE UPDATE ON "${table}"
-      FOR EACH ROW
-      EXECUTE FUNCTION update_updated_at();
     `);
   }
 }

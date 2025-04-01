@@ -4,6 +4,10 @@ import { serverEntities } from './generated/server-entities.js';
 // @ts-ignore - TypeScript doesn't know about these imports
 import { clientEntities } from './generated/client-entities.js';
 
+// Export base entity classes
+export { BaseDomainEntity } from './entities/BaseDomainEntity.js';
+export { BaseSystemEntity } from './entities/BaseSystemEntity.js';
+
 // Re-export all entities from generated files
 export * from './generated/server-entities.js';
 export * from './generated/client-entities.js';

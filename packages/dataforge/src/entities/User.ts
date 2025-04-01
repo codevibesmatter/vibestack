@@ -1,4 +1,4 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, OneToMany, Relation, ManyToMany } from 'typeorm';
+import { Entity, Column, OneToMany, Relation, ManyToMany } from 'typeorm';
 import { 
   IsString, 
   IsEmail, 
@@ -6,15 +6,14 @@ import {
   IsOptional, 
   IsUrl, 
   Matches, 
-  IsUUID,
-  IsDate,
   IsEnum
 } from 'class-validator';
-import { ServerOnly, TableCategory } from '../utils/context.js';
+import { ServerOnly } from '../utils/context.js';
 // Import Task and Project for use in decorators
 // The Relation wrapper will handle circular dependencies
 import { Task } from './Task.js';
 import { Project } from './Project.js';
+import { BaseDomainEntity } from './BaseDomainEntity.js';
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -26,15 +25,10 @@ export enum UserRole {
  * User entity
  * Contains fields for both server and client contexts with appropriate decorators
  * This is a shared entity (not server-only or client-only)
- * Categorized as a domain entity for replication purposes
+ * Extends BaseDomainEntity for common fields and behavior
  */
 @Entity('users')
-@TableCategory('domain')
-export class User {
-  @PrimaryGeneratedColumn('uuid')
-  @IsUUID(4)
-  id!: string;
-  
+export class User extends BaseDomainEntity {
   @Column({ type: "varchar", length: 100 })
   @IsString()
   @MinLength(2, { message: "Name must be at least 2 characters long" })
@@ -62,19 +56,6 @@ export class User {
   @IsString()
   @MinLength(8, { message: "Password hash must be at least 8 characters long" })
   passwordHash?: string;
-  
-  @Column({ type: "uuid", nullable: true, name: "client_id" })
-  @IsOptional()
-  @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  clientId?: string;
-  
-  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
-  @IsDate()
-  createdAt!: Date;
-  
-  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
-  @IsDate()
-  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @OneToMany(() => Task, (task) => task.assignee)

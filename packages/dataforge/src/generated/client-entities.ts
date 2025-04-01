@@ -1,6 +1,5 @@
 // Generated client entities - DO NOT EDIT
 
-export * from '../entities/ChangeHistory.js';
 export * from '../entities/ClientMigrationStatus.js';
 export * from '../entities/Comment.js';
 export * from '../entities/LocalChanges.js';
@@ -8,7 +7,6 @@ export * from '../entities/Project.js';
 export * from '../entities/Task.js';
 export * from '../entities/User.js';
 
-import { ChangeHistory } from '../entities/ChangeHistory.js';
 import { ClientMigrationStatus } from '../entities/ClientMigrationStatus.js';
 import { Comment } from '../entities/Comment.js';
 import { LocalChanges } from '../entities/LocalChanges.js';
@@ -18,7 +16,6 @@ import { User } from '../entities/User.js';
 
 // Export entity array for TypeORM
 export const clientEntities = [
-  ChangeHistory,
   ClientMigrationStatus,
   Comment,
   LocalChanges,
@@ -47,7 +44,6 @@ export const CLIENT_DOMAIN_TABLES = [
 
 // system tables for client context
 export const CLIENT_SYSTEM_TABLES = [
-  '"change_history"',
   '"client_migration_status"',
   '"local_changes"',
 ] as const;

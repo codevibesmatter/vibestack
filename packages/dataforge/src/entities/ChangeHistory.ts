@@ -5,11 +5,14 @@ import {
   CreateDateColumn,
   Index
 } from 'typeorm';
+import { ServerOnly } from '../utils/context.js';
 
 /**
  * ChangeHistory entity for tracking changes for catchup sync
+ * Server-only entity - not replicated to clients
  */
 @Entity({ name: 'change_history' })
+@ServerOnly()
 export class ChangeHistory {
   @PrimaryGeneratedColumn('uuid')
   id!: string;

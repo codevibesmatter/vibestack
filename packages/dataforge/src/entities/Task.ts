@@ -1,4 +1,4 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
@@ -15,7 +15,7 @@ import {
 // The Relation wrapper will handle circular dependencies
 import { User } from './User.js';
 import { Project } from './Project.js';
-import { TableCategory } from '../utils/context.js';
+import { BaseDomainEntity } from './BaseDomainEntity.js';
 // No need for ServerOnly/ClientOnly decorators as this is a shared entity
 
 // These enum values must match the database exactly
@@ -34,14 +34,11 @@ export enum TaskPriority {
 /**
  * Task entity
  * Contains task information and relationships to users and projects
- * Categorized as a domain entity for replication purposes
+ * Extends BaseDomainEntity for common fields and behavior
  */
 @Entity('tasks')
-@TableCategory('domain')
-export class Task {
-  @PrimaryGeneratedColumn('uuid')
-  @IsUUID(4)
-  id!: string;
+export class Task extends BaseDomainEntity {
+  // No need for id, created_at, updated_at, client_id as they're in BaseDomainEntity
   
   @Column({ type: "varchar", length: 100 })
   @IsString()
@@ -94,19 +91,6 @@ export class Task {
   @IsOptional()
   @IsUUID(4)
   assigneeId?: string;
-  
-  @Column({ type: "uuid", nullable: true, name: "client_id" })
-  @IsOptional()
-  @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  clientId?: string;
-  
-  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
-  @IsDate()
-  createdAt!: Date;
-  
-  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
-  @IsDate()
-  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @ManyToOne(() => Project, (project) => project.tasks)

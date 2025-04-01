@@ -1,20 +1,17 @@
-import { Entity, Column, PrimaryGeneratedColumn, Index, CreateDateColumn } from 'typeorm';
-import { IsUUID, IsString, IsJSON, IsBoolean } from 'class-validator';
-import { ClientOnly, TableCategory } from '../utils/context.js';
+import { Entity, Column, Index } from 'typeorm';
+import { IsString, IsJSON, IsBoolean } from 'class-validator';
+import { ClientOnly } from '../utils/context.js';
+import { BaseSystemEntity } from './BaseSystemEntity.js';
 
 /**
  * LocalChanges entity
  * Tracks local changes that need to be synced to the server
  * This is a client-only entity that won't be exposed to the server
+ * Extends BaseSystemEntity for common system fields and behavior
  */
 @Entity('local_changes')
-@TableCategory('system')
 @ClientOnly()
-export class LocalChanges {
-  @PrimaryGeneratedColumn('uuid')
-  @IsUUID(4)
-  id!: string;
-
+export class LocalChanges extends BaseSystemEntity {
   @Column({ type: 'text' })
   @IsString()
   table!: string;

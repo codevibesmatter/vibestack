@@ -1,11 +1,10 @@
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, OneToMany, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, OneToMany, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
   IsOptional, 
   IsUUID, 
-  MaxLength, 
-  IsDate,
+  MaxLength,
   Matches,
   IsEnum
 } from 'class-validator';
@@ -13,7 +12,7 @@ import {
 // The Relation wrapper will handle circular dependencies
 import { User } from './User.js';
 import { Task } from './Task.js';
-import { TableCategory } from '../utils/context.js';
+import { BaseDomainEntity } from './BaseDomainEntity.js';
 // No need for ServerOnly/ClientOnly decorators as this is a shared entity
 
 export enum ProjectStatus {
@@ -26,15 +25,10 @@ export enum ProjectStatus {
 /**
  * Project entity
  * Contains project information and relationships to users and tasks
- * Categorized as a domain entity for replication purposes
+ * Extends BaseDomainEntity for common fields and behavior
  */
 @Entity('projects')
-@TableCategory('domain')
-export class Project {
-  @PrimaryGeneratedColumn('uuid')
-  @IsUUID(4, { message: "Project ID must be a valid UUID" })
-  id!: string;
-  
+export class Project extends BaseDomainEntity {
   @Column({ type: "varchar", length: 100 })
   @IsString({ message: "Name must be a string" })
   @MinLength(2, { message: "Name must be at least 2 characters long" })
@@ -57,19 +51,6 @@ export class Project {
   @Column({ type: "uuid", name: "owner_id" })
   @IsUUID(4, { message: "Owner ID must be a valid UUID" })
   ownerId!: string;
-  
-  @Column({ type: "uuid", nullable: true, name: "client_id" })
-  @IsOptional()
-  @IsUUID(4, { message: "Client ID must be a valid UUID" })
-  clientId?: string;
-  
-  @CreateDateColumn({ type: "timestamptz", name: "created_at" })
-  @IsDate({ message: "Created date must be a valid date" })
-  createdAt!: Date;
-  
-  @UpdateDateColumn({ type: "timestamptz", name: "updated_at" })
-  @IsDate({ message: "Updated date must be a valid date" })
-  updatedAt!: Date;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @ManyToOne(() => User, (user) => user.ownedProjects)
