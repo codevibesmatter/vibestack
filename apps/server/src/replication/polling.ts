@@ -116,23 +116,42 @@ export class PollingManager {
       
       if (changes && changes.length > 0) {
         try {
+          // Extract basic info about the WAL entries
+          const firstLSN = changes[0].lsn;
+          const lastLSN = changes[changes.length - 1].lsn;
+          
+          // Count the actual database changes within each WAL entry
+          let totalEntityChanges = 0;
+          for (const walEntry of changes) {
+            try {
+              const parsedData = JSON.parse(walEntry.data);
+              if (parsedData?.change && Array.isArray(parsedData.change)) {
+                totalEntityChanges += parsedData.change.length;
+              }
+            } catch (parseError) {
+              // Ignore parse errors for counting
+            }
+          }
+          
           replicationLogger.info('WAL changes found', {
-            count: changes.length,
+            walEntries: changes.length,
+            entityChanges: totalEntityChanges,
             lsnRange: {
-              first: changes[0].lsn,
-              last: changes[changes.length - 1].lsn
+              first: firstLSN,
+              last: lastLSN
             }
           }, MODULE_NAME);
 
           replicationLogger.debug('Processing changes', {
-            count: changes.length,
+            walEntries: changes.length,
+            entityChanges: totalEntityChanges,
             lsnRange: {
-              first: changes[0].lsn,
-              last: changes[changes.length - 1].lsn
+              first: firstLSN,
+              last: lastLSN
             }
           }, MODULE_NAME);
 
-          await processChanges(
+          const result = await processChanges(
             changes,
             this.env,
             this.c,
@@ -141,10 +160,11 @@ export class PollingManager {
           );
           
           replicationLogger.debug('Polling cycle completed', {
-            processedCount: changes.length,
+            walEntriesProcessed: changes.length,
+            entitiesProcessed: result.changeCount || 0,
             lsnRange: {
-              first: changes[0].lsn,
-              last: changes[changes.length - 1].lsn
+              first: firstLSN,
+              last: lastLSN
             },
             nextPollIn: this.config.pollingInterval || DEFAULT_POLL_INTERVAL
           }, MODULE_NAME);
@@ -153,7 +173,7 @@ export class PollingManager {
           const errorMsg = processError instanceof Error ? processError.message : String(processError);
           replicationLogger.error('Change processing error', {
             error: errorMsg,
-            changeCount: changes.length
+            walEntries: changes.length
           }, MODULE_NAME);
         }
       }

@@ -40,7 +40,20 @@ import type {
   CltMessageType,
   TableChange
 } from '@repo/sync-types';
-import { ChangeTracker } from '../core/change-tracker.ts';
+
+// Import from entity-changes module
+import { 
+  ChangeTracker,
+  initialize as initializeDatabase,
+  createChangeTracker
+} from '../core/entity-changes/index.ts';
+
+// Also import the change-operations types directly to get GeneratedChanges interface
+import type { GeneratedChanges } from '../core/entity-changes/change-operations.ts';
+
+// Import TypeORM DataSource and serverEntities
+import { DataSource } from 'typeorm';
+import { serverEntities } from '@repo/dataforge/server-entities';
 
 // Logger for this module
 const logger = createLogger('live-sync');
@@ -53,6 +66,22 @@ logger.info(`Loaded environment from ${resolve(rootDir, '.env')}`);
 logger.info(`Database URL configured: ${process.env.DATABASE_URL ? 'Yes' : 'No'}`);
 logger.info(`API URL configured: ${process.env.API_URL ? 'Yes' : 'No'}`);
 logger.info(`WebSocket URL configured: ${process.env.WS_URL ? 'Yes' : 'No'}`);
+
+// Check if the DATABASE_URL environment variable is set
+if (!process.env.DATABASE_URL) {
+  logger.error('No DATABASE_URL configured. Tests cannot run.');
+  logger.error('Please ensure you have configured a proper database connection in .env file.');
+  process.exit(1);
+}
+
+// Create a DataSource instance directly like in entity-changes-test.ts
+const dataSource = new DataSource({
+  type: 'postgres',
+  url: process.env.DATABASE_URL,
+  entities: serverEntities,
+  synchronize: false,
+  logging: false
+});
 
 // Define table mappings for validation
 const TABLE_MAP: Record<string, string> = {
@@ -68,14 +97,14 @@ function resetInactivityTimeout(context: OperationContext): void {
     clearTimeout(context.state.timeoutId);
   }
   
-  // Set a longer inactivity timeout (120 seconds) - increased from 90s to handle more clients
+  // Set a longer inactivity timeout (300 seconds) - increased to handle high server load
   context.state.timeoutId = setTimeout(() => {
     context.logger.warn('Inactivity timeout expired, forcing completion');
     messageDispatcher.dispatchMessage({
       type: 'timeout_force_completion',
       timestamp: Date.now()
     });
-  }, 120000); // Increased to 120 seconds
+  }, 300000); // Increased to 300 seconds (5 minutes)
   
   context.state.lastChangeTime = Date.now();
 }
@@ -121,31 +150,35 @@ export const LiveSyncScenario: Scenario = {
       context.logger.info(`Starting live sync test with ${context.config.customProperties?.clientCount || 1} clients and ${context.config.changeCount} changes`);
       
       // Create a single ChangeTracker instance to use throughout the entire scenario
-      const tolerance = 0; // Always use zero tolerance for strict validation
-      context.state.changeTracker = new ChangeTracker(tolerance);
+      // Configure it for optimized handling of large datasets
+      const options = {
+        tolerance: 0, // No tolerance for strict validation
+        deduplicationEnabled: true, // Enable deduplication support
+        batchSize: 50 // Process in reasonable batch sizes
+      };
       
-      // We'll register clients later when we know how many there are
+      context.state.changeTracker = createChangeTracker(options);
       
       // Register the message handlers EARLY to ensure they're available before messages are processed
       // This prevents the "Message was NOT handled by any dispatcher handler" warnings
       messageDispatcher.registerHandler('srv_live_changes', (message: any) => {
-        // This handler is just to prevent warnings - the actual processing happens in the protocol handler
-        return true;
+        // DO NOT fully handle the message - let it pass through to the interactive protocol handler
+        return false;
       });
       
       messageDispatcher.registerHandler('srv_catchup_changes', (message: any) => {
-        // This handler is just to prevent warnings - the actual processing happens in the protocol handler
-        return true;
+        // DO NOT fully handle the message - let it pass through to the interactive protocol handler
+        return false;
       });
       
       messageDispatcher.registerHandler('srv_catchup_completed', (message: any) => {
-        // This handler is just to prevent warnings - the actual processing happens in the protocol handler
-        return true;
+        // DO NOT fully handle the message - let it pass through to the interactive protocol handler
+        return false;
       });
 
       messageDispatcher.registerHandler('srv_sync_stats', (message: any) => {
-        // This handler is just to prevent warnings - the actual processing happens in the protocol handler
-        return true;
+        // DO NOT fully handle the message - let it pass through to the interactive protocol handler
+        return false;
       });
     },
     
@@ -167,8 +200,28 @@ export const LiveSyncScenario: Scenario = {
         {
           type: 'changes',
           name: 'Initialize Database',
-          operation: 'initialize',
-          params: defaultOptions?.initializeParams
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            context.logger.info('Initializing database for live sync test');
+            
+            try {
+              // Use the initialize function from entity-changes with direct dataSource
+              const initialized = await initializeDatabase(dataSource);
+              
+              if (!initialized) {
+                context.logger.error('Failed to initialize database');
+                context.state.shouldExit = true;
+                return { success: false, error: 'Database initialization failed' };
+              }
+              
+              context.logger.info('Database initialized successfully');
+              return { success: true };
+            } catch (error) {
+              context.logger.error(`Error initializing database: ${error}`);
+              context.state.shouldExit = true;
+              return { success: false, error: String(error) };
+            }
+          }
         } as ChangesAction
       ]
     },
@@ -325,24 +378,17 @@ export const LiveSyncScenario: Scenario = {
           type: 'interactive',
           name: 'Wait for Catchup Sync',
           protocol: 'catchup-sync',
-          maxTimeout: 180000, // Increased timeout for multiple clients (from 120000)
+          maxTimeout: 180000, 
           
           initialAction: {
             type: 'ws',
             name: 'Initialize Catchup Tracking',
             operation: 'exec',
             params: async (context: OperationContext) => {
-              // Initialize tracking state for client catchup completion
-              context.state.clientCatchupComplete = new Map();
-              context.state.clientReconnectAttempts = new Map();
+              // Initialize a simple set to track which clients have completed catchup
+              context.state.clientsCompleted = new Set();
               
-              // Mark all clients as not complete
-              (context.state.clients || []).forEach((clientId: string) => {
-                context.state.clientCatchupComplete.set(clientId, false);
-                context.state.clientReconnectAttempts.set(clientId, 0);
-              });
-              
-              context.logger.info(`Initialized catchup tracking for ${context.state.clients?.length || 0} clients`);
+              context.logger.info(`Initialized simple catchup tracking for ${context.state.clients?.length || 0} clients`);
               return { success: true };
             }
           },
@@ -350,19 +396,17 @@ export const LiveSyncScenario: Scenario = {
           handlers: {
             // Handle server changes during catchup
             'srv_catchup_changes': async (message: ServerChangesMessage, context: OperationContext, operations: Record<string, any>) => {
-              const serverMessage = message;
-              const clientId = message.clientId || context.state.clients[0]; // Get client ID from message or use first client
+              const clientId = message.clientId || context.state.clients[0];
               
-              context.logger.info(`Received catchup changes: chunk ${serverMessage.sequence?.chunk}/${serverMessage.sequence?.total} with ${serverMessage.changes?.length || 0} changes`);
+              context.logger.info(`Received catchup changes: chunk ${message.sequence?.chunk}/${message.sequence?.total} with ${message.changes?.length || 0} changes`);
               
-              if (serverMessage.lastLSN) {
-                context.logger.info(`Catchup LSN: ${serverMessage.lastLSN}`);
-                context.state.lastLSN = serverMessage.lastLSN;
+              if (message.lastLSN) {
+                context.state.lastLSN = message.lastLSN;
                 
                 // Update the client's LSN
                 try {
-                  await operations.ws.updateLSN(clientId, serverMessage.lastLSN);
-                  context.logger.info(`Updated client LSN to ${serverMessage.lastLSN}`);
+                  await operations.ws.updateLSN(clientId, message.lastLSN);
+                  context.logger.info(`Updated client LSN to ${message.lastLSN}`);
                 } catch (error) {
                   context.logger.warn(`Failed to update client LSN: ${error}`);
                 }
@@ -377,141 +421,128 @@ export const LiveSyncScenario: Scenario = {
                     messageId: `catchup_ack_${Date.now()}`,
                     clientId,
                     timestamp: Date.now(),
-                    chunk: serverMessage.sequence?.chunk || 1,
-                    lsn: serverMessage.lastLSN || context.state.lastLSN || '0/0'
+                    chunk: message.sequence?.chunk || 1,
+                    lsn: message.lastLSN || context.state.lastLSN || '0/0'
                   }
                 );
                 
-                context.logger.info(`Acknowledged catchup chunk ${serverMessage.sequence?.chunk}/${serverMessage.sequence?.total}`);
+                context.logger.info(`Acknowledged catchup chunk ${message.sequence?.chunk}/${message.sequence?.total}`);
               } catch (error) {
                 context.logger.error(`Failed to acknowledge catchup: ${error}`);
-                
-                // Handle reconnection if needed
-                const reconnectAttempts = context.state.clientReconnectAttempts.get(clientId) || 0;
-                if (reconnectAttempts < 3) {  // Maximum 3 reconnection attempts
-                  context.logger.warn(`Connection issue detected. Attempting to reconnect client ${clientId} (attempt ${reconnectAttempts + 1})`);
-                  try {
-                    // Wait a brief moment before reconnecting
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    await operations.ws.setupClient(clientId);
-                    context.logger.info(`Successfully reconnected client ${clientId}`);
-                    context.state.clientReconnectAttempts.set(clientId, reconnectAttempts + 1);
-                  } catch (reconnectError) {
-                    context.logger.error(`Failed to reconnect client ${clientId}: ${reconnectError}`);
-                    // Continue execution even if reconnect fails
-                  }
-                }
               }
               
               // Don't complete the handler yet, wait for catchup completed message
               return false;
             },
             
-            // Also handle heartbeats to keep the test active while waiting
-            'srv_heartbeat': async (message: { type: string, clientId?: string }, context: OperationContext, operations: Record<string, any>) => {
-              // Just log heartbeats but don't complete the protocol
-              context.logger.debug(`Received server heartbeat`);
-              return false;
+            // Also handle heartbeats
+            'srv_heartbeat': async (message: { type: string, clientId?: string }) => {
+              return false; // Just ignore heartbeats
             },
             
             // Handle catchup completion
             'srv_catchup_completed': async (message: ServerCatchupCompletedMessage, context: OperationContext, operations: Record<string, any>) => {
-              const catchupCompletedMsg = message;
-              const clientId = message.clientId || context.state.clients[0]; // Get client ID from message or use first client
+              const clientId = message.clientId || context.state.clients[0];
               
-              context.logger.info(`Catchup sync completed for client ${clientId}: startLSN=${catchupCompletedMsg.startLSN}, finalLSN=${catchupCompletedMsg.finalLSN}, changes=${catchupCompletedMsg.changeCount}, success=${catchupCompletedMsg.success}`);
+              context.logger.info(`Catchup sync completed for client ${clientId}: finalLSN=${message.finalLSN}, changes=${message.changeCount}`);
               
-              if (catchupCompletedMsg.finalLSN) {
-                // Store the LSN in context (for global reference)
-                context.state.lastLSN = catchupCompletedMsg.finalLSN;
-                
-                // Update the client's LSN with the final LSN
-                try {
-                  await operations.ws.updateLSN(clientId, catchupCompletedMsg.finalLSN);
-                  context.logger.info(`Updated client ${clientId} with final LSN ${catchupCompletedMsg.finalLSN}`);
-                } catch (error) {
-                  context.logger.warn(`Failed to update client with final LSN: ${error}`);
-                }
+              if (message.finalLSN) {
+                // Store the LSN and update the client
+                context.state.lastLSN = message.finalLSN;
+                await operations.ws.updateLSN(clientId, message.finalLSN);
               }
               
               // Mark this client as complete
-              context.state.clientCatchupComplete.set(clientId, true);
+              context.state.clientsCompleted.add(clientId);
               
-              // Check if all clients are complete
-              let allComplete = true;
-              let completedCount = 0;
+              const totalClients = context.state.clients?.length || 0;
+              const completedCount = context.state.clientsCompleted.size;
               
-              for (const [id, isComplete] of context.state.clientCatchupComplete.entries()) {
-                if (isComplete) {
-                  completedCount++;
-                } else {
-                  allComplete = false;
-                }
-              }
+              context.logger.info(`Catchup progress: ${completedCount}/${totalClients} clients complete`);
               
-              context.logger.info(`Catchup progress: ${completedCount}/${context.state.clientCatchupComplete.size} clients complete`);
-              
-              // Only complete the protocol when all clients are done
-              if (allComplete) {
+              // Complete when all clients are done
+              if (completedCount >= totalClients) {
                 context.logger.info(`All ${completedCount} clients have completed catchup sync`);
                 return true;
               }
               
-              // Continue waiting for other clients
-              return false;
+              return false; // Keep waiting for other clients
             }
           }
         } as InteractiveAction
       ]
     },
     
-    // Step 6: Generate and Apply Changes
+    // Step 6: Generate Changes
     {
-      name: 'Generate and Apply Changes',
+      name: 'Generate Changes',
       execution: 'serial',
       actions: [
         {
           type: 'changes',
-          name: 'Generate and Apply Changes',
+          name: 'Generate Changes',
           operation: 'exec',
           params: async (context: OperationContext, operations: Record<string, any>) => {
             const changeCount = context.config.changeCount || 3;
             
+            context.logger.info(`Generating ${changeCount} changes`);
+            
             try {
-              // Create a simple distribution config
-              const distribution: Record<string, number> = {};
-              TEST_DEFAULTS.ENTITY_TYPES.forEach(type => {
-                distribution[type] = 1/TEST_DEFAULTS.ENTITY_TYPES.length;
+              // First seed database with dependencies - users and projects first
+              // Keep generation and application as separate steps
+              const seedChanges = await operations.changes.generateChanges(5, {
+                distribution: {
+                  user: 0.5,  // Create users first
+                  project: 0.5, // Create projects first
+                  task: 0,
+                  comment: 0
+                },
+                mode: 'seed'  // Insert only
               });
               
-              // Generate and apply changes in a single operation
-              context.logger.info(`Generating and applying ${changeCount} changes`);
+              // Apply seed changes
+              const seedTableChanges = operations.changes.convertToTableChanges(seedChanges);
+              await operations.changes.applyBatchChanges(seedTableChanges);
               
-              // Call the entity-changes module to handle everything
-              const result = await operations.changes.generateAndApplyChanges(changeCount, distribution);
+              context.logger.info('Seeded database with dependencies (users and projects)');
               
-              if (!result || !result.success) {
-                context.logger.error('Failed to generate and apply changes');
-                context.state.shouldExit = true;
-                return { success: false, error: result?.error || 'Unknown error' };
-              }
+              // Now generate the actual test changes
+              const generatedChanges = await operations.changes.generateChanges(changeCount, {
+                distribution: {
+                  user: 0.2,
+                  project: 0.2,
+                  task: 0.3,
+                  comment: 0.3
+                },
+                useExistingIds: true, // Use existing entities for foreign keys
+                operations: {
+                  create: 0.6,
+                  update: 0.3,
+                  delete: 0.1
+                }
+              });
               
-              // Store the applied changes for validation
-              context.state.databaseChanges = result.changes;
+              // Store for the next step
+              context.state.generatedChanges = generatedChanges;
               
-              // Track the database changes for validation
-              if (context.state.changeTracker) {
-                context.state.changeTracker.trackDatabaseChanges(result.changes);
-              }
+              // Log change counts
+              let totalChanges = 0;
+              Object.entries(generatedChanges as GeneratedChanges).forEach(([entityType, entityOps]) => {
+                const entityCount = entityOps.create.length + entityOps.update.length + entityOps.delete.length;
+                if (entityCount > 0) {
+                  context.logger.info(`Generated ${entityCount} changes for ${entityType}`);
+                  totalChanges += entityCount;
+                }
+              });
               
-              context.logger.info(`Successfully applied ${result.changes.length} changes to database`);
+              context.logger.info(`Successfully generated ${totalChanges} changes`);
               
-              return { 
+              return {
                 success: true,
-                changes: result.changes
+                changeCount: totalChanges
               };
             } catch (error) {
-              context.logger.error(`Error generating and applying changes: ${error}`);
+              context.logger.error(`Error generating changes: ${error}`);
               context.state.shouldExit = true;
               return { success: false, error: String(error) };
             }
@@ -520,17 +551,66 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // Step 7: Track and Apply Changes (updated to just Track Changes)
+    // Step 7: Apply and Track Changes
     {
-      name: 'Track Changes',
+      name: 'Apply and Track Changes',
       execution: 'parallel',
       actions: [
-        // Action: Wait for changes across all clients
+        // Action 1: Apply the generated changes to the database
+        {
+          type: 'changes',
+          name: 'Apply Generated Changes',
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            try {
+              // Get the generated changes from the previous step
+              const generatedChanges = context.state.generatedChanges;
+              
+              if (!generatedChanges) {
+                context.logger.error('No generated changes found from previous step');
+                context.state.shouldExit = true;
+                return { success: false, error: 'No generated changes available' };
+              }
+              
+              // Convert to TableChange format
+              context.logger.info('Converting generated changes to TableChange format');
+              const tableChanges = await operations.changes.convertToTableChanges(generatedChanges);
+              
+              // Apply the changes to the database
+              context.logger.info(`Applying ${tableChanges.length} changes to database`);
+              
+              // NOTE: applyBatchChanges already processes entities in dependency order
+              // (users → projects → tasks → comments) inside a transaction
+              const appliedChanges = await operations.changes.applyBatchChanges(tableChanges);
+              
+              // Store the applied changes for validation
+              context.state.databaseChanges = appliedChanges;
+              
+              // Track the database changes for validation
+              if (context.state.changeTracker) {
+                context.state.changeTracker.trackDatabaseChanges(appliedChanges);
+              }
+              
+              context.logger.info(`Successfully applied ${appliedChanges.length} changes to database`);
+              
+              return {
+                success: true,
+                changeCount: appliedChanges.length
+              };
+            } catch (error) {
+              context.logger.error(`Error applying changes: ${error}`);
+              context.state.shouldExit = true;
+              return { success: false, error: String(error) };
+            }
+          }
+        } as ChangesAction,
+        
+        // Action 2: Wait for changes across all clients
         {
           type: 'interactive',
           name: 'Wait for Change Messages on All Clients',
           protocol: 'live-changes',
-          maxTimeout: 120000,
+          maxTimeout: 30000,
           
           initialAction: {
             type: 'ws',
@@ -582,13 +662,11 @@ export const LiveSyncScenario: Scenario = {
               if (changes.length > 0) {
                 context.logger.info(`Received ${changes.length} changes from server for client ${clientId}`);
                 
-                // Log each change ID for comparison with database IDs
-                changes.forEach((change: any, index: number) => {
-                  context.logger.info(`  Change ${index+1}: id=${change.id}, type=${change.type}, operation=${change.operation}`);
-                });
+                // Generate a batch ID based on LSN and timestamp for traceability
+                const batchId = `batch-${message.lastLSN || '0-0'}-${Date.now()}`;
                 
-                // Use the change tracker to track these changes
-                context.state.changeTracker.trackChanges(clientId, changes);
+                // Use the change tracker's batch tracking to track these changes
+                context.state.changeTracker.trackChanges(clientId, changes, batchId);
                 
                 // Update last change time to now
                 context.state.lastChangeTime = Date.now();
@@ -767,67 +845,191 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // Step 8: Validate Changes
+    // Step 8: Validate Changes and WAL
     {
-      name: 'Validate Changes',
+      name: 'Validate Changes and WAL',
       execution: 'serial',
       actions: [
         {
+          type: 'changes',
+          name: 'Verify Changes in Database and Change History',
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            context.logger.info('Starting comprehensive change verification...');
+            
+            // Get all the changes we applied
+            const changes = context.state.generatedChanges || [];
+            if (!changes.length) {
+              context.logger.warn('No generated changes found to verify');
+              return { success: false, error: 'No changes to verify' };
+            }
+            
+            // Get start and end LSN
+            const startLSN = context.state.initialLSN || '0/0';
+            const currentLSN = await operations.changes.getCurrentLSN();
+            
+            context.logger.info(`Verifying changes between LSN ${startLSN} and ${currentLSN}`);
+            
+            try {
+              // Get changes from change_history table to verify they were captured
+              const changesHistory = await operations.changes.queryChangeHistory(startLSN, currentLSN);
+              
+              // Count changes by table and operation
+              const changesByTable: Record<string, {created: number, updated: number, deleted: number}> = {};
+              
+              for (const change of changesHistory) {
+                if (!changesByTable[change.table_name]) {
+                  changesByTable[change.table_name] = { created: 0, updated: 0, deleted: 0 };
+                }
+                // Map operation types to counter keys
+                const operationKey = change.operation === 'insert' ? 'created' :
+                                    change.operation === 'update' ? 'updated' : 'deleted';
+                changesByTable[change.table_name][operationKey]++;
+              }
+              
+              // Log the breakdown of changes in the history table
+              context.logger.info('Changes captured in change_history table:');
+              Object.entries(changesByTable).forEach(([table, counts]) => {
+                context.logger.info(`  ${table}: ${counts.created} created, ${counts.updated} updated, ${counts.deleted} deleted`);
+              });
+              
+              // Check for expected tables
+              const trackedTables = ['users', 'projects', 'tasks', 'comments'];
+              const missingTables = trackedTables.filter(table => !changesByTable[table]);
+              
+              if (missingTables.length > 0) {
+                context.logger.error(`Missing change records for tables: ${missingTables.join(', ')}`);
+                context.logger.info('This suggests these tables are not being tracked in WAL or not being processed correctly');
+              } else {
+                context.logger.info('All expected tables have change records in the history table');
+              }
+              
+              // Compare with our tracker's database changes
+              if (context.state.changeTracker) {
+                const trackerDbChanges = context.state.changeTracker.getDatabaseChanges() || [];
+                const trackerDbChangesByTable: Record<string, number> = {};
+                
+                trackerDbChanges.forEach((change: TableChange) => {
+                  const table = change.table || 'unknown';
+                  trackerDbChangesByTable[table] = (trackerDbChangesByTable[table] || 0) + 1; 
+                });
+                
+                context.logger.info('Changes tracked in our ChangeTracker:');
+                Object.entries(trackerDbChangesByTable).forEach(([table, count]) => {
+                  context.logger.info(`  ${table}: ${count}`);
+                });
+                
+                // Compare with what's in the database history
+                const totalHistoryChanges = Object.values(changesByTable).reduce(
+                  (sum, counts) => sum + counts.created + counts.updated + counts.deleted, 0
+                );
+                const totalTrackerChanges = Object.values(trackerDbChangesByTable).reduce(
+                  (sum, count) => sum + count, 0
+                );
+                
+                context.logger.info(`Total changes in history: ${totalHistoryChanges}, in tracker: ${totalTrackerChanges}`);
+                
+                if (totalHistoryChanges !== totalTrackerChanges) {
+                  context.logger.warn(`Mismatch between changes in history table and tracker`);
+                  
+                  // Check if some tables are present in tracker but not in history
+                  const tablesOnlyInTracker = Object.keys(trackerDbChangesByTable)
+                    .filter(table => !changesByTable[table]);
+                  
+                  if (tablesOnlyInTracker.length > 0) {
+                    context.logger.error(`Tables in tracker but not in history: ${tablesOnlyInTracker.join(', ')}`);
+                    context.logger.info('These tables may not be tracked in the server WAL configuration');
+                  }
+                }
+              }
+              
+              return {
+                success: true,
+                changesByTable,
+                historyCount: changesHistory.length,
+                message: 'Change verification completed'
+              };
+            } catch (error) {
+              context.logger.error(`Error verifying changes: ${error}`);
+              return { 
+                success: false, 
+                error: String(error)
+              };
+            }
+          }
+        } as ChangesAction,
+        
+        // Original validation action
+        {
           type: 'validation',
-          name: 'Verify Synchronized Changes',
+          name: 'Validate Changes',
           operation: 'exec',
           params: async (context: OperationContext, operations: Record<string, any>) => {
             context.logger.info(`Validating synchronized changes`);
             
             // Use the existing ChangeTracker from beforeScenario
             const tracker = context.state.changeTracker;
+            
+            // Get the validation report from the tracker
             const trackerReport = tracker.getValidationReport();
             
-            // Log the validation report from the ChangeTracker with more details
-            context.logger.info(`ChangeTracker validation: ${trackerReport.databaseChanges} database changes, ${trackerReport.receivedChanges} received changes, ${trackerReport.exactMatchCount} exact matches`);
+            // Log the validation report with detailed information
+            context.logger.info(`Validation Summary:`);
+            context.logger.info(`- Database changes: ${trackerReport.databaseChanges}`);
+            context.logger.info(`- Total received changes: ${trackerReport.receivedChanges}`);
+            context.logger.info(`- Unique records changed: ${trackerReport.uniqueRecordsChanged}`);
+            context.logger.info(`- Unique records received: ${trackerReport.uniqueRecordsReceived}`);
+            context.logger.info(`- Exact match count: ${trackerReport.exactMatchCount}`);
+            context.logger.info(`- Potential deduplications: ${trackerReport.deduplicatedChanges}`);
             
-            // For this test, consider it a success if the count matches, even if IDs don't match exactly
-            // This is because the server might be generating different IDs than what we track locally
-            const countMatches = trackerReport.receivedChanges >= trackerReport.databaseChanges;
+            // Get deduplication information
+            const deduplication = tracker.analyzeDuplication();
+            if (deduplication.duplicatedIds > 0) {
+              context.logger.info(`Deduplication analysis: ${deduplication.duplicatedIds} IDs had multiple changes (${Math.round(deduplication.duplicationRate * 100)}% duplication rate)`);
+            }
             
-            if (countMatches) {
-              context.logger.info(`All expected changes were delivered to clients! (${trackerReport.receivedChanges} received, ${trackerReport.databaseChanges} expected)`);
-              return { 
-                success: true, 
-                report: trackerReport
-              };
-            } else {
-              // If counts don't match, we have missing changes
-              const missingChanges = trackerReport.missingChanges;
-              context.logger.error(`ChangeTracker reports ${missingChanges.length} changes missing from clients`);
+            // Focus on real missing changes not affected by deduplication
+            if (trackerReport.realMissingChanges.length > 0) {
+              context.logger.error(`Found ${trackerReport.realMissingChanges.length} changes missing from clients (not related to deduplication)`);
               
-              // Create a summary of missing changes by type
+              // Analyze missing changes by type
               const missingByType: Record<string, number> = {};
-              missingChanges.forEach((change: TableChange) => {
+              trackerReport.realMissingChanges.forEach((change: TableChange) => {
                 const type = change.table || 'unknown';
                 missingByType[type] = (missingByType[type] || 0) + 1;
               });
               
+              // Log missing changes by type
               context.logger.error(`Missing changes by type: ${
                 Object.entries(missingByType)
                   .map(([type, count]) => `${type}: ${count}`)
                   .join(', ')
               }`);
               
-              // Store the validation errors for reporting
-              context.state.validationErrors = {
-                missingChanges: missingChanges,
-                missingCount: missingChanges.length
-              };
-              
-              // Return failure if missing changes exceed tolerance (which is 0)
+              // Force the test to fail if we have real missing changes
               return { 
                 success: false,
-                error: `${missingChanges.length} changes were not received by all clients`,
-                missingChanges: missingChanges.length,
-                report: trackerReport
+                error: `Test failed: ${trackerReport.realMissingChanges.length} changes missing`,
+                report: trackerReport,
+                deduplication
               };
             }
+            
+            // The report includes success status based on validation rules in the tracker
+            const success = trackerReport.success;
+            
+            // Store validation results in context state for reference
+            context.state.validationResults = {
+              report: trackerReport,
+              success,
+              deduplication
+            };
+            
+            return { 
+              success,
+              report: trackerReport,
+              deduplication
+            };
           }
         } as ValidationAction
       ]

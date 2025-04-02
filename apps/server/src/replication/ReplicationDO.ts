@@ -62,11 +62,9 @@ export class ReplicationDO implements DurableObject {
       this.stateManager
     );
     
-    // Initialize the replication system in the background
-    // This will check if the slot exists and start polling immediately
-    this.durableObjectState.waitUntil(
-      this.initializeAndStartPolling()
-    );
+    // Auto-initialization removed - replication will only start when explicitly
+    // requested through the API endpoint
+    replicationLogger.info('ReplicationDO created - awaiting explicit initialization', {}, MODULE_NAME);
   }
 
   private getContext(): MinimalContext {
@@ -81,9 +79,13 @@ export class ReplicationDO implements DurableObject {
    * Initialize replication and start polling immediately
    * This ensures polling is active as soon as the DO is created
    */
-  private async initializeAndStartPolling(): Promise<void> {
+  private async initializeAndStartPolling(): Promise<{
+    success: boolean,
+    slotStatus: any,
+    error?: string
+  }> {
     try {
-      replicationLogger.info('Auto-initializing replication system', {}, MODULE_NAME);
+      replicationLogger.info('Initializing replication system', {}, MODULE_NAME);
       
       // Check if slot exists or create it
       const c = this.getContext();
@@ -98,10 +100,15 @@ export class ReplicationDO implements DurableObject {
       await this.pollingManager.startPolling();
       
       // Log successful initialization at debug level only
-      replicationLogger.debug('Auto-initialization completed', {}, MODULE_NAME);
+      replicationLogger.debug('Initialization completed', {}, MODULE_NAME);
+      
+      return {
+        success: true,
+        slotStatus
+      };
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      replicationLogger.error('Failed to auto-initialize replication', { 
+      replicationLogger.error('Failed to initialize replication', { 
         error: errorMessage 
       }, MODULE_NAME);
       
@@ -114,6 +121,12 @@ export class ReplicationDO implements DurableObject {
           error: pollErr instanceof Error ? pollErr.message : String(pollErr)
         }, MODULE_NAME);
       }
+      
+      return {
+        success: false,
+        slotStatus: null,
+        error: errorMessage
+      };
     }
   }
 
@@ -221,21 +234,26 @@ export class ReplicationDO implements DurableObject {
         });
       }
       
-      // If not already polling, perform full initialization including slot check
-      // This is the same flow as the auto-initialization but returns a Response
+      // If not already polling, perform full initialization using the shared method
       try {
         replicationLogger.info('API: Initializing replication', {}, MODULE_NAME);
         
-        // Check if slot exists or create it
-        const c = this.getContext();
-        const slotStatus = await this.stateManager.checkSlotStatus(c);
+        // Use the shared initialization method which returns slot status
+        const initResult = await this.initializeAndStartPolling();
         
-        // Start polling - PollingManager will handle its own logging
-        await this.pollingManager.startPolling();
+        if (!initResult.success) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: initResult.error || 'Unknown initialization error'
+          }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
         
         return new Response(JSON.stringify({
           success: true,
-          slotStatus,
+          slotStatus: initResult.slotStatus,
           pollingStarted: true
         }), {
           status: 200,

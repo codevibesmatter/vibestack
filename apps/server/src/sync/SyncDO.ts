@@ -488,8 +488,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     let serverLSN;
     try {
       requestData = await request.json() as { 
-        lsn?: string,
-        sequence?: { chunk: number, total: number }
+        lsn?: string
       };
       
       // Extract server LSN from request data
