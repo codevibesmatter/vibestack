@@ -14,6 +14,61 @@ import type {
 } from '@repo/sync-types';
 
 /**
+ * Compare two LSN (Log Sequence Number) values to determine their relative order
+ * @param lsn1 First LSN in format "X/YYYYYYY"
+ * @param lsn2 Second LSN in format "X/YYYYYYY"
+ * @returns 1 if lsn1 > lsn2, -1 if lsn1 < lsn2, 0 if equal
+ */
+export function compareLSNs(lsn1: string, lsn2: string): number {
+  if (lsn1 === lsn2) return 0;
+  
+  // Handle invalid LSN cases
+  if (lsn1 === '0/0') return -1;
+  if (lsn2 === '0/0') return 1;
+  
+  try {
+    const [seg1A, seg1B] = lsn1.split('/');
+    const [seg2A, seg2B] = lsn2.split('/');
+    
+    // Compare the first segment (numeric)
+    const numA1 = parseInt(seg1A, 10);
+    const numA2 = parseInt(seg2A, 10);
+    
+    if (numA1 !== numA2) {
+      return numA1 > numA2 ? 1 : -1;
+    }
+    
+    // If first segments are equal, compare the second segment (hexadecimal)
+    const numB1 = parseInt(seg1B, 16);
+    const numB2 = parseInt(seg2B, 16);
+    
+    if (numB1 !== numB2) {
+      return numB1 > numB2 ? 1 : -1;
+    }
+    
+    // They are truly equal
+    return 0;
+  } catch (e) {
+    // Handle malformed LSNs - treat them as less than valid LSNs
+    console.warn(`Error comparing LSNs ${lsn1} and ${lsn2}: ${e}`);
+    return -1;
+  }
+}
+
+/**
+ * Validates if a LSN has proper format
+ * @param lsn LSN string to validate
+ * @returns boolean indicating if the LSN is valid
+ */
+export function isValidLSN(lsn: string): boolean {
+  if (!lsn || typeof lsn !== 'string') return false;
+  if (lsn === '0/0') return false; // Often represents an invalid state
+  
+  // LSN format should be X/YYYYYY where X is numeric and Y is hexadecimal
+  return /^\d+\/[0-9A-F]+$/i.test(lsn);
+}
+
+/**
  * ValidationResult interface for validation checks
  */
 export interface ValidationResult {
@@ -140,6 +195,35 @@ export class ValidationService {
     };
     
     this.logger.info(`ValidationService reset for session: ${this.sessionId}`);
+  }
+  
+  /**
+   * Compare two LSN values (wrapper for the utility function)
+   * @param lsn1 First LSN
+   * @param lsn2 Second LSN
+   * @returns 1 if lsn1 > lsn2, -1 if lsn1 < lsn2, 0 if equal
+   */
+  public compareLSNs(lsn1: string, lsn2: string): number {
+    return compareLSNs(lsn1, lsn2);
+  }
+  
+  /**
+   * Validates if an LSN is in the correct format and not the invalid 0/0 state
+   * @param lsn LSN to validate
+   * @returns boolean indicating if the LSN is valid
+   */
+  public isValidLSN(lsn: string): boolean {
+    return isValidLSN(lsn);
+  }
+  
+  /**
+   * Determines if an LSN is greater than another LSN
+   * @param lsn LSN to check
+   * @param compareTo LSN to compare against
+   * @returns true if lsn > compareTo
+   */
+  public isGreaterLSN(lsn: string, compareTo: string): boolean {
+    return this.compareLSNs(lsn, compareTo) > 0;
   }
   
   /**

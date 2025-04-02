@@ -3,7 +3,6 @@ import { createLogger } from './logger.ts';
 import { TestConfig } from '../types.ts';
 import { ClientProfileManager } from './client-profile-manager.ts';
 import { ValidationService } from './validation-service.ts';
-import { MessageProcessor, MessageProcessorOptions } from './message-processor.ts';
 import { wsClientFactory, WebSocketClientFactory } from './ws-client-factory.ts';
 import { messageDispatcher } from './message-dispatcher.ts';
 import * as apiService from './api-service.ts';
@@ -162,7 +161,6 @@ export interface OperationContext {
 export class ScenarioRunner extends EventEmitter {
   protected logger = createLogger('Runner');
   protected validationService: ValidationService;
-  protected messageProcessor: MessageProcessor;
   protected profileManager: ClientProfileManager;
   
   constructor() {
@@ -170,10 +168,9 @@ export class ScenarioRunner extends EventEmitter {
     
     // Initialize services with default options
     this.validationService = new ValidationService();
-    this.messageProcessor = new MessageProcessor();
     this.profileManager = new ClientProfileManager();
     
-    this.logger.info('ScenarioRunner created with validation and message processing capabilities');
+    this.logger.info('ScenarioRunner created with validation capabilities');
   }
   
   /**
@@ -194,7 +191,6 @@ export class ScenarioRunner extends EventEmitter {
         },
         logger: this.logger,
         validationService: this.validationService,
-        messageProcessor: this.messageProcessor,
         operations: {
           // API operations
           api: {
@@ -202,6 +198,21 @@ export class ScenarioRunner extends EventEmitter {
             post: this.apiPost.bind(this),
             put: this.apiPut.bind(this),
             delete: this.apiDelete.bind(this)
+          },
+          
+          // WS operations
+          ws: {
+            createClient: wsClientFactory.createClient.bind(wsClientFactory),
+            connectClient: wsClientFactory.connectClient.bind(wsClientFactory),
+            disconnectClient: wsClientFactory.disconnectClient.bind(wsClientFactory),
+            setupClient: wsClientFactory.setupClient.bind(wsClientFactory),
+            sendMessage: wsClientFactory.sendMessage.bind(wsClientFactory),
+            registerHandler: wsClientFactory.registerMessageHandler.bind(wsClientFactory),
+            getClientStatus: wsClientFactory.getClientStatus.bind(wsClientFactory),
+            waitForCatchup: wsClientFactory.waitForCatchup.bind(wsClientFactory),
+            sendChangesAcknowledgment: wsClientFactory.sendChangesAcknowledgment.bind(wsClientFactory),
+            updateLSN: wsClientFactory.updateLSN.bind(wsClientFactory),
+            getCurrentLSN: wsClientFactory.getCurrentLSN.bind(wsClientFactory)
           },
           
           // Changes operations (formerly DB operations)
@@ -221,27 +232,13 @@ export class ScenarioRunner extends EventEmitter {
             seedDatabase: entityChanges.seedDatabase.bind(entityChanges)
           },
           
-          // WebSocket operations
-          ws: {
-            createClient: wsClientFactory.createClient.bind(wsClientFactory),
-            connectClient: wsClientFactory.connectClient.bind(wsClientFactory),
-            setupClient: wsClientFactory.setupClient.bind(wsClientFactory),
-            sendMessage: wsClientFactory.sendMessage.bind(wsClientFactory),
-            disconnectClient: wsClientFactory.disconnectClient.bind(wsClientFactory),
-            addMessageHandler: wsClientFactory.addMessageHandler.bind(wsClientFactory),
-            removeMessageHandler: wsClientFactory.removeMessageHandler.bind(wsClientFactory),
-            waitForCatchup: wsClientFactory.waitForCatchup.bind(wsClientFactory),
-            sendChangesAcknowledgment: wsClientFactory.sendChangesAcknowledgment.bind(wsClientFactory),
-            removeAllMessageHandlers: wsClientFactory.removeAllMessageHandlers?.bind(wsClientFactory),
-            updateLSN: wsClientFactory.updateLSN?.bind(wsClientFactory),
-            getClientStatus: wsClientFactory.getClientStatus?.bind(wsClientFactory)
-          },
-          // Message processing operations
+          // Message dispatcher operations
           messages: {
-            process: this.messageProcessor.processWebSocketMessages.bind(this.messageProcessor),
-            processServerMessage: this.messageProcessor.processServerChangesMessage.bind(this.messageProcessor),
-            createSyntheticIds: this.messageProcessor.createSyntheticIdMapping.bind(this.messageProcessor),
-            processTableChanges: this.messageProcessor.processTableChanges.bind(this.messageProcessor)
+            registerHandler: messageDispatcher.registerHandler.bind(messageDispatcher),
+            removeHandler: messageDispatcher.removeHandler.bind(messageDispatcher),
+            processTableChanges: messageDispatcher.processTableChanges.bind(messageDispatcher),
+            updateClientLSN: messageDispatcher.updateClientLSN.bind(messageDispatcher),
+            getClientLSN: messageDispatcher.getClientLSN.bind(messageDispatcher)
           }
         }
       };
@@ -841,12 +838,24 @@ export class ScenarioRunner extends EventEmitter {
     
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
+        messageDispatcher.removeHandler(messageType, messageHandler);
         reject(new Error(`Timeout waiting for WebSocket message: ${messageType}`));
       }, timeout);
       
-      // This would typically set up a message handler that resolves when the message is received
-      // For now, just returning a placeholder
-      resolve({ success: true, messageType });
+      const messageHandler = (message: any) => {
+        // Only handle messages for the specific client
+        if (message.clientId === clientId) {
+          clearTimeout(timeoutId);
+          messageDispatcher.removeHandler(messageType, messageHandler);
+          this.logger.info(`Received expected message type: ${messageType} from client: ${clientId}`);
+          resolve(message);
+          return true; // Message was handled
+        }
+        return false; // Message was not handled
+      };
+      
+      // Register with the central message dispatcher
+      messageDispatcher.registerHandler(messageType, messageHandler);
     });
   }
 }

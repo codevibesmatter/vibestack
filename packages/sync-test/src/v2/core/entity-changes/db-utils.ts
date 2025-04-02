@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { faker } from '@faker-js/faker';
 
 import { createLogger } from '../logger.ts';
-import { EntityType, EntityTypeMapping, getEntityClassForType, ORDERED_ENTITY_TYPES, TABLE_TO_ENTITY_MAP } from './entity-definitions.ts';
+import { EntityType, EntityTypeMapping, getEntityClassForType, ORDERED_ENTITY_TYPES, TABLE_TO_ENTITY_MAP, ENTITY_TEMPLATES } from './entity-definitions.ts';
 import { User, UserRole, Project, ProjectStatus, Task, TaskStatus, Comment } from '@repo/dataforge/server-entities';
 
 // Initialize logger
@@ -696,7 +696,7 @@ async function processEntityUpdates(
 }
 
 /**
- * Process entity deletes for a specific entity type
+ * Process entity deletes for a specific entity type, respecting cascade relationships
  */
 async function processEntityDeletes(
   entityType: EntityType,
@@ -709,43 +709,143 @@ async function processEntityDeletes(
   
   const repository = transactionalEntityManager.getRepository(getEntityClassForType(entityType));
   
-  // Process deletes in batches
-  const batchSize = 10;
+  // Get the entity template with its dependencies
+  const entityTemplate = ENTITY_TEMPLATES[entityType];
   
-  for (let i = 0; i < operations.delete.length; i += batchSize) {
-    const batch = operations.delete.slice(i, i + batchSize);
-    const ids = batch.map(change => change.data.id as string);
+  // Process deletes one at a time to handle cascade dependencies properly
+  for (const change of operations.delete) {
+    const entityId = change.data.id as string;
     
     try {
-      // Delete all entities in the batch
-      await repository.delete(ids);
+      // Check if the entity exists
+      const entity = await repository.findOneBy({ id: entityId });
+      
+      if (!entity) {
+        logger.warn(`Entity ${entityType} with ID ${entityId} not found for deletion, skipping`);
+        continue;
+      }
+      
+      // Handle dependent entities (cascade delete)
+      await handleCascadeDeletes(entityType, entityId, transactionalEntityManager);
+      
+      // Now delete the entity
+      await repository.delete(entityId);
       
       // Mark as applied
-      batch.forEach(change => {
-        appliedChanges.push({
-          ...change,
-          updated_at: new Date().toISOString()
-        });
+      appliedChanges.push({
+        ...change,
+        updated_at: new Date().toISOString()
       });
-    } catch (error) {
-      logger.error(`Error deleting ${entityType} entities: ${error}`);
       
-      // For each entity, try to delete individually to isolate errors
-      for (const change of batch) {
-        try {
-          const entityId = change.data.id as string;
-          await repository.delete(entityId);
-          
-          // Mark as applied
-          appliedChanges.push({
-            ...change,
-            updated_at: new Date().toISOString()
-          });
-        } catch (innerError) {
-          logger.error(`Error deleting ${entityType} entity ${change.data.id}: ${innerError}`);
-          // Don't throw, try to continue with other deletes
-        }
-      }
+    } catch (error) {
+      logger.error(`Error deleting ${entityType} entity ${entityId}: ${error}`);
+      // Don't throw, try to continue with other deletes
     }
+  }
+}
+
+/**
+ * Handle cascade deletes for dependent entities
+ */
+async function handleCascadeDeletes(
+  entityType: EntityType,
+  entityId: string,
+  transactionalEntityManager: any
+): Promise<void> {
+  // Check which entity types might have dependencies on this entity
+  switch (entityType) {
+    case 'user':
+      // When deleting a user, check for owned projects
+      await deleteEntitiesWithDependency(
+        'project',
+        'ownerId',
+        entityId,
+        transactionalEntityManager
+      );
+      
+      // Check for assigned tasks
+      await deleteEntitiesWithDependency(
+        'task', 
+        'assigneeId', 
+        entityId, 
+        transactionalEntityManager
+      );
+      
+      // Check for authored comments  
+      await deleteEntitiesWithDependency(
+        'comment', 
+        'authorId', 
+        entityId, 
+        transactionalEntityManager
+      );
+      break;
+      
+    case 'project':
+      // When deleting a project, delete all tasks in that project
+      await deleteEntitiesWithDependency(
+        'task', 
+        'projectId', 
+        entityId, 
+        transactionalEntityManager
+      );
+      break;
+      
+    case 'task':
+      // When deleting a task, delete all comments on that task
+      await deleteEntitiesWithDependency(
+        'comment', 
+        'entityId', 
+        entityId, 
+        transactionalEntityManager,
+        entity => entity.entityType === 'task' // Additional filter
+      );
+      break;
+      
+    case 'comment':
+      // When deleting a comment, delete all child comments
+      await deleteEntitiesWithDependency(
+        'comment', 
+        'parentId', 
+        entityId, 
+        transactionalEntityManager
+      );
+      break;
+  }
+}
+
+/**
+ * Delete entities that have a dependency on another entity
+ */
+async function deleteEntitiesWithDependency(
+  entityType: EntityType,
+  dependencyField: string,
+  dependencyValue: string,
+  transactionalEntityManager: any,
+  additionalFilter?: (entity: any) => boolean
+): Promise<void> {
+  const repository = transactionalEntityManager.getRepository(getEntityClassForType(entityType));
+  
+  // Find all dependent entities
+  const dependentEntities = await repository.findBy({ [dependencyField]: dependencyValue });
+  
+  // Apply additional filter if provided
+  const filteredEntities = additionalFilter 
+    ? dependentEntities.filter(additionalFilter) 
+    : dependentEntities;
+    
+  if (filteredEntities.length === 0) {
+    return;
+  }
+  
+  logger.debug(`Found ${filteredEntities.length} ${entityType} entities dependent on ${dependencyField}=${dependencyValue}`);
+  
+  // For each dependent entity, handle its cascade deletes first
+  for (const entity of filteredEntities) {
+    // Recursively handle cascade deletes for this entity
+    await handleCascadeDeletes(entityType, entity.id, transactionalEntityManager);
+    
+    // Delete the entity itself
+    await repository.delete(entity.id);
+    logger.debug(`Cascade deleted ${entityType} ${entity.id}`);
   }
 } 

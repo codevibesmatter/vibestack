@@ -26,9 +26,8 @@ import {
   InteractiveAction,
   OperationContext 
 } from '../core/scenario-runner.ts';
-import { MessageProcessor } from '../core/message-processor.ts';
-import { EntityType, EntityChange, Operation } from '../types.ts';
 import { messageDispatcher } from '../core/message-dispatcher.ts';
+import { EntityType, EntityChange, Operation } from '../types.ts';
 import type {
   ServerChangesMessage,
   ServerLSNUpdateMessage,
@@ -185,8 +184,9 @@ export const LiveSyncScenario: Scenario = {
     // Add a hook to check for fatal errors after each step
     afterStep: async (step, context) => {
       if (context.state.shouldExit) {
-        context.logger.error(`Critical error in step "${step.name}", exiting scenario`);
-        throw new Error(`Step "${step.name}" encountered a fatal error, terminating scenario`);
+        const reason = context.state.exitReason || 'Critical error';
+        context.logger.error(`${reason} in step "${step.name}", exiting scenario`);
+        throw new Error(`Step "${step.name}" encountered a fatal error: ${reason}`);
       }
     }
   },
@@ -317,25 +317,44 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
-    // UPDATED STEP: Initialize clients with the same LSN
+    // UPDATED STEP: Initialize Clients with Same LSN
     {
       name: 'Initialize Clients with Same LSN',
       execution: 'serial',
       actions: [
         {
+          type: 'api',
+          name: 'Get Current LSN from Server',
+          endpoint: '/api/replication/lsn',
+          method: 'GET',
+          responseHandler: async (response: any, context: OperationContext) => {
+            if (response && response.lsn) {
+              context.state.currentLSN = response.lsn;
+              context.logger.info(`Retrieved current server LSN: ${response.lsn}`);
+              
+              // Compare with initialization LSN if available
+              if (context.state.initialLSN) {
+                context.logger.info(`Comparing LSNs - init: ${context.state.initialLSN}, current: ${response.lsn}`);
+              }
+            }
+            return response;
+          }
+        } as ApiAction,
+        {
           type: 'ws',
           name: 'Update All Clients with Same LSN',
           operation: 'exec',
           params: async (context: OperationContext, operations: Record<string, any>) => {
-            // Use the LSN we got from the init call
-            const initialLSN = context.state.initialLSN;
+            // Get the most current LSN directly from the API call above
+            // Fall back to the initialization LSN if API call failed
+            const initialLSN = context.state.currentLSN || context.state.initialLSN;
             if (!initialLSN) {
-              context.logger.info('No initial LSN available from replication init, skipping client LSN updates');
+              context.logger.info('No LSN available from server, skipping client LSN updates');
               return { success: true, skipped: true };
             }
             
             const clients = context.state.clients || [];
-            context.logger.info(`Updating ${clients.length} clients with initial LSN: ${initialLSN}`);
+            context.logger.info(`Updating ${clients.length} clients with current server LSN: ${initialLSN}`);
             
             // Update each client's LSN in parallel
             const updatePromises = clients.map(async (clientId: string, index: number) => {
@@ -364,6 +383,71 @@ export const LiveSyncScenario: Scenario = {
               totalClients: clients.length,
               lsn: initialLSN
             };
+          }
+        } as WSAction,
+        // New action to verify all clients have matching LSNs
+        {
+          type: 'ws',
+          name: 'Verify Client LSNs Match',
+          operation: 'exec',
+          params: async (context: OperationContext, operations: Record<string, any>) => {
+            const clients = context.state.clients || [];
+            if (clients.length === 0) {
+              context.logger.warn('No clients to verify LSNs for');
+              return { success: true };
+            }
+            
+            context.logger.info(`Verifying LSNs for ${clients.length} clients match before proceeding`);
+            
+            // Get LSN for each client
+            const clientLSNs: Record<string, string> = {};
+            
+            for (const clientId of clients) {
+              try {
+                const lsn = await operations.messages.getClientLSN(clientId);
+                if (!lsn) {
+                  context.logger.error(`Client ${clientId} has no LSN set`);
+                  context.state.shouldExit = true;
+                  return { 
+                    success: false, 
+                    error: `Client ${clientId} has no LSN set` 
+                  };
+                }
+                clientLSNs[clientId] = lsn;
+              } catch (err) {
+                context.logger.error(`Failed to get LSN for client ${clientId}: ${err}`);
+                context.state.shouldExit = true;
+                return { 
+                  success: false, 
+                  error: `Failed to get LSN for client ${clientId}: ${err}` 
+                };
+              }
+            }
+            
+            // Check if all LSNs match
+            const lsnValues = Object.values(clientLSNs);
+            const firstLSN = lsnValues[0];
+            const allMatch = lsnValues.every(lsn => lsn === firstLSN);
+            
+            if (allMatch) {
+              context.logger.info(`All ${clients.length} clients have matching LSN: ${firstLSN}`);
+              return { success: true, lsn: firstLSN };
+            } else {
+              // Log the mismatched LSNs
+              context.logger.error(`Client LSNs do not match:`);
+              for (const [clientId, lsn] of Object.entries(clientLSNs)) {
+                context.logger.error(`  Client ${clientId}: LSN ${lsn}`);
+              }
+              
+              // Set the exit flag to terminate the scenario
+              context.state.shouldExit = true;
+              
+              return { 
+                success: false, 
+                error: 'Client LSNs do not match, cannot proceed with test', 
+                lsns: clientLSNs 
+              };
+            }
           }
         } as WSAction
       ]
@@ -463,6 +547,60 @@ export const LiveSyncScenario: Scenario = {
               // Complete when all clients are done
               if (completedCount >= totalClients) {
                 context.logger.info(`All ${completedCount} clients have completed catchup sync`);
+                
+                // NEW: Before proceeding, verify all clients have matching LSNs
+                context.logger.info('Verifying all clients have matching LSNs after catchup');
+                
+                // Get LSN for each client
+                const clientLSNs: Record<string, string> = {};
+                const clients = context.state.clients || [];
+                
+                for (const cId of clients) {
+                  try {
+                    const lsn = await operations.messages.getClientLSN(cId);
+                    if (!lsn) {
+                      context.logger.error(`Client ${cId} has no LSN set after catchup`);
+                      context.state.shouldExit = true;
+                      return false; // Continue waiting, but scenario will exit after step
+                    }
+                    clientLSNs[cId] = lsn;
+                  } catch (err) {
+                    context.logger.error(`Failed to get LSN for client ${cId} after catchup: ${err}`);
+                    context.state.shouldExit = true;
+                    return false; // Continue waiting, but scenario will exit after step
+                  }
+                }
+                
+                // Check if all LSNs match
+                const lsnValues = Object.values(clientLSNs);
+                const firstLSN = lsnValues[0];
+                const allMatch = lsnValues.every(lsn => lsn === firstLSN);
+                
+                if (!allMatch) {
+                  // Log the mismatched LSNs
+                  context.logger.error(`Client LSNs do not match after catchup:`);
+                  for (const [cId, lsn] of Object.entries(clientLSNs)) {
+                    context.logger.error(`  Client ${cId}: LSN ${lsn}`);
+                  }
+                  
+                  // Set the exit flag to terminate the scenario
+                  context.state.shouldExit = true;
+                  context.state.exitReason = 'Client LSNs do not match after catchup';
+                  return false; // Continue waiting, but scenario will exit after step
+                }
+                
+                context.logger.info(`All ${clients.length} clients have matching LSN after catchup: ${firstLSN}`);
+                
+                // IMPORTANT: Reset the change tracker after catchup to avoid counting catchup changes
+                context.logger.info("Resetting change tracker after catchup phase to avoid counting catchup changes");
+                
+                // Reset the existing tracker instead of creating a new one
+                context.state.changeTracker.resetTrackerState();
+                
+                // Re-register clients without setting expected count yet
+                // The expected count will be set after we generate changes
+                context.state.changeTracker.registerClients(context.state.clients || []);
+                
                 return true;
               }
               
@@ -509,16 +647,23 @@ export const LiveSyncScenario: Scenario = {
               // Now generate the actual test changes
               const generatedChanges = await operations.changes.generateChanges(changeCount, {
                 distribution: {
-                  user: 0.2,
-                  project: 0.2,
-                  task: 0.3,
-                  comment: 0.3
+                  user: 0.15,
+                  project: 0.15,
+                  task: 0.2,
+                  comment: 0.5
                 },
                 useExistingIds: true, // Use existing entities for foreign keys
                 operations: {
-                  create: 0.6,
-                  update: 0.3,
-                  delete: 0.1
+                  create: 0.8,
+                  update: 0.15,
+                  delete: 0.05
+                },
+                // Set minCounts to control the change generation
+                minCounts: {
+                  user: 1,
+                  project: 1,
+                  task: 1,
+                  comment: changeCount - 3 // Ensure we generate exactly the requested number
                 }
               });
               
@@ -589,6 +734,26 @@ export const LiveSyncScenario: Scenario = {
               // Track the database changes for validation
               if (context.state.changeTracker) {
                 context.state.changeTracker.trackDatabaseChanges(appliedChanges);
+                
+                // Log info about the database changes we're tracking - this is what we should validate
+                const uniqueRecords = new Set();
+                appliedChanges.forEach((change: TableChange) => {
+                  const key = `${change.table}:${change.data.id}`;
+                  uniqueRecords.add(key);
+                });
+                
+                // Store total changes count for validation
+                context.state.totalChangesCount = appliedChanges.length;
+                context.state.uniqueChangesCount = uniqueRecords.size;
+                
+                // IMPORTANT: Set the expected count for each client based on the actual applied changes
+                // This ensures that the change tracker knows how many changes to expect
+                for (const clientId of context.state.clients) {
+                  context.state.changeTracker.setClientExpectedCount(clientId, appliedChanges.length);
+                }
+                
+                context.logger.info(`Tracking ${appliedChanges.length} database changes (${uniqueRecords.size} unique records)`);
+                context.logger.info(`Set expected change count to ${appliedChanges.length} for all clients`);
               }
               
               context.logger.info(`Successfully applied ${appliedChanges.length} changes to database`);
@@ -618,13 +783,19 @@ export const LiveSyncScenario: Scenario = {
             operation: 'exec',
             params: async (context: OperationContext, operations: Record<string, any>) => {
               const clients = context.state.clients || [];
-              const expectedChanges = context.config.changeCount || 3;
               
               // Use the existing ChangeTracker instance from beforeScenario
               const tracker = context.state.changeTracker;
               
               // Register clients with the tracker
-              tracker.registerClients(clients, expectedChanges);
+              // Don't set expected changes here - the actual count from generated changes will be used
+              tracker.registerClients(clients);
+              
+              // Reset all clients' received counts to ensure we're only tracking changes from this point forward
+              for (const clientId of clients) {
+                tracker.resetClientReceivedCount(clientId);
+              }
+              context.logger.info(`Reset received count for all clients to ensure we don't count catchup changes`);
               
               // Listen for completion events from the tracker
               tracker.on('complete', () => {
@@ -640,8 +811,8 @@ export const LiveSyncScenario: Scenario = {
               context.state.timeoutId = null;
               context.state.timeoutDuration = context.config.timeout || 90000; // Increased default timeout
               
-              // Log expected changes with zero tolerance for debugging
-              context.logger.info(`Setting up to wait for ${expectedChanges} changes on each of ${clients.length} clients (strict validation, no tolerance)`);
+              // Log tracking setup
+              context.logger.info(`Setting up to track changes for ${clients.length} clients (strict validation)`);
               
               return { success: true };
             }
@@ -655,12 +826,16 @@ export const LiveSyncScenario: Scenario = {
               // Reset timeout since we received changes
               resetInactivityTimeout(context);
               
-              // Use the processed changes instead of raw changes
-              const changes = message._processedChanges || [];
+              // Use the original server changes array instead of processed changes
+              const changes = message.changes || [];
               
               // Detailed logging of received change IDs
               if (changes.length > 0) {
                 context.logger.info(`Received ${changes.length} changes from server for client ${clientId}`);
+                
+                // Enhanced logging to debug table names
+                const tableNames = [...new Set(changes.map((c: any) => c.table))].join(', ');
+                context.logger.info(`Changes tables: ${tableNames}`);
                 
                 // Generate a batch ID based on LSN and timestamp for traceability
                 const batchId = `batch-${message.lastLSN || '0-0'}-${Date.now()}`;
@@ -1035,6 +1210,29 @@ export const LiveSyncScenario: Scenario = {
       ]
     },
     
+    // New step: Wait for changes to finish processing before disconnecting
+    {
+      name: 'Wait for Changes to Propagate',
+      execution: 'serial',
+      actions: [
+        {
+          type: 'changes',
+          name: 'Wait for Server Processing',
+          operation: 'exec',
+          params: async (context: OperationContext) => {
+            context.logger.info('Waiting for server to finish processing changes before disconnecting...');
+            
+            // Add a delay to ensure server has time to process and send all changes
+            const waitTime = 3000; // 3 seconds should be plenty
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            
+            context.logger.info(`Waited ${waitTime}ms for changes to propagate`);
+            return { success: true };
+          }
+        } as ChangesAction
+      ]
+    },
+    
     // Step 9: Disconnect Clients
     {
       name: 'Disconnect Clients',
@@ -1237,11 +1435,6 @@ async function cleanupResources(context: any): Promise<void> {
           }
         }
       }
-    }
-    
-    // Clear the MessageProcessor cache
-    if (context.messageProcessor && typeof context.messageProcessor.clearCache === 'function') {
-      context.messageProcessor.clearCache();
     }
     
     logger.info('Resource cleanup completed');

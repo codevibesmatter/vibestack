@@ -1,28 +1,17 @@
-import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { createLogger } from './logger.ts';
 import { WS_CONFIG } from '../config.ts';
-import { ClientProfileManager, ClientProfile } from './client-profile-manager.ts';
+import { ClientProfileManager } from './client-profile-manager.ts';
 import * as apiService from './api-service.ts';
 import { messageDispatcher } from './message-dispatcher.ts';
-import type { ServerChangesMessage, SrvMessageType, TableChange } from '@repo/sync-types';
-import { MessageProcessor } from './message-processor.ts';
-
-// Define client status type
-type ClientStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
-
-// WebSocket message handler type
-type MessageHandler = (message: any) => void;
+import type { ServerChangesMessage } from '@repo/sync-types';
+import { WebSocketConnection, ConnectionStatus } from './websocket-connection.ts';
 
 // Client instance type
 interface WSClient {
   id: string;
-  ws: WebSocket | null;
-  status: ClientStatus;
+  connection: WebSocketConnection;
   profileId: number;
-  lsn: string;
-  connectionPromise: Promise<void> | null;
-  messageHandlers: Set<MessageHandler>;
 }
 
 export class WebSocketClientFactory {
@@ -30,13 +19,22 @@ export class WebSocketClientFactory {
   private logger = createLogger('ws-client-factory');
   private wsConfig = { ...WS_CONFIG };
   private profileManager: ClientProfileManager;
-  private messageProcessor: MessageProcessor;
-  private heartbeatIntervals: Map<string, NodeJS.Timeout> = new Map();
   
   constructor() {
     this.profileManager = new ClientProfileManager();
-    this.messageProcessor = new MessageProcessor({ verbose: false });
-    this.logger.info('WebSocketClientFactory initialized with MessageProcessor');
+    this.logger.info('WebSocketClientFactory initialized');
+    
+    // Listen for LSN updates from the MessageDispatcher
+    messageDispatcher.on('lsn_updated', (data: { clientId: string, lsn: string }) => {
+      const { clientId, lsn } = data;
+      if (this.clients.has(clientId)) {
+        const client = this.clients.get(clientId)!;
+        
+        // Update profile with new LSN
+        this.profileManager.updateLSN(client.profileId, lsn);
+        this.logger.debug(`Updated profile LSN for client ${clientId} to ${lsn}`);
+      }
+    });
   }
   
   /**
@@ -55,16 +53,19 @@ export class WebSocketClientFactory {
       return clientId;
     }
     
-    // Create client 
+    // Create WebSocketConnection for this client
+    const connection = new WebSocketConnection(clientId, profile.lsn);
+    
+    // Create client entry
     this.clients.set(clientId, {
       id: clientId,
-      ws: null,
-      status: 'disconnected',
-      profileId,
-      lsn: profile.lsn,
-      connectionPromise: null,
-      messageHandlers: new Set(),
+      connection,
+      profileId
     });
+    
+    // IMPORTANT: Initialize the LSN in MessageDispatcher
+    messageDispatcher.updateClientLSN(clientId, profile.lsn);
+    this.logger.info(`Initialized MessageDispatcher with LSN ${profile.lsn} for client ${clientId}`);
     
     this.logger.info(`Created client: ${clientId} with profile ${profileId}`);
     return clientId;
@@ -80,83 +81,20 @@ export class WebSocketClientFactory {
   async connectClient(clientId: string, serverUrl: string = WS_CONFIG.URL, options: any = {}): Promise<void> {
     const client = this.getClient(clientId);
     
-    if (client.status === 'connected') {
+    if (client.connection.getStatus() === 'connected') {
       this.logger.warn(`Client ${clientId} is already connected`);
       return;
     }
     
-    // Update client status
-    client.status = 'connecting';
-    
-    // Configure WebSocket URL with client ID and LSN
-    const wsUrl = new URL(serverUrl);
-    wsUrl.searchParams.set('clientId', clientId);
-    
-    // Always include LSN parameter
-    const lsn = options.lsn || client.lsn;
-    if (lsn) {
-      wsUrl.searchParams.set('lsn', lsn);
-      this.logger.info(`Connecting with LSN: ${lsn}`);
-    }
-    
     try {
-      // Create WebSocket
-      this.logger.info(`Connecting to: ${wsUrl.toString()}`);
-      client.ws = new WebSocket(wsUrl.toString());
-      
-      // Create connection promise
-      client.connectionPromise = new Promise<void>((resolve, reject) => {
-        // Set timeout for connection
-        const timeout = setTimeout(() => {
-          reject(new Error(`Connection timeout for client ${clientId}`));
-          
-          if (client.ws) {
-            client.ws.close();
-            client.ws = null;
-          }
-          
-          client.status = 'error';
-        }, options.timeout || 10000);
-        
-        // Set up event handlers
-        client.ws!.on('open', () => {
-          this.logger.info(`Client ${clientId} connected to ${wsUrl.toString()}`);
-          client.status = 'connected';
-          resolve();
-        });
-        
-        client.ws!.on('error', (error) => {
-          clearTimeout(timeout);
-          client.status = 'error';
-          this.logger.error(`WebSocket connection error for client ${clientId}: ${error}`);
-          reject(error);
-        });
-        
-        client.ws!.on('close', () => {
-          client.status = 'disconnected';
-          this.logger.info(`Client ${clientId} disconnected`);
-        });
-        
-        client.ws!.on('message', async (data: WebSocket.Data) => {
-          try {
-            // Process the message asynchronously
-            await this.processIncomingMessage(clientId, data);
-          } catch (error) {
-            this.logger.error(`Error processing message for client ${clientId}: ${error}`);
-          }
-        });
+      // Connect with options
+      await client.connection.connect(serverUrl, {
+        timeout: options.timeout || WS_CONFIG.CONNECT_TIMEOUT,
+        lsn: options.lsn || client.connection.getLSN()
       });
       
-      // Start heartbeat for this client
-      this.startHeartbeat(clientId);
-      
-      // Wait for connection
-      await client.connectionPromise;
-      
-      // Return when connected
-      return;
+      this.logger.info(`Client ${clientId} connected successfully`);
     } catch (error) {
-      client.status = 'error';
       this.logger.error(`Failed to connect client ${clientId}: ${error}`);
       throw error;
     }
@@ -170,14 +108,14 @@ export class WebSocketClientFactory {
   async sendCatchupRequest(clientId: string, fromLSN?: string): Promise<void> {
     const client = this.getClient(clientId);
     
-    if (client.status !== 'connected') {
+    if (client.connection.getStatus() !== 'connected') {
       throw new Error(`Client ${clientId} is not connected`);
     }
     
-    const lsn = fromLSN || client.lsn;
+    const lsn = fromLSN || client.connection.getLSN();
     
     this.logger.info(`Sending catchup request for client ${clientId} from LSN ${lsn}`);
-    await this.sendMessage(clientId, {
+    await client.connection.sendMessage({
       type: 'clt_catchup_request',
       clientId,
       fromLSN: lsn
@@ -192,20 +130,21 @@ export class WebSocketClientFactory {
   async waitForCatchup(clientId: string, timeout: number = 10000): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
-        this.removeMessageHandler(clientId, catchupHandler);
+        messageDispatcher.removeHandler('srv_catchup_completed', catchupHandler);
         reject(new Error('Catchup handshake timed out'));
       }, timeout);
       
       const catchupHandler = (message: any) => {
-        if (message.type === 'srv_catchup_completed') {
+        if (message.clientId === clientId) {
           clearTimeout(timeoutId);
-          this.removeMessageHandler(clientId, catchupHandler);
+          messageDispatcher.removeHandler('srv_catchup_completed', catchupHandler);
           this.logger.info(`Catchup completed for client ${clientId}`);
           resolve();
         }
+        return true;
       };
       
-      this.addMessageHandler(clientId, catchupHandler);
+      messageDispatcher.registerHandler('srv_catchup_completed', catchupHandler);
     });
   }
   
@@ -220,7 +159,7 @@ export class WebSocketClientFactory {
     await this.connectClient(clientId);
     
     // Send catchup request only if needed (profile will have proper LSN)
-    if (client.lsn === '0/0') {
+    if (client.connection.getLSN() === '0/0') {
       await this.sendCatchupRequest(clientId);
       await this.waitForCatchup(clientId);
     }
@@ -235,40 +174,14 @@ export class WebSocketClientFactory {
     const client = this.getClient(clientId);
     
     // If already disconnected, just return
-    if (client.status === 'disconnected' || client.ws === null) {
+    if (client.connection.getStatus() === 'disconnected') {
       this.logger.debug(`Client ${clientId} is already disconnected`);
       return;
     }
     
-    // Stop heartbeat immediately
-    this.stopHeartbeat(clientId);
-    
     try {
-      // Send a disconnect message if possible
-      if (client.ws && client.ws.readyState === WebSocket.OPEN) {
-        try {
-          client.ws.send(JSON.stringify({
-            type: 'clt_disconnect',
-            clientId,
-            timestamp: Date.now(),
-            message: 'Client disconnecting'
-          }));
-        } catch (e) {
-          // Ignore errors when sending disconnect message
-        }
-      }
-      
-      // Close the connection - don't wait for response
-      if (client.ws) {
-        try {
-          client.ws.close();
-        } catch (e) {
-          // Ignore errors during close
-        }
-        
-        // Don't wait for onclose - force cleanup immediately
-        this.forceTerminateClient(client, clientId);
-      }
+      // Disconnect the WebSocket connection
+      await client.connection.disconnect();
       
       // Clear this client from the profile
       await this.clearActiveClientFromProfile(clientId, client.profileId);
@@ -277,38 +190,9 @@ export class WebSocketClientFactory {
     } catch (error) {
       this.logger.error(`Error disconnecting client ${clientId}: ${error}`);
       
-      // Ensure cleanup happens even on error
-      this.forceTerminateClient(client, clientId);
+      // Still try to clear from profile even on error
       await this.clearActiveClientFromProfile(clientId, client.profileId);
     }
-  }
-  
-  /**
-   * Force terminate a client's WebSocket connection
-   * This bypasses the normal close handshake
-   */
-  private forceTerminateClient(client: WSClient, clientId: string): void {
-    // Clean up the client's state
-    client.status = 'disconnected';
-    client.messageHandlers.clear();
-    
-    // Force terminate WebSocket
-    if (client.ws) {
-      try {
-        client.ws.terminate(); // More aggressive than close()
-      } catch (e) {
-        // Ignore errors during termination
-      }
-      
-      // Nullify references for garbage collection
-      client.ws.onclose = null;
-      client.ws.onerror = null;
-      client.ws.onmessage = null;
-      client.ws.onopen = null;
-      client.ws = null;
-    }
-    
-    this.logger.debug(`Force terminated client ${clientId}`);
   }
   
   /**
@@ -319,19 +203,8 @@ export class WebSocketClientFactory {
   async sendMessage(clientId: string, message: any): Promise<void> {
     const client = this.getClient(clientId);
     
-    if (client.status !== 'connected' || !client.ws) {
-      throw new Error(`Client ${clientId} is not connected`);
-    }
-    
     try {
-      // Add clientId to message if not present
-      if (typeof message === 'object' && !message.clientId) {
-        message.clientId = clientId;
-      }
-      
-      // Send message
-      client.ws.send(JSON.stringify(message));
-      this.logger.debug(`Client ${clientId} sent message: ${message.type}`);
+      await client.connection.sendMessage(message);
     } catch (error) {
       this.logger.error(`Failed to send message for client ${clientId}: ${error}`);
       throw error;
@@ -339,46 +212,38 @@ export class WebSocketClientFactory {
   }
   
   /**
-   * Add a message handler for a client
-   * @param clientId The client ID
-   * @param handler The message handler function
+   * Register a handler for a specific message type
+   * @param messageType Message type to handle
+   * @param handler Handler function
    */
-  addMessageHandler(clientId: string, handler: MessageHandler): void {
-    const client = this.getClient(clientId);
-    client.messageHandlers.add(handler);
-  }
-  
-  /**
-   * Remove a message handler for a client
-   * @param clientId The client ID
-   * @param handler The message handler function to remove
-   */
-  removeMessageHandler(clientId: string, handler: MessageHandler): void {
-    const client = this.getClient(clientId);
-    client.messageHandlers.delete(handler);
+  registerMessageHandler(messageType: string, handler: (message: any) => boolean | Promise<boolean>): void {
+    messageDispatcher.registerHandler(messageType, handler);
+    this.logger.debug(`Registered handler for message type: ${messageType}`);
   }
   
   /**
    * Get the current LSN for a client
    * @param clientId The client ID
    * @returns The current LSN or null
+   * 
+   * NOTE: MessageDispatcher is the source of truth for LSN tracking.
+   * Connection layer is only consulted as fallback for backward compatibility.
    */
   getCurrentLSN(clientId: string): string | null {
-    const client = this.getClient(clientId);
-    return client.lsn;
-  }
-  
-  /**
-   * Update the LSN for a client
-   * @param clientId The client ID
-   * @param lsn The new LSN
-   */
-  updateLSN(clientId: string, lsn: string): void {
-    const client = this.getClient(clientId);
-    client.lsn = lsn;
+    // MessageDispatcher is the source of truth for LSN
+    const dispatcherLSN = messageDispatcher.getClientLSN(clientId);
+    if (dispatcherLSN) return dispatcherLSN;
     
-    // Also update the profile
-    this.profileManager.updateLSN(client.profileId, lsn);
+    // Fallback to connection's LSN only if not in MessageDispatcher
+    // This is for backward compatibility only
+    try {
+      const client = this.getClient(clientId);
+      return client.connection.getLSN();
+    } catch (error) {
+      // If client not found, return null
+      this.logger.warn(`Client ${clientId} not found when getting LSN`);
+      return null;
+    }
   }
   
   /**
@@ -386,9 +251,32 @@ export class WebSocketClientFactory {
    * @param clientId The client ID
    * @returns The client status
    */
-  getClientStatus(clientId: string): ClientStatus {
+  getClientStatus(clientId: string): ConnectionStatus {
     const client = this.getClient(clientId);
-    return client.status;
+    return client.connection.getStatus();
+  }
+  
+  /**
+   * Update the LSN for a client
+   * @param clientId The client ID 
+   * @param lsn The new LSN
+   * 
+   * NOTE: MessageDispatcher is the source of truth for LSN tracking.
+   * Connection layer is updated for backward compatibility only.
+   */
+  updateLSN(clientId: string, lsn: string): void {
+    // MessageDispatcher is the source of truth - update it first
+    // This also emits an event that will update profiles
+    messageDispatcher.updateClientLSN(clientId, lsn);
+    
+    // Update connection's LSN as well for backward compatibility
+    try {
+      const client = this.getClient(clientId);
+      client.connection.updateLSN(lsn);
+      this.logger.debug(`Updated LSN for client ${clientId} to ${lsn}`);
+    } catch (error) {
+      this.logger.warn(`Client ${clientId} not found when updating LSN, but MessageDispatcher was updated`);
+    }
   }
   
   /**
@@ -403,7 +291,7 @@ export class WebSocketClientFactory {
     const client = this.getClient(clientId);
     
     // Disconnect if connected
-    if (client.status === 'connected') {
+    if (client.connection.getStatus() === 'connected') {
       await this.disconnectClient(clientId);
     }
     
@@ -428,151 +316,6 @@ export class WebSocketClientFactory {
   }
   
   /**
-   * Start heartbeat for a client
-   * @param clientId The client ID
-   */
-  private startHeartbeat(clientId: string): void {
-    const client = this.getClient(clientId);
-    
-    // Clear any existing heartbeat interval
-    this.stopHeartbeat(clientId);
-    
-    const interval = setInterval(() => {
-      if (client.status !== 'connected' || !client.ws) {
-        this.stopHeartbeat(clientId);
-        return;
-      }
-      
-      try {
-        client.ws.send(JSON.stringify({
-          type: 'clt_heartbeat',
-          clientId,
-          timestamp: Date.now()
-        }));
-        
-        this.logger.debug(`Sent heartbeat for client ${clientId}`);
-      } catch (error) {
-        this.logger.error(`Error sending heartbeat for client ${clientId}: ${error}`);
-        this.stopHeartbeat(clientId);
-      }
-    }, WS_CONFIG.HEARTBEAT_INTERVAL);
-    
-    // Store the interval for future cleanup
-    this.heartbeatIntervals.set(clientId, interval);
-  }
-  
-  /**
-   * Stop heartbeat for a client
-   * @param clientId The client ID
-   */
-  private stopHeartbeat(clientId: string): void {
-    if (this.heartbeatIntervals.has(clientId)) {
-      clearInterval(this.heartbeatIntervals.get(clientId)!);
-      this.heartbeatIntervals.delete(clientId);
-      this.logger.debug(`Stopped heartbeat for client ${clientId}`);
-    }
-  }
-  
-  /**
-   * Remove all message handlers for a client
-   * @param clientId The client ID
-   */
-  removeAllMessageHandlers(clientId: string): void {
-    const client = this.getClient(clientId);
-    client.messageHandlers.clear();
-    this.logger.debug(`Removed all message handlers for client ${clientId}`);
-  }
-  
-  /**
-   * Process an incoming WebSocket message
-   * Uses MessageProcessor to handle different message types
-   */
-  private async processIncomingMessage(clientId: string, data: WebSocket.Data): Promise<any> {
-    try {
-      const rawMessage = JSON.parse(data.toString());
-      // Reduce verbosity - log at debug level instead of info
-      this.logger.debug(`Client ${clientId} received message type: ${rawMessage.type}`);
-      
-      // Add clientId to the message
-      rawMessage.clientId = clientId;
-      
-      // Process specific message types for local state updates
-      if (rawMessage.type.startsWith('srv_')) {
-        // Server messages
-        if (rawMessage.type === 'srv_live_changes' || rawMessage.type === 'srv_catchup_changes') {
-          // Process server changes message
-          const serverMessage = rawMessage as ServerChangesMessage;
-          
-          // Log more details for debugging
-          if (rawMessage.type === 'srv_catchup_changes') {
-            // Keep this as info since it's important state info
-            this.logger.info(`Catchup change received: chunk=${serverMessage.sequence?.chunk}/${serverMessage.sequence?.total}, changes=${serverMessage.changes?.length || 0}, LSN=${serverMessage.lastLSN || 'none'}`);
-          }
-          
-          // Update client's LSN if available
-          const client = this.getClient(clientId);
-          if (serverMessage.lastLSN) {
-            client.lsn = serverMessage.lastLSN;
-            this.profileManager.updateLSN(client.profileId, serverMessage.lastLSN);
-            this.logger.debug(`Updated LSN for client ${clientId} to ${serverMessage.lastLSN}`);
-          }
-          
-          // Process the changes for easier consumption by handlers
-          const processedChanges = this.messageProcessor.processTableChanges(
-            serverMessage.changes,
-            false // Don't log warnings
-          );
-          
-          // Augment the message with processed changes for handlers
-          rawMessage._processedChanges = processedChanges;
-        } else if (rawMessage.type === 'srv_catchup_completed') {
-          this.logger.info(`Catchup completed message received for client ${clientId}: ${JSON.stringify(rawMessage)}`);
-        }
-      }
-      
-      // Forward ALL messages to the central message dispatcher first
-      // IMPORTANT: Wait for the dispatch result before falling back to legacy handlers
-      let wasHandled = false;
-      try {
-        wasHandled = await messageDispatcher.dispatchMessage(rawMessage);
-        
-        if (wasHandled) {
-          // Reduce log level to debug
-          this.logger.debug(`Message ${rawMessage.type} was handled by central dispatcher`);
-        } else {
-          // Only log a warning for server messages that should be handled
-          if (rawMessage.type.startsWith('srv_')) {
-            this.logger.warn(`Message ${rawMessage.type} was NOT handled by any dispatcher handler`);
-          }
-        }
-      } catch (err) {
-        this.logger.error(`Error dispatching message: ${err}`);
-      }
-      
-      // Only call registered message handlers directly if not handled by the dispatcher
-      // IMPORTANT: This is for backward compatibility only
-      if (!wasHandled) {
-        const client = this.getClient(clientId);
-        if (client.messageHandlers.size > 0) {
-          this.logger.debug(`Forwarding message to ${client.messageHandlers.size} direct handlers (legacy)`);
-          client.messageHandlers.forEach(handler => {
-            try {
-              handler(rawMessage);
-            } catch (err) {
-              this.logger.error(`Error in message handler: ${err}`);
-            }
-          });
-        }
-      }
-      
-      return rawMessage;
-    } catch (err) {
-      this.logger.error(`Error processing message: ${err}`);
-      return null;
-    }
-  }
-  
-  /**
    * Send a client acknowledgment message for server changes
    * @param clientId The client ID
    * @param lsn The LSN to acknowledge
@@ -581,7 +324,7 @@ export class WebSocketClientFactory {
   async sendChangesAcknowledgment(clientId: string, lsn: string, messageId?: string): Promise<void> {
     const client = this.getClient(clientId);
     
-    if (client.status !== 'connected') {
+    if (client.connection.getStatus() !== 'connected') {
       throw new Error(`Client ${clientId} is not connected`);
     }
     
@@ -596,11 +339,10 @@ export class WebSocketClientFactory {
       lastLSN: lsn
     };
     
-    await this.sendMessage(clientId, message);
+    await client.connection.sendMessage(message);
     
-    // Update client's LSN state
-    client.lsn = lsn;
-    this.profileManager.updateLSN(client.profileId, lsn);
+    // Update LSN in central message dispatcher
+    messageDispatcher.updateClientLSN(clientId, lsn);
   }
   
   /**

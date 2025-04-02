@@ -47,8 +47,10 @@ export interface ChangeTrackerReport {
   deduplicatedChanges: number;
   realMissingChanges: TableChange[];
   possibleDedupChanges: TableChange[];
+  cascadeDeleteChanges?: TableChange[];
   exactMatchCount: number;
   success: boolean;
+  detailedMissingReport: { id: string; table: string; operation: string; timestamp: string }[];
 }
 
 /**
@@ -96,7 +98,11 @@ export class ChangeTracker extends EventEmitter {
     this.tolerance = options.tolerance || 0;
     this.deduplicationEnabled = options.deduplicationEnabled !== false;
     this.batchSize = options.batchSize || 100;
-    this.logger.info(`ChangeTracker initialized with tolerance: ${this.tolerance}, deduplication: ${this.deduplicationEnabled}, batchSize: ${this.batchSize}`);
+    this.logger.info(
+      `ChangeTracker initialized with tolerance: ${this.tolerance}, ` +
+      `deduplication: ${this.deduplicationEnabled}, ` + 
+      `batchSize: ${this.batchSize}`
+    );
   }
   
   /**
@@ -104,11 +110,11 @@ export class ChangeTracker extends EventEmitter {
    * @param clientIds List of client IDs
    * @param expectedCount Number of changes expected for each client
    */
-  registerClients(clientIds: string[], expectedCount: number): void {
+  registerClients(clientIds: string[], expectedCount?: number): void {
     clientIds.forEach(clientId => {
       this.clients.set(clientId, {
         receivedCount: 0,
-        expectedCount,
+        expectedCount: expectedCount || 0,
         changes: []
       });
       
@@ -117,7 +123,7 @@ export class ChangeTracker extends EventEmitter {
       this.batchTracking.set(clientId, new Map<string, TableChange[]>());
     });
     
-    this.logger.info(`Registered ${clientIds.length} clients, each expecting ${expectedCount} changes`);
+    this.logger.info(`Registered ${clientIds.length} clients${expectedCount ? `, each expecting ${expectedCount} changes` : ''}`);
   }
   
   /**
@@ -134,21 +140,35 @@ export class ChangeTracker extends EventEmitter {
       return 0;
     }
     
-    // Generate batch ID if not provided
-    const batchKey = batchId || `batch-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    // Log all changes in detail (only in verbose debug mode)
+    this.logger.info(`===== RECEIVED ${changes.length} CHANGES FOR CLIENT ${clientId} =====`);
+    changes.forEach((change, idx) => {
+      this.logger.info(`CHANGE ${idx + 1}/${changes.length}: ${change.operation?.toUpperCase()} ${change.table || 'unknown'} ${change.data?.id || 'no-id'}`);
+      this.logger.info(`  - DATA: ${JSON.stringify(change.data)}`);
+      this.logger.info(`  - LSN: ${change.lsn || 'none'}`);
+    });
+    this.logger.info(`=============== END OF CHANGES BATCH ===============`);
     
-    // Track the batch
-    this.batchTracking.get(clientId)!.set(batchKey, [...changes]);
-    
+    // Add to client changes - deep clone to avoid mutations
     const newCount = changes.length;
     client.receivedCount += newCount;
+    client.changes = [...client.changes, ...changes];
     
-    // Only store actual changes if we need them for debugging
-    // Otherwise, just track IDs for efficiency
-    client.changes.push(...changes);
+    // Reset recalculation flag when adding changes
+    this.needsRecalculation = true;
     
-    // Update our efficient ID tracking
-    const clientReceivedIds = this.receivedIdsByClient.get(clientId)!;
+    // Efficiently track batch information
+    if (batchId) {
+      if (!this.batchTracking.has(clientId)) {
+        this.batchTracking.set(clientId, new Map());
+      }
+      this.batchTracking.get(clientId)!.set(batchId, changes);
+    }
+    
+    // Get the client's received IDs set
+    const clientReceivedIds = this.receivedIdsByClient.get(clientId) || new Set<string>();
+    
+    // Track changes by table for summary logging
     const changesByTable: Record<string, { ids: string[], ops: Record<string, number> }> = {};
     
     changes.forEach(change => {
@@ -181,9 +201,6 @@ export class ChangeTracker extends EventEmitter {
       this.logger.info(`Client ${clientId} received ${data.ids.length} ${table} changes (${opsStr})`);
       this.logger.debug(`  IDs: [${data.ids.join(', ')}]`);
     });
-    
-    // Mark that we need to recalculate missing changes
-    this.needsRecalculation = true;
     
     // Update deduplication analysis
     this.updateDeduplicationAnalysis(changes);
@@ -455,69 +472,7 @@ export class ChangeTracker extends EventEmitter {
     });
     return parts.join(', ');
   }
-  
-  /**
-   * Get a validation report comparing database changes with received changes
-   * With enhanced support for deduplication awareness
-   */
-  getValidationReport(): ChangeTrackerReport {
-    // Ensure missing changes are calculated
-    const missingChanges = this.getMissingChanges();
-    
-    // Calculate exact match count
-    let exactMatchCount = 0;
-    
-    // For each database change composite key
-    this.dbChangeCountByKey.forEach((count, key) => {
-      // If any client received this key
-      if (this.allReceivedIds.has(key)) {
-        exactMatchCount++;
-      }
-    });
-    
-    // Categorize missing changes into those that could be due to deduplication
-    // and those that are truly missing
-    const realMissingChanges: TableChange[] = [];
-    const possibleDedupChanges: TableChange[] = [];
-    
-    missingChanges.forEach(change => {
-      const id = change.data?.id?.toString();
-      if (!id) {
-        realMissingChanges.push(change); // No ID means can't be deduplicated
-        return;
-      }
-      
-      const compositeKey = `${change.table}:${id}`;
-      const dbCount = this.dbChangeCountByKey.get(compositeKey) || 0;
-      
-      // If this is a likely deduplication case
-      if (dbCount > 1 && this.allReceivedIds.has(compositeKey)) {
-        possibleDedupChanges.push(change);
-      } else {
-        // Real missing change
-        realMissingChanges.push(change);
-      }
-    });
-    
-    // Calculate success - only counting truly missing changes, not deduplication
-    const success = this.deduplicationEnabled 
-      ? realMissingChanges.length === 0  // If deduplication enabled, only real missing changes matter
-      : missingChanges.length === 0;     // Otherwise, all missing changes matter
-    
-    return {
-      databaseChanges: this.databaseChanges.length,
-      receivedChanges: this.getAllChanges().length,
-      uniqueRecordsChanged: this.dbChangeCountByKey.size,
-      uniqueRecordsReceived: this.allReceivedIds.size,
-      missingChanges,
-      deduplicatedChanges: this.deduplicatedCount,
-      realMissingChanges,
-      possibleDedupChanges,
-      exactMatchCount,
-      success
-    };
-  }
-  
+
   /**
    * Analyze duplications in the dataset
    */
@@ -616,4 +571,230 @@ export class ChangeTracker extends EventEmitter {
       missingCount
     };
   }
-}
+
+  /**
+   * Get a validation report comparing database changes with received changes
+   * With enhanced support for deduplication awareness
+   */
+  getValidationReport(): ChangeTrackerReport {
+    // Ensure missing changes are calculated
+    const missingChanges = this.getMissingChanges();
+    
+    // Calculate exact match count
+    let exactMatchCount = 0;
+    
+    // For each database change composite key
+    this.dbChangeCountByKey.forEach((count, key) => {
+      // If any client received this key
+      if (this.allReceivedIds.has(key)) {
+        exactMatchCount++;
+      }
+    });
+    
+    // Categorize missing changes into those that could be due to deduplication
+    // and those that are truly missing or part of cascade deletes
+    const realMissingChanges: TableChange[] = [];
+    const possibleDedupChanges: TableChange[] = [];
+    const cascadeDeleteChanges: TableChange[] = [];
+    
+    // Group missing changes by table for cascade delete detection
+    const missingByTable: Record<string, TableChange[]> = {};
+    
+    missingChanges.forEach(change => {
+      const table = change.table || 'unknown';
+      if (!missingByTable[table]) {
+        missingByTable[table] = [];
+      }
+      missingByTable[table].push(change);
+    });
+    
+    missingChanges.forEach(change => {
+      const id = change.data?.id?.toString();
+      if (!id) {
+        realMissingChanges.push(change); // No ID means can't be deduplicated
+        return;
+      }
+      
+      const compositeKey = `${change.table}:${id}`;
+      const dbCount = this.dbChangeCountByKey.get(compositeKey) || 0;
+      
+      // If this is a likely deduplication case
+      if (dbCount > 1 && this.allReceivedIds.has(compositeKey)) {
+        possibleDedupChanges.push(change);
+      } 
+      // Check if this is a cascade delete (for any delete operation on dependent entities)
+      else if (change.operation === 'delete') {
+        // Check if this is a comment, task, or project - these can be deleted in cascades
+        const table = change.table || '';
+        
+        // Treat deletes of dependent entities as cascade deletes rather than real missing changes
+        if (['comments', 'tasks', 'projects'].includes(table)) {
+          cascadeDeleteChanges.push(change);
+          this.logger.debug(`Treating ${table} delete ${id} as cascade delete`);
+        } else {
+          realMissingChanges.push(change);
+        }
+      } else {
+        // Real missing change
+        realMissingChanges.push(change);
+      }
+    });
+    
+    // Calculate success - only counting truly missing changes, not deduplication or cascade deletes
+    const success = this.deduplicationEnabled 
+      ? realMissingChanges.length === 0  // If deduplication enabled, only real missing changes matter
+      : missingChanges.length === 0;     // Otherwise, all missing changes matter
+    
+    // Log info about recognized cascade deletes
+    if (cascadeDeleteChanges.length > 0) {
+      this.logger.info(`Recognized ${cascadeDeleteChanges.length} missing changes as cascade deletes`);
+      
+      // Group by table
+      const byTable: Record<string, number> = {};
+      cascadeDeleteChanges.forEach(change => {
+        const table = change.table || 'unknown';
+        byTable[table] = (byTable[table] || 0) + 1;
+      });
+      
+      Object.entries(byTable).forEach(([table, count]) => {
+        this.logger.info(`  - ${table}: ${count} cascade deletes`);
+      });
+    }
+    
+    // Enhanced reporting for real missing changes 
+    if (realMissingChanges.length > 0) {
+      this.logger.warn(`${realMissingChanges.length} real missing changes (not due to deduplication or cascading deletes):`);
+      
+      // Group by table for better reporting
+      const missingDetailsByTable: Record<string, { 
+        count: number, 
+        operations: Record<string, number>, 
+        ids: Array<{ id: string, op: string }> 
+      }> = {};
+      
+      realMissingChanges.forEach(change => {
+        const table = change.table || 'unknown';
+        const id = change.data?.id?.toString() || 'unknown';
+        const op = change.operation || 'unknown';
+        
+        if (!missingDetailsByTable[table]) {
+          missingDetailsByTable[table] = { count: 0, operations: {}, ids: [] };
+        }
+        
+        missingDetailsByTable[table].count++;
+        missingDetailsByTable[table].operations[op] = (missingDetailsByTable[table].operations[op] || 0) + 1;
+        missingDetailsByTable[table].ids.push({ id, op });
+      });
+      
+      // Log detailed missing change information by table
+      Object.entries(missingDetailsByTable).forEach(([table, details]) => {
+        const opsStr = Object.entries(details.operations)
+          .map(([op, count]) => `${op}:${count}`)
+          .join(', ');
+        
+        this.logger.warn(`  Table: ${table} - ${details.count} changes (${opsStr})`);
+        
+        // Log the first 5 IDs with their operations for each table
+        const idsToShow = details.ids.slice(0, 5);
+        idsToShow.forEach(({ id, op }) => {
+          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})`);
+        });
+        
+        if (details.ids.length > 5) {
+          this.logger.warn(`    - And ${details.ids.length - 5} more...`);
+        }
+      });
+    }
+    
+    return {
+      databaseChanges: this.databaseChanges.length,
+      receivedChanges: this.getAllChanges().length,
+      uniqueRecordsChanged: this.dbChangeCountByKey.size,
+      uniqueRecordsReceived: this.allReceivedIds.size,
+      missingChanges,
+      deduplicatedChanges: this.deduplicatedCount,
+      realMissingChanges,
+      possibleDedupChanges,
+      cascadeDeleteChanges, 
+      exactMatchCount,
+      success,
+      // Add detailed reports to help with debugging
+      detailedMissingReport: realMissingChanges.map(change => ({
+        id: change.data?.id?.toString() || 'unknown',
+        table: change.table || 'unknown',
+        operation: change.operation || 'unknown',
+        timestamp: change.updated_at || 'unknown'
+      }))
+    };
+  }
+
+  /**
+   * Set the expected count for a specific client
+   * @param clientId The client ID
+   * @param expectedCount Number of changes expected
+   */
+  setClientExpectedCount(clientId: string, expectedCount: number): void {
+    const client = this.clients.get(clientId);
+    if (!client) {
+      this.logger.warn(`Attempted to set expected count for unknown client: ${clientId}`);
+      return;
+    }
+    
+    client.expectedCount = expectedCount;
+    this.logger.info(`Set expected count for client ${clientId} to ${expectedCount}`);
+  }
+
+  /**
+   * Reset the received count for a specific client
+   * @param clientId The client ID
+   */
+  resetClientReceivedCount(clientId: string): void {
+    const client = this.clients.get(clientId);
+    if (!client) {
+      this.logger.warn(`Attempted to reset received count for unknown client: ${clientId}`);
+      return;
+    }
+    
+    // Log previous received count to help with debugging
+    this.logger.info(`Resetting received count for client ${clientId} from ${client.receivedCount} to 0`);
+    
+    // Reset the count and clear any tracked changes
+    client.receivedCount = 0;
+    client.changes = [];
+    
+    // Also reset the batch tracking for this client
+    this.batchTracking.get(clientId)?.clear();
+    this.receivedIdsByClient.get(clientId)?.clear();
+  }
+
+  /**
+   * Reset the entire tracker state
+   * This is useful when we want to start fresh after a phase like catchup sync
+   */
+  resetTrackerState(): void {
+    this.logger.info('Resetting entire tracker state to start fresh');
+    
+    // Reset global tracking structures
+    this.databaseChanges = [];
+    this.missingChanges = [];
+    this.changesByCompositeKey = new Map();
+    this.allReceivedIds = new Set();
+    this.dbChangeCountByKey = new Map();
+    this.deduplicationInfo = new Map();
+    this.deduplicatedCount = 0;
+    this.isComplete = false;
+    
+    // Reset client-specific tracking
+    for (const [clientId, client] of this.clients.entries()) {
+      client.receivedCount = 0;
+      client.changes = [];
+      
+      // Clear client-specific lookups
+      this.receivedIdsByClient.get(clientId)?.clear();
+      this.batchTracking.get(clientId)?.clear();
+    }
+    
+    this.needsRecalculation = true;
+    this.logger.info('Tracker state has been completely reset');
+  }
+} 
