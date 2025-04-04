@@ -257,6 +257,24 @@ export class WebSocketClientFactory {
   }
   
   /**
+   * Check if a client connection was hibernated
+   * @param clientId The client ID
+   * @returns True if hibernation was detected
+   */
+  wasClientHibernated(clientId: string): boolean {
+    // Always return false since we're not tracking hibernation anymore
+    return false;
+  }
+  
+  /**
+   * Reset hibernation state for a client
+   * @param clientId The client ID
+   */
+  resetClientHibernationState(clientId: string): void {
+    // No-op since we're not tracking hibernation anymore
+  }
+  
+  /**
    * Update the LSN for a client
    * @param clientId The client ID 
    * @param lsn The new LSN

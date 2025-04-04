@@ -226,6 +226,7 @@ export class ScenarioRunner extends EventEmitter {
             generateChanges: entityChanges.generateChanges.bind(entityChanges),
             convertToTableChanges: entityChanges.convertToTableChanges.bind(entityChanges),
             applyBatchChanges: entityChanges.applyBatchChanges.bind(entityChanges),
+            applyChangesInBatches: entityChanges.applyChangesInBatches.bind(entityChanges),
             generateAndApplyChanges: entityChanges.generateAndApplyChanges.bind(entityChanges),
             createChangeTracker: entityChanges.createChangeTracker.bind(entityChanges),
             generateAndTrackChanges: entityChanges.generateAndTrackChanges.bind(entityChanges),

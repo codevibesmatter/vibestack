@@ -48,7 +48,8 @@ export interface ChangeTrackerReport {
   realMissingChanges: TableChange[];
   possibleDedupChanges: TableChange[];
   cascadeDeleteChanges?: TableChange[];
-  exactMatchCount: number;
+  extraChangesCount: number;
+  extraChanges: TableChange[];
   success: boolean;
   detailedMissingReport: { id: string; table: string; operation: string; timestamp: string }[];
 }
@@ -81,8 +82,13 @@ export class ChangeTracker extends EventEmitter {
   private allReceivedIds = new Set<string>();
   private dbChangeCountByKey = new Map<string, number>();
   
+  // Track last change time for each client
+  private lastChangeTimeByClient = new Map<string, number>();
+  
   // Batch tracking
   private batchTracking = new Map<string, Map<string, TableChange[]>>();
+  // Track database changes by origin batch for missing change analysis
+  private dbChangesByOriginBatch = new Map<string, Set<string>>();
   private needsRecalculation = true;
   
   // Deduplication tracking
@@ -140,19 +146,40 @@ export class ChangeTracker extends EventEmitter {
       return 0;
     }
     
-    // Log all changes in detail (only in verbose debug mode)
+    // Log summary instead of all changes in detail
     this.logger.info(`===== RECEIVED ${changes.length} CHANGES FOR CLIENT ${clientId} =====`);
-    changes.forEach((change, idx) => {
-      this.logger.info(`CHANGE ${idx + 1}/${changes.length}: ${change.operation?.toUpperCase()} ${change.table || 'unknown'} ${change.data?.id || 'no-id'}`);
-      this.logger.info(`  - DATA: ${JSON.stringify(change.data)}`);
-      this.logger.info(`  - LSN: ${change.lsn || 'none'}`);
+    
+    // Instead of logging every single change, just summarize by type and operation
+    const changesByTypeAndOp: Record<string, Record<string, number>> = {};
+    
+    changes.forEach(change => {
+      const table = change.table || 'unknown';
+      const op = change.operation || 'unknown';
+      
+      if (!changesByTypeAndOp[table]) {
+        changesByTypeAndOp[table] = {};
+      }
+      
+      changesByTypeAndOp[table][op] = (changesByTypeAndOp[table][op] || 0) + 1;
     });
+    
+    // Log the summary
+    Object.entries(changesByTypeAndOp).forEach(([table, ops]) => {
+      const opsStr = Object.entries(ops)
+        .map(([op, count]) => `${op}:${count}`)
+        .join(', ');
+      this.logger.info(`  - ${table}: ${opsStr}`);
+    });
+    
     this.logger.info(`=============== END OF CHANGES BATCH ===============`);
     
     // Add to client changes - deep clone to avoid mutations
     const newCount = changes.length;
     client.receivedCount += newCount;
     client.changes = [...client.changes, ...changes];
+    
+    // Update last change time for this client
+    this.lastChangeTimeByClient.set(clientId, Date.now());
     
     // Reset recalculation flag when adding changes
     this.needsRecalculation = true;
@@ -192,14 +219,14 @@ export class ChangeTracker extends EventEmitter {
       changesByTable[table].ops[op] = (changesByTable[table].ops[op] || 0) + 1;
     });
     
-    // Log the changes organized by table
+    // Log the changes organized by table (just counts, not IDs)
     Object.entries(changesByTable).forEach(([table, data]) => {
       const opsStr = Object.entries(data.ops)
         .map(([op, count]) => `${op}:${count}`)
         .join(', ');
       
       this.logger.info(`Client ${clientId} received ${data.ids.length} ${table} changes (${opsStr})`);
-      this.logger.debug(`  IDs: [${data.ids.join(', ')}]`);
+      // Don't log all IDs - too verbose
     });
     
     // Update deduplication analysis
@@ -216,10 +243,29 @@ export class ChangeTracker extends EventEmitter {
   /**
    * Track database changes (the source of truth)
    * @param changes Database changes to track
+   * @param originBatch Optional origin batch identifier for tracing missing changes
    */
-  trackDatabaseChanges(changes: TableChange[]): void {
+  trackDatabaseChanges(changes: TableChange[], originBatch?: string): void {
     this.databaseChanges = [...changes];
     this.needsRecalculation = true;
+    
+    // Track origin batch if provided
+    if (originBatch) {
+      if (!this.dbChangesByOriginBatch.has(originBatch)) {
+        this.dbChangesByOriginBatch.set(originBatch, new Set<string>());
+      }
+      
+      // Register each change with this batch
+      changes.forEach(change => {
+        const id = change.data?.id?.toString();
+        if (!id) return;
+        
+        const key = `${change.table}:${id}:${change.operation}`;
+        this.dbChangesByOriginBatch.get(originBatch)?.add(key);
+      });
+      
+      this.logger.info(`Tracked ${changes.length} database changes from batch ${originBatch}`);
+    }
     
     // Build efficient lookup structures for database changes
     changes.forEach(change => {
@@ -415,6 +461,7 @@ export class ChangeTracker extends EventEmitter {
     let allComplete = true;
     let totalExpected = 0;
     let totalReceived = 0;
+    let incompleteClients: string[] = [];
     
     // Check each client's progress
     this.clients.forEach((client, clientId) => {
@@ -429,6 +476,10 @@ export class ChangeTracker extends EventEmitter {
       // Only set all complete if every client is complete
       allComplete = allComplete && clientComplete;
       
+      if (!clientComplete) {
+        incompleteClients.push(clientId);
+      }
+      
       totalExpected += client.expectedCount;
       totalReceived += client.receivedCount;
     });
@@ -436,6 +487,19 @@ export class ChangeTracker extends EventEmitter {
     // Log summary of progress
     this.logger.info(`Progress: ${totalReceived}/${totalExpected} changes received, ` + 
       `deduplication: ${this.deduplicationEnabled ? `enabled (${this.deduplicatedCount} dups)` : 'disabled'}`);
+    
+    if (incompleteClients.length > 0) {
+      this.logger.info(`Waiting for ${incompleteClients.length} clients to complete: ${incompleteClients.map(id => id.substring(0, 8)).join(', ')}`);
+      const progressDetails = incompleteClients.map(id => {
+        const client = this.clients.get(id);
+        if (!client) return `${id.substring(0, 8)}: unknown`;
+        const adjustedExpected = this.deduplicationEnabled
+          ? Math.max(1, client.expectedCount - this.deduplicatedCount)
+          : client.expectedCount;
+        return `${id.substring(0, 8)}: ${client.receivedCount}/${adjustedExpected}`;
+      });
+      this.logger.debug(`Client progress details: ${progressDetails.join(', ')}`);
+    }
     
     // If all clients are now complete but weren't before
     if (allComplete && !this.isComplete) {
@@ -545,6 +609,7 @@ export class ChangeTracker extends EventEmitter {
     expectedChanges: number;
     percentComplete: number;
     missingCount: number;
+    extraCount: number;
   } {
     // Calculate totals
     let totalReceived = 0;
@@ -561,14 +626,22 @@ export class ChangeTracker extends EventEmitter {
       ? Math.round((totalReceived / totalExpected) * 100) 
       : 0;
     
-    // Calculate missing
-    const missingCount = Math.max(0, totalExpected - totalReceived);
+    // Calculate missing changes (always positive)
+    const missingCount = totalExpected > totalReceived 
+      ? totalExpected - totalReceived 
+      : 0;
+      
+    // Calculate extra changes (always positive)
+    const extraCount = totalReceived > totalExpected 
+      ? totalReceived - totalExpected 
+      : 0;
     
     return {
       receivedChanges: totalReceived,
       expectedChanges: totalExpected,
       percentComplete,
-      missingCount
+      missingCount,
+      extraCount
     };
   }
 
@@ -580,16 +653,8 @@ export class ChangeTracker extends EventEmitter {
     // Ensure missing changes are calculated
     const missingChanges = this.getMissingChanges();
     
-    // Calculate exact match count
-    let exactMatchCount = 0;
-    
-    // For each database change composite key
-    this.dbChangeCountByKey.forEach((count, key) => {
-      // If any client received this key
-      if (this.allReceivedIds.has(key)) {
-        exactMatchCount++;
-      }
-    });
+    // Identify extra changes (received but not in database changes)
+    const extraChanges: TableChange[] = this.identifyExtraChanges();
     
     // Categorize missing changes into those that could be due to deduplication
     // and those that are truly missing or part of cascade deletes
@@ -669,13 +734,15 @@ export class ChangeTracker extends EventEmitter {
       const missingDetailsByTable: Record<string, { 
         count: number, 
         operations: Record<string, number>, 
-        ids: Array<{ id: string, op: string }> 
+        ids: Array<{ id: string, op: string, lsn?: string, timestamp?: string }> 
       }> = {};
       
       realMissingChanges.forEach(change => {
         const table = change.table || 'unknown';
         const id = change.data?.id?.toString() || 'unknown';
         const op = change.operation || 'unknown';
+        const lsn = change.lsn?.toString() || undefined;
+        const timestamp = change.updated_at || undefined;
         
         if (!missingDetailsByTable[table]) {
           missingDetailsByTable[table] = { count: 0, operations: {}, ids: [] };
@@ -683,7 +750,7 @@ export class ChangeTracker extends EventEmitter {
         
         missingDetailsByTable[table].count++;
         missingDetailsByTable[table].operations[op] = (missingDetailsByTable[table].operations[op] || 0) + 1;
-        missingDetailsByTable[table].ids.push({ id, op });
+        missingDetailsByTable[table].ids.push({ id, op, lsn, timestamp });
       });
       
       // Log detailed missing change information by table
@@ -694,16 +761,105 @@ export class ChangeTracker extends EventEmitter {
         
         this.logger.warn(`  Table: ${table} - ${details.count} changes (${opsStr})`);
         
-        // Log the first 5 IDs with their operations for each table
+        // Log the first 5 IDs with their operations for each table and additional metadata
         const idsToShow = details.ids.slice(0, 5);
-        idsToShow.forEach(({ id, op }) => {
-          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})`);
+        idsToShow.forEach(({ id, op, lsn, timestamp }) => {
+          const metaInfo = [];
+          if (lsn) metaInfo.push(`lsn=${lsn}`);
+          if (timestamp) metaInfo.push(`time=${timestamp}`);
+          
+          const metaString = metaInfo.length > 0 ? ` (${metaInfo.join(', ')})` : '';
+          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})${metaString}`);
         });
         
         if (details.ids.length > 5) {
           this.logger.warn(`    - And ${details.ids.length - 5} more...`);
         }
       });
+      
+      // Add a detailed batch history section for the missing changes
+      this.logger.warn(`===== DETAILED BATCH HISTORY FOR MISSING CHANGES =====`);
+      const batchHistory = this.getChangesBatchHistory(realMissingChanges);
+      
+      if (Object.keys(batchHistory).length === 0) {
+        this.logger.warn(`  No batch history found for missing changes`);
+      } else {
+        Object.entries(batchHistory).forEach(([changeId, batches]) => {
+          const [table, id, op] = changeId.split(':');
+          this.logger.warn(`  ${table} ${op} ${id.substring(0, 8)}... : ${batches.join(', ')}`);
+        });
+      }
+      this.logger.warn(`===== END OF BATCH HISTORY REPORT =====`);
+    }
+    
+    // Calculate extra changes count
+    const stats = this.getCompletionStats();
+    const extraChangesCount = stats.extraCount;
+    
+    // Enhanced reporting for extra changes 
+    if (extraChanges.length > 0) {
+      this.logger.warn(`${extraChanges.length} extra changes received (not in database changes):`);
+      
+      // Group by table for better reporting
+      const extraDetailsByTable: Record<string, { 
+        count: number, 
+        operations: Record<string, number>, 
+        ids: Array<{ id: string, op: string, lsn?: string, timestamp?: string }> 
+      }> = {};
+      
+      extraChanges.forEach(change => {
+        const table = change.table || 'unknown';
+        const id = change.data?.id?.toString() || 'unknown';
+        const op = change.operation || 'unknown';
+        const lsn = change.lsn?.toString() || undefined;
+        const timestamp = change.updated_at || undefined;
+        
+        if (!extraDetailsByTable[table]) {
+          extraDetailsByTable[table] = { count: 0, operations: {}, ids: [] };
+        }
+        
+        extraDetailsByTable[table].count++;
+        extraDetailsByTable[table].operations[op] = (extraDetailsByTable[table].operations[op] || 0) + 1;
+        extraDetailsByTable[table].ids.push({ id, op, lsn, timestamp });
+      });
+      
+      // Log detailed extra change information by table
+      Object.entries(extraDetailsByTable).forEach(([table, details]) => {
+        const opsStr = Object.entries(details.operations)
+          .map(([op, count]) => `${op}:${count}`)
+          .join(', ');
+        
+        this.logger.warn(`  Table: ${table} - ${details.count} extra changes (${opsStr})`);
+        
+        // Log the first 5 IDs with their operations for each table and additional metadata
+        const idsToShow = details.ids.slice(0, 5);
+        idsToShow.forEach(({ id, op, lsn, timestamp }) => {
+          const metaInfo = [];
+          if (lsn) metaInfo.push(`lsn=${lsn}`);
+          if (timestamp) metaInfo.push(`time=${timestamp}`);
+          
+          const metaString = metaInfo.length > 0 ? ` (${metaInfo.join(', ')})` : '';
+          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})${metaString}`);
+        });
+        
+        if (details.ids.length > 5) {
+          this.logger.warn(`    - And ${details.ids.length - 5} more...`);
+        }
+      });
+      
+      // Add a detailed batch history section for the extra changes
+      this.logger.warn(`===== DETAILED BATCH HISTORY FOR EXTRA CHANGES =====`);
+      const batchHistory = this.getChangesBatchHistory(extraChanges);
+      
+      if (Object.keys(batchHistory).length === 0) {
+        this.logger.warn(`  No batch history found for extra changes`);
+      } else {
+        Object.entries(batchHistory).forEach(([changeId, batches]) => {
+          const [table, id, op] = changeId.split(':');
+          this.logger.warn(`  ${table} ${op} ${id.substring(0, 8)}... : ${batches.join(', ')}`);
+        });
+      }
+      this.logger.warn(`===== END OF BATCH HISTORY REPORT =====`);
     }
     
     return {
@@ -715,8 +871,9 @@ export class ChangeTracker extends EventEmitter {
       deduplicatedChanges: this.deduplicatedCount,
       realMissingChanges,
       possibleDedupChanges,
-      cascadeDeleteChanges, 
-      exactMatchCount,
+      cascadeDeleteChanges,
+      extraChangesCount,
+      extraChanges,
       success,
       // Add detailed reports to help with debugging
       detailedMissingReport: realMissingChanges.map(change => ({
@@ -726,6 +883,41 @@ export class ChangeTracker extends EventEmitter {
         timestamp: change.updated_at || 'unknown'
       }))
     };
+  }
+
+  /**
+   * Identify changes that were received but not in the database changes
+   * @returns Array of extra changes
+   */
+  private identifyExtraChanges(): TableChange[] {
+    const extraChanges: TableChange[] = [];
+    
+    // Create a lookup set for all database changes
+    const dbChangeKeys = new Set<string>();
+    this.databaseChanges.forEach(dbChange => {
+      const id = dbChange.data?.id?.toString();
+      if (!id) return;
+      
+      const key = `${dbChange.table}:${id}:${dbChange.operation}`;
+      dbChangeKeys.add(key);
+    });
+    
+    // Check all received changes to see if they're in the db changes
+    this.clients.forEach(client => {
+      client.changes.forEach(change => {
+        const id = change.data?.id?.toString();
+        if (!id) return;
+        
+        const key = `${change.table}:${id}:${change.operation}`;
+        
+        // If this change wasn't in the database changes, it's extra
+        if (!dbChangeKeys.has(key)) {
+          extraChanges.push(change);
+        }
+      });
+    });
+    
+    return extraChanges;
   }
 
   /**
@@ -755,16 +947,26 @@ export class ChangeTracker extends EventEmitter {
       return;
     }
     
-    // Log previous received count to help with debugging
-    this.logger.info(`Resetting received count for client ${clientId} from ${client.receivedCount} to 0`);
-    
-    // Reset the count and clear any tracked changes
+    // Reset count and received changes list
     client.receivedCount = 0;
     client.changes = [];
     
-    // Also reset the batch tracking for this client
-    this.batchTracking.get(clientId)?.clear();
-    this.receivedIdsByClient.get(clientId)?.clear();
+    // Reset received IDs set
+    const clientReceivedIds = this.receivedIdsByClient.get(clientId);
+    if (clientReceivedIds) {
+      clientReceivedIds.clear();
+    }
+    
+    // Reset last change time
+    this.lastChangeTimeByClient.delete(clientId);
+    
+    this.logger.info(`Reset received count and change history for client ${clientId}`);
+    
+    // Reset completion status
+    this.isComplete = false;
+    
+    // Force recalculation of missing changes
+    this.needsRecalculation = true;
   }
 
   /**
@@ -796,5 +998,81 @@ export class ChangeTracker extends EventEmitter {
     
     this.needsRecalculation = true;
     this.logger.info('Tracker state has been completely reset');
+  }
+
+  /**
+   * Get the timestamp of when a client last received changes
+   * @param clientId The client ID
+   * @returns Timestamp in milliseconds, or undefined if no changes received
+   */
+  getClientLastChangeTime(clientId: string): number | undefined {
+    return this.lastChangeTimeByClient.get(clientId);
+  }
+
+  /**
+   * Get batch history for a set of changes
+   * @param changes The changes to get batch history for
+   * @returns An object mapping change identifiers to batch IDs
+   */
+  getChangesBatchHistory(changes: TableChange[]): Record<string, string[]> {
+    const batchHistory: Record<string, string[]> = {};
+    
+    // Generate composite keys for each change
+    changes.forEach(change => {
+      const id = change.data?.id?.toString();
+      if (!id) return;
+      
+      const compositeKey = `${change.table}:${id}:${change.operation}`;
+      
+      // Check if this is a received change in any batch
+      let foundInReceivedBatches = false;
+      
+      // Check all batches for this change
+      this.batchTracking.forEach((batchMap, clientId) => {
+        batchMap.forEach((batchChanges, batchId) => {
+          // Look for this change in the batch
+          const found = batchChanges.some(batchChange => {
+            const batchChangeId = batchChange.data?.id?.toString();
+            return batchChangeId === id && 
+                   batchChange.table === change.table && 
+                   batchChange.operation === change.operation;
+          });
+          
+          if (found) {
+            foundInReceivedBatches = true;
+            if (!batchHistory[compositeKey]) {
+              batchHistory[compositeKey] = [];
+            }
+            batchHistory[compositeKey].push(`${clientId.substring(0, 8)}:${batchId}`);
+          }
+        });
+      });
+      
+      // If not found in any received batch, check origin batches for truly missing changes
+      if (!foundInReceivedBatches) {
+        // Find origin batch(es) for this change
+        this.dbChangesByOriginBatch.forEach((changeSet, batchId) => {
+          if (changeSet.has(compositeKey)) {
+            if (!batchHistory[compositeKey]) {
+              batchHistory[compositeKey] = [];
+            }
+            batchHistory[compositeKey].push(`origin:${batchId}`);
+          }
+        });
+      }
+    });
+    
+    return batchHistory;
+  }
+
+  // Add a helper method to track database changes with batch info
+  /**
+   * Track database changes from a specific batch
+   * @param changes The changes to track
+   * @param batchId Identifier of the batch these changes were generated in
+   */
+  trackDatabaseChangesWithBatch(changes: TableChange[], batchId: string): void {
+    // First track the changes normally
+    this.trackDatabaseChanges(changes, batchId);
   }
 } 

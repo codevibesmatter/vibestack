@@ -30,18 +30,32 @@ export function compareLSN(lsn1: string, lsn2: string): number {
  * Deduplicate changes by keeping only the latest change for each record
  * Uses last-write-wins based on updated_at timestamp
  * Also optimizes insert+update sequences into a single insert with latest data
+ * @returns Object containing deduplicated changes and info about skipped changes
  */
-export function deduplicateChanges(changes: TableChange[]): TableChange[] {
+export function deduplicateChanges(changes: TableChange[]): {
+  changes: TableChange[];
+  skipped: {
+    missingId: TableChange[];
+    outdated: TableChange[];
+  };
+} {
   // Process into a map with the latest change for each record id
   const latestChanges = new Map<string, TableChange>();
   
   // Also track which tables+ids have inserts (for optimization)
   const insertMap = new Map<string, TableChange>();
+  
+  // Track skipped changes for diagnostics
+  const skipped = {
+    missingId: [] as TableChange[],
+    outdated: [] as TableChange[]
+  };
 
   // First pass - find the latest change for each record
   for (const change of changes) {
-    // Skip if no id in the change data
+    // Track changes skipped due to missing id
     if (!change.data?.id) {
+      skipped.missingId.push(change);
       continue;
     }
 
@@ -55,7 +69,14 @@ export function deduplicateChanges(changes: TableChange[]): TableChange[] {
     
     // Keep change if no existing one, or if this one is newer
     if (!existing || new Date(change.updated_at) >= new Date(existing.updated_at)) {
+      // If we're replacing an existing change, track it as outdated
+      if (existing) {
+        skipped.outdated.push(existing);
+      }
       latestChanges.set(key, change);
+    } else {
+      // This change is outdated compared to what we already have
+      skipped.outdated.push(change);
     }
   }
   
@@ -95,7 +116,12 @@ export function deduplicateChanges(changes: TableChange[]): TableChange[] {
   }
 
   // Sort changes by LSN for consistency
-  return orderChangesByDomain(result.sort((a, b) => compareLSN(a.lsn!, b.lsn!)));
+  const orderedChanges = orderChangesByDomain(result.sort((a, b) => compareLSN(a.lsn!, b.lsn!)));
+  
+  return {
+    changes: orderedChanges,
+    skipped
+  };
 }
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;

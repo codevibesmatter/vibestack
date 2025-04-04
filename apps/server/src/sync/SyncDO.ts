@@ -68,6 +68,7 @@ function isValidLSN(lsn: string): boolean {
 export class SyncDO implements DurableObject, WebSocketHandler {
   private state: DurableObjectState;
   private env: Env;
+  private ctx: DurableObjectState;
   private webSocket: WebSocket | null = null;
   private stateManager: SyncStateManager;
   private clientId: string = '';
@@ -79,10 +80,12 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     reject: (error: Error) => void,
     timer: NodeJS.Timeout | null
   }> = new Map();
+  private isHandlerRegistered: boolean = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    this.ctx = state;
     
     // Create context for state manager
     const context: MinimalContext = {
@@ -97,6 +100,21 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     this.stateManager = new SyncStateManager(context, state as any);
     this.syncId = state.id.toString();
     
+    // We no longer register handlers in the constructor
+    // to prevent duplicate registrations when DO wakes from hibernation
+  }
+
+  /**
+   * Register message handlers only once
+   */
+  private registerMessageHandlers(): void {
+    if (this.isHandlerRegistered) {
+      syncLogger.debug('Message handlers already registered, skipping', {
+        clientId: this.clientId,
+      }, MODULE_NAME);
+      return;
+    }
+
     // Register message handler for client changes
     this.onMessage('clt_send_changes', async (message: ClientMessage) => {
       syncLogger.info('Received client changes', {
@@ -117,6 +135,25 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         }, MODULE_NAME);
       }
     });
+
+    // Add handler for catchup acknowledgments to update client LSN
+    this.onMessage('clt_catchup_received', async (message: ClientMessage) => {
+      // Cast to any to access the lsn property which is specific to this message type
+      const catchupMessage = message as any;
+      if (catchupMessage.lsn) {
+        // Update the state manager with the LSN from each acknowledgment
+        await this.stateManager.updateClientLSN(catchupMessage.clientId || this.clientId, catchupMessage.lsn);
+        syncLogger.debug('Updated client LSN from catchup acknowledgment', {
+          clientId: catchupMessage.clientId || this.clientId,
+          lsn: catchupMessage.lsn
+        }, MODULE_NAME);
+      }
+    });
+
+    this.isHandlerRegistered = true;
+    syncLogger.info('Message handlers registered', {
+      clientId: this.clientId,
+    }, MODULE_NAME);
   }
 
   /**
@@ -208,9 +245,12 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     this.webSocket = server;
     this.clientId = clientId;
 
-    // Configure WebSocket
-    server.accept();
+    // Configure WebSocket with hibernation API
+    this.ctx.acceptWebSocket(server);
     this.setupWebSocketEventHandlers(server);
+    
+    // Register message handlers only once per clientId
+    this.registerMessageHandlers();
     
     // Store the client LSN for use after connection is established
     const finalClientId = clientId;
@@ -250,49 +290,21 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    * Set up WebSocket event handlers
    */
   private setupWebSocketEventHandlers(ws: WebSocket): void {
-    ws.addEventListener('message', async (event) => {
-      await this.handleWebSocketMessage(event);
-    });
+    // When using hibernation API, we don't need event listeners here
+    // Event handling will be done via the webSocketMessage, webSocketClose, etc. methods
     
-    ws.addEventListener('close', (event) => {
-      syncLogger.info('WebSocket closed', {
-        clientId: this.clientId,
-        code: event.code,
-        reason: event.reason
-      }, MODULE_NAME);
-      
-      // Mark client as inactive when connection closes
-      this.state.waitUntil(
-        (async () => {
-          try {
-            await this.stateManager.cleanupConnection();
-          } catch (error) {
-            syncLogger.error('Connection cleanup failed', {
-              clientId: this.clientId,
-              error: error instanceof Error ? error.message : String(error)
-            }, MODULE_NAME);
-          }
-        })()
-      );
-      
-      this.webSocket = null;
-    });
-    
-    ws.addEventListener('error', (event) => {
-      syncLogger.error('WebSocket error', {
-        clientId: this.clientId
-      }, MODULE_NAME);
-      
-      this.webSocket = null;
-    });
+    // Keep track of active WebSocket for sending methods
+    this.webSocket = ws;
   }
   
   /**
-   * Handle incoming WebSocket messages
+   * WebSocket message handler for hibernation API
    */
-  private async handleWebSocketMessage(event: MessageEvent): Promise<void> {
+  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
     try {
-      const message = JSON.parse(event.data as string) as ClientMessage;
+      // Convert data to string if it's ArrayBuffer
+      const messageStr = typeof data === 'string' ? data : new TextDecoder().decode(data);
+      const message = JSON.parse(messageStr) as ClientMessage;
       
       // Store in message queue for waitForMessage
       if (!this.messageQueue.has(message.type)) {
@@ -323,6 +335,61 @@ export class SyncDO implements DurableObject, WebSocketHandler {
   }
   
   /**
+   * WebSocket close handler for hibernation API
+   */
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
+    // Save clientId before it's potentially cleared during cleanup
+    const savedClientId = this.clientId;
+    
+    syncLogger.info('WebSocket closed', {
+      clientId: savedClientId,
+      code,
+      reason,
+      wasClean
+    }, MODULE_NAME);
+    
+    // Mark client as inactive when connection closes
+    this.state.waitUntil(
+      (async () => {
+        try {
+          // If it's not a clean closure, handle more carefully
+          if (!wasClean) {
+            syncLogger.warn('Unclean WebSocket closure', {
+              clientId: savedClientId,
+              code,
+              reason: reason || 'No reason provided'
+            }, MODULE_NAME);
+          }
+          
+          await this.stateManager.cleanupConnection();
+        } catch (error) {
+          syncLogger.error('Connection cleanup failed', {
+            clientId: savedClientId, // Use saved clientId
+            code,
+            wasClean,
+            error: error instanceof Error ? error.message : String(error)
+          }, MODULE_NAME);
+        }
+      })()
+    );
+    
+    this.webSocket = null;
+  }
+  
+  /**
+   * WebSocket error handler for hibernation API
+   */
+  async webSocketError(ws: WebSocket, error: Error): Promise<void> {
+    syncLogger.error('WebSocket error', {
+      clientId: this.clientId,
+      error: error.message,
+      stack: error.stack
+    }, MODULE_NAME);
+    
+    this.webSocket = null;
+  }
+
+  /**
    * Check if any waiting resolvers match this message
    */
   private checkWaitingResolvers(type: string, message: ClientMessage): void {
@@ -346,6 +413,15 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       // Remove from waiting resolvers
       this.waitingResolvers.delete(waitId);
     }
+  }
+
+  /**
+   * Handle incoming WebSocket messages - this is replaced by webSocketMessage with hibernation API
+   * Keeping the method for backward compatibility but it won't be called
+   */
+  private async handleWebSocketMessage(event: MessageEvent): Promise<void> {
+    // This won't be called with hibernation API
+    syncLogger.warn('handleWebSocketMessage called but using hibernation API', {}, MODULE_NAME);
   }
   
   /**

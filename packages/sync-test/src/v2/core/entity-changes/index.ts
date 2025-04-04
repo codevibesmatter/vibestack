@@ -28,6 +28,7 @@ export {
   generateChanges,
   convertToTableChanges,
   generateAndApplyChanges,
+  applyChangesInBatches,
   seedDatabase,
   createChangeTracker,
   generateAndTrackChanges,
@@ -50,3 +51,9 @@ export {
   listReplicationSlots,
   validateEntityChanges
 } from './validation.ts'; 
+
+// Export the batch change generation function
+export { 
+  generateMixedChanges,
+  generateAndApplyMixedChanges
+} from './batch-changes.ts';

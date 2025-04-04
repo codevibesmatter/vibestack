@@ -178,6 +178,18 @@ export async function applyBatchChanges(
     groupedChanges[entityType][operation].push(change);
   });
   
+  // Log summary of changes to apply
+  Object.entries(groupedChanges).forEach(([entityType, operations]) => {
+    const opCounts = Object.entries(operations)
+      .map(([op, changes]) => `${op}:${changes.length}`)
+      .filter(s => s.endsWith(':0') === false)
+      .join(', ');
+    
+    if (opCounts) {
+      logger.info(`Changes for ${entityType}: ${opCounts}`);
+    }
+  });
+  
   // Process changes in a transaction
   const appliedChanges: TableChange[] = [];
   
@@ -203,6 +215,28 @@ export async function applyBatchChanges(
     for (const entityType of [...ORDERED_ENTITY_TYPES].reverse()) {
       await processEntityDeletes(entityType, groupedChanges, transactionalEntityManager, appliedChanges);
     }
+  });
+  
+  // Summarize which changes were applied
+  const appliedByType: Record<string, Record<string, number>> = {};
+  appliedChanges.forEach(change => {
+    const entityType = TABLE_TO_ENTITY_MAP[change.table] || 'unknown';
+    const operation = change.operation || 'unknown';
+    
+    if (!appliedByType[entityType]) {
+      appliedByType[entityType] = {};
+    }
+    
+    appliedByType[entityType][operation] = (appliedByType[entityType][operation] || 0) + 1;
+  });
+  
+  // Log summary of applied changes
+  Object.entries(appliedByType).forEach(([entityType, operations]) => {
+    const opCounts = Object.entries(operations)
+      .map(([op, count]) => `${op}:${count}`)
+      .join(', ');
+      
+    logger.info(`Applied changes for ${entityType}: ${opCounts}`);
   });
   
   logger.info(`Successfully applied ${appliedChanges.length} changes to database`);
@@ -349,16 +383,34 @@ async function processEntityCreates(
         const taskId = change.data.taskId as string;
         const userId = change.data.userId as string;
         const projectId = change.data.projectId as string;
+        const entityId = change.data.entityId as string;
+        const commentEntityType = change.data.entityType as string;
         
-        if (userId) {
+        // CRITICAL FIX: Always ensure entity_type is set
+        // If we have entityType, use it to set entity_type
+        if (commentEntityType) {
+          change.data.entity_type = commentEntityType;
+        }
+        
+        // Ensure authorId is set if userId is present (mapping between fields)
+        if (userId && !change.data.authorId) {
+          change.data.authorId = userId;
+        }
+        
+        if (userId || change.data.authorId) {
+          // Ensure authorId is a string, generate a UUID if neither is available
+          const authorId = (typeof change.data.authorId === 'string' ? 
+            change.data.authorId : 
+            (typeof userId === 'string' ? userId : uuidv4()));
+            
           const userExists = await transactionalEntityManager
             .getRepository(User)
-            .findOneBy({ id: userId });
+            .findOneBy({ id: authorId });
             
           if (!userExists) {
             // Create a random user
             const user = new User();
-            user.id = userId;
+            user.id = authorId;
             user.name = faker.person.fullName();
             user.email = faker.internet.email();
             user.role = faker.helpers.arrayElement(Object.values(UserRole));
@@ -370,30 +422,28 @@ async function processEntityCreates(
           }
         }
         
-        if (taskId) {
-          const taskExists = await transactionalEntityManager
-            .getRepository(Task)
-            .findOneBy({ id: taskId });
-            
-          if (!taskExists) {
-            // Create a random task
-            const task = new Task();
-            task.id = taskId;
-            task.title = faker.lorem.sentence();
-            task.description = faker.lorem.paragraph();
-            task.status = faker.helpers.arrayElement(Object.values(TaskStatus));
-            
-            // Create a random project if no project ID provided
-            const actualProjectId = projectId || uuidv4();
-            
+        // Check if we have entityId and entity_type (using snake_case field name)
+        if ((entityId || (change.data.entity_id && typeof change.data.entity_id === 'string')) && 
+            (commentEntityType || (change.data.entity_type && typeof change.data.entity_type === 'string'))) {
+          
+          const actualEntityId = (typeof change.data.entity_id === 'string' ? change.data.entity_id : entityId) as string;
+          const actualEntityType = (typeof change.data.entity_type === 'string' ? change.data.entity_type : commentEntityType) as string;
+          
+          // Map the field specifically to entity_type in the database
+          change.data.entity_type = actualEntityType;
+          change.data.entity_id = actualEntityId;
+          
+          // Handle different entity types
+          if (actualEntityType === 'task') {
+            // Verify project exists
             const projectExists = await transactionalEntityManager
               .getRepository(Project)
-              .findOneBy({ id: actualProjectId });
+              .findOneBy({ id: actualEntityId });
               
             if (!projectExists) {
               // Create a random project
               const project = new Project();
-              project.id = actualProjectId;
+              project.id = actualEntityId;
               project.name = faker.company.name();
               project.description = faker.company.catchPhrase();
               project.status = faker.helpers.arrayElement(Object.values(ProjectStatus));
@@ -414,10 +464,8 @@ async function processEntityCreates(
               project.updatedAt = new Date();
               
               const savedProject = await transactionalEntityManager.getRepository(Project).save(project);
-              logger.debug(`Created project ${savedProject.id} for task ${taskId}`);
+              logger.debug(`Created project ${savedProject.id} for task ${actualEntityId}`);
             }
-            
-            task.projectId = actualProjectId;
             
             // Create a random assignee
             const assigneeId = userId || uuidv4();
@@ -438,12 +486,51 @@ async function processEntityCreates(
               await transactionalEntityManager.getRepository(User).save(user);
             }
             
+            // Create the task
+            const task = new Task();
+            task.id = actualEntityId;
+            task.title = faker.lorem.sentence();
+            task.description = faker.lorem.paragraph();
+            task.status = faker.helpers.arrayElement(Object.values(TaskStatus));
+            task.projectId = actualEntityId;
             task.assigneeId = assigneeId;
             task.createdAt = new Date();
             task.updatedAt = new Date();
             
             const savedTask = await transactionalEntityManager.getRepository(Task).save(task);
             logger.debug(`Created task ${savedTask.id} for comment ${change.data.id as string}`);
+          } else if (actualEntityType === 'project') {
+            // Verify project exists
+            const projectExists = await transactionalEntityManager
+              .getRepository(Project)
+              .findOneBy({ id: actualEntityId });
+              
+            if (!projectExists) {
+              // Create a random project
+              const project = new Project();
+              project.id = actualEntityId;
+              project.name = faker.company.name();
+              project.description = faker.company.catchPhrase();
+              project.status = faker.helpers.arrayElement(Object.values(ProjectStatus));
+              
+              // Create a random user for the project owner
+              const ownerId = uuidv4();
+              const user = new User();
+              user.id = ownerId;
+              user.name = faker.person.fullName();
+              user.email = faker.internet.email();
+              user.role = faker.helpers.arrayElement(Object.values(UserRole));
+              user.createdAt = new Date();
+              user.updatedAt = new Date();
+              
+              await transactionalEntityManager.getRepository(User).save(user);
+              project.ownerId = ownerId;
+              project.createdAt = new Date();
+              project.updatedAt = new Date();
+              
+              const savedProject = await transactionalEntityManager.getRepository(Project).save(project);
+              logger.debug(`Created project ${savedProject.id} for comment ${change.data.id as string}`);
+            }
           }
         }
       }
@@ -584,16 +671,38 @@ async function processEntityUpdates(
           // Handle comment dependencies
           const taskId = change.data.taskId as string;
           const userId = change.data.userId as string;
+          const entityId = change.data.entityId as string;
+          const commentEntityType = change.data.entityType as string;
           
-          if (userId) {
+          // CRITICAL FIX: Always ensure entity_type is properly set in database
+          if (commentEntityType) {
+            change.data.entity_type = commentEntityType;
+          }
+          
+          // CRITICAL FIX: Always ensure entity_id is set
+          if (entityId) {
+            change.data.entity_id = entityId;
+          }
+          
+          // Ensure authorId is set if userId is provided
+          if (userId && !change.data.authorId) {
+            change.data.authorId = userId;
+          }
+          
+          if (userId || change.data.authorId) {
+            // Ensure authorId is a string, generate a UUID if neither is available
+            const authorId = (typeof change.data.authorId === 'string' ? 
+              change.data.authorId : 
+              (typeof userId === 'string' ? userId : uuidv4()));
+              
             const userExists = await transactionalEntityManager
               .getRepository(User)
-              .findOneBy({ id: userId });
-              
+              .findOneBy({ id: authorId });
+            
             if (!userExists) {
               // Create a user with the specified ID
               const user = new User();
-              user.id = userId;
+              user.id = authorId;
               user.name = faker.person.fullName();
               user.email = faker.internet.email();
               user.role = faker.helpers.arrayElement(Object.values(UserRole));
@@ -601,7 +710,7 @@ async function processEntityUpdates(
               user.updatedAt = new Date();
               
               await transactionalEntityManager.getRepository(User).save(user);
-              logger.debug(`Created missing user ${userId} for comment update ${entityId}`);
+              logger.debug(`Created missing user ${authorId} for comment update ${entityId}`);
             }
           }
           
@@ -712,9 +821,18 @@ async function processEntityDeletes(
   // Get the entity template with its dependencies
   const entityTemplate = ENTITY_TEMPLATES[entityType];
   
+  // Track failed deletes so we don't retry them
+  const failedDeletes = new Set<string>();
+  
   // Process deletes one at a time to handle cascade dependencies properly
   for (const change of operations.delete) {
     const entityId = change.data.id as string;
+    
+    // Skip if we've already failed to delete this entity
+    if (failedDeletes.has(entityId)) {
+      logger.debug(`Skipping previously failed delete for ${entityType} ${entityId}`);
+      continue;
+    }
     
     try {
       // Check if the entity exists
@@ -739,6 +857,7 @@ async function processEntityDeletes(
       
     } catch (error) {
       logger.error(`Error deleting ${entityType} entity ${entityId}: ${error}`);
+      failedDeletes.add(entityId);
       // Don't throw, try to continue with other deletes
     }
   }
@@ -788,6 +907,15 @@ async function handleCascadeDeletes(
         entityId, 
         transactionalEntityManager
       );
+      
+      // Also find and delete comments directly on the project
+      await deleteEntitiesWithDependency(
+        'comment', 
+        'entityId', 
+        entityId, 
+        transactionalEntityManager,
+        entity => entity.entityType === 'project' // Additional filter
+      );
       break;
       
     case 'task':
@@ -803,12 +931,18 @@ async function handleCascadeDeletes(
       
     case 'comment':
       // When deleting a comment, delete all child comments
-      await deleteEntitiesWithDependency(
-        'comment', 
-        'parentId', 
-        entityId, 
-        transactionalEntityManager
-      );
+      try {
+        await deleteEntitiesWithDependency(
+          'comment', 
+          'parentId', 
+          entityId, 
+          transactionalEntityManager
+        );
+      } catch (error) {
+        // If we fail to delete child comments, log but don't break the process
+        logger.warn(`Failed to delete child comments for comment ${entityId}: ${error}`);
+        // We'll continue and try to delete this comment anyway
+      }
       break;
   }
 }
@@ -837,15 +971,34 @@ async function deleteEntitiesWithDependency(
     return;
   }
   
-  logger.debug(`Found ${filteredEntities.length} ${entityType} entities dependent on ${dependencyField}=${dependencyValue}`);
+  // Only log the count, not details of each entity
+  logger.debug(`Found ${filteredEntities.length} ${entityType} entities dependent on ${dependencyField}=${dependencyValue.substring(0, 8)}...`);
   
   // For each dependent entity, handle its cascade deletes first
+  let successCount = 0;
+  let failureCount = 0;
+  
   for (const entity of filteredEntities) {
-    // Recursively handle cascade deletes for this entity
-    await handleCascadeDeletes(entityType, entity.id, transactionalEntityManager);
-    
-    // Delete the entity itself
-    await repository.delete(entity.id);
-    logger.debug(`Cascade deleted ${entityType} ${entity.id}`);
+    try {
+      // Recursively handle cascade deletes for this entity
+      await handleCascadeDeletes(entityType, entity.id, transactionalEntityManager);
+      
+      // Delete the entity itself
+      try {
+        await repository.delete(entity.id);
+        successCount++;
+      } catch (error) {
+        failureCount++;
+        // Don't log every failure - too verbose
+      }
+    } catch (error) {
+      failureCount++;
+      // Don't log every failure - too verbose
+    }
+  }
+  
+  // Log summary of cascade deletion
+  if (successCount > 0 || failureCount > 0) {
+    logger.debug(`Cascade delete results for ${entityType} (on ${dependencyField}=${dependencyValue.substring(0, 8)}...): ${successCount} succeeded, ${failureCount} failed`);
   }
 } 

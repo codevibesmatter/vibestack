@@ -96,92 +96,93 @@ export interface GeneratedChanges {
 }
 
 /**
- * Generate a comprehensive set of changes across entity types
+ * Generate changes for testing
+ * Simplified version that focuses on generating exactly the requested number of changes
+ * 
+ * @param count Total number of changes to generate
+ * @param options Simple options object with mode and distribution fractions
+ * @returns Generated changes object
  */
 export async function generateChanges(
   count: number,
-  options: ChangeGenOptions = {}
+  options: {
+    mode?: 'seed' | 'normal' | 'mixed';
+    distribution?: {
+      user?: number;
+      project?: number;
+      task?: number;
+      comment?: number;
+    };
+    useExistingIds?: boolean;
+  } = {}
 ): Promise<GeneratedChanges> {
   logger.info(`Generating exactly ${count} changes across entity types`);
+
+  // Default options
+  const mode = options.mode || 'normal';
+  const useExistingIds = options.useExistingIds !== false;
   
-  // Additional safety option: avoid deleting users in small batches to prevent
-  // large cascading deletes that complicate testing 
-  const userDeleteThreshold = options.userDeleteThreshold || 20;
-  const avoidUserDeletes = count < userDeleteThreshold;
+  // Get data source and fetch existing IDs
+  const dataSource = await getDataSource();
+  const existingIds = await fetchExistingEntityIds(ORDERED_ENTITY_TYPES);
   
+  // If in seed mode, avoid deletes and focus on inserts
+  const avoidUserDeletes = mode === 'seed' || count < 20;
   if (avoidUserDeletes) {
-    logger.info(`Batch size ${count} is below user delete threshold (${userDeleteThreshold}), avoiding user deletes`);
+    logger.info(`Batch size ${count} is below user delete threshold (20), avoiding user deletes`);
   }
   
-  // Hold tracking of IDs for references
-  let existingIds: Record<EntityType, string[]> = {
-    task: [],
-    project: [],
-    user: [],
-    comment: []
-  };
-  
-  // If useExistingIds is true, fetch IDs from the database first
-  if (options.useExistingIds) {
-    // Only fetch a limited number of existing IDs
-    const maxIdsToFetch = Math.min(Math.max(30, Math.floor(count * 0.5)), 100); // Increase fetch limit for large counts
-    existingIds = await fetchExistingEntityIds(ORDERED_ENTITY_TYPES, maxIdsToFetch);
-    logger.info(`Found existing IDs: users=${existingIds.user.length}, projects=${existingIds.project.length}, tasks=${existingIds.task.length}, comments=${existingIds.comment.length}`);
-  }
-  
-  // Default operation distribution or use seed mode if specified
-  let operations = options.operations || { create: 0.7, update: 0.2, delete: 0.1 };
-  
-  // Apply predefined modes if specified
-  if (options.mode === 'seed') {
-    operations = { create: 1, update: 0, delete: 0 };
+  if (mode === 'seed') {
     logger.info('Using seed mode: 100% inserts');
   }
-
-  // Get duplication options
-  const duplication = options.duplication || { enabled: false };
-  const isDuplicationEnabled = duplication.enabled === true && count >= 10; // Only enable duplication if count >= 10
-  const duplicationPercentage = duplication.percentage || 0.3; // Default 30% of updates become duplicates
-  const duplicateCount = duplication.duplicateCount || 2; // Default 2 duplicates per entity
   
-  if (isDuplicationEnabled) {
-    logger.info(`Duplication enabled with ${duplicateCount} duplicates per entity for ${Math.round(duplicationPercentage * 100)}% of updates`);
+  // Define operation distributions
+  const operations = {
+    create: mode === 'seed' ? 1.0 : 0.7,
+    update: mode === 'seed' ? 0.0 : 0.2,
+    delete: mode === 'seed' ? 0.0 : 0.1
+  };
+  
+  // Distribute changes across entity types using simple fractions
+  // Default distribution if none provided
+  const defaultDistribution = {
+    user: 0.1,    // 10% users
+    project: 0.1,  // 10% projects
+    task: 0.3,     // 30% tasks
+    comment: 0.5   // 50% comments
+  };
+  
+  // Use provided distribution or default
+  const distribution = options.distribution || defaultDistribution;
+  
+  // Normalize distribution to ensure it adds up to 1.0
+  const total = Object.values(distribution).reduce((sum, val) => sum + (val || 0), 0);
+  const normalizedDistribution = {
+    user: (distribution.user || defaultDistribution.user) / total,
+    project: (distribution.project || defaultDistribution.project) / total,
+    task: (distribution.task || defaultDistribution.task) / total,
+    comment: (distribution.comment || defaultDistribution.comment) / total
+  };
+  
+  // Calculate exact counts for each entity type
+  const exactCount: Record<EntityType, number> = {
+    user: Math.round(count * normalizedDistribution.user),
+    project: Math.round(count * normalizedDistribution.project),
+    task: Math.round(count * normalizedDistribution.task),
+    comment: Math.round(count * normalizedDistribution.comment)
+  };
+  
+  // Adjust to ensure exact count
+  const calculatedTotal = Object.values(exactCount).reduce((sum, val) => sum + val, 0);
+  if (calculatedTotal !== count) {
+    // Adjust comment count to match total (comments are usually the most abundant)
+    exactCount.comment += (count - calculatedTotal);
   }
   
-  // For very small counts, just create the exact entities needed
-  const exactCount = options.minCounts || getFixedDistribution(count);
+  // Log the exact distribution being used
+  logger.info(`Using distribution: user=${exactCount.user}, project=${exactCount.project}, task=${exactCount.task}, comment=${exactCount.comment}`);
+  logger.info(`Total: ${Object.values(exactCount).reduce((sum, val) => sum + val, 0)} changes`);
   
-  // Validate that the distribution adds up to the requested count
-  const totalExactCount = Object.values(exactCount).reduce((sum, val) => sum + val, 0);
-  if (Math.abs(totalExactCount - count) > 1) { // Allow for rounding error of 1
-    logger.warn(`Generated distribution total (${totalExactCount}) does not match requested count (${count}). Adjusting...`);
-    
-    // Adjust the largest category to make up the difference
-    let largestCategory: EntityType = 'comment';
-    let largestValue = exactCount.comment || 0;
-    
-    for (const [category, value] of Object.entries(exactCount) as [EntityType, number][]) {
-      if (value > largestValue) {
-        largestCategory = category;
-        largestValue = value;
-      }
-    }
-    
-    // Ensure the category exists before adjusting
-    if (typeof exactCount[largestCategory] === 'number') {
-      const originalValue = exactCount[largestCategory] as number;
-      exactCount[largestCategory] = originalValue + (count - totalExactCount);
-      logger.info(`Adjusted ${largestCategory} from ${originalValue} to ${exactCount[largestCategory]}`);
-    } else {
-      // If somehow the largest category is undefined, add to comments as fallback
-      exactCount.comment = (exactCount.comment || 0) + (count - totalExactCount);
-      logger.info(`Adjusted comment from ${exactCount.comment - (count - totalExactCount)} to ${exactCount.comment}`);
-    }
-  }
-  
-  logger.info(`Using fixed distribution: ${JSON.stringify(exactCount)}`);
-  
-  // Generate changes for each entity type
   const generatedChanges: GeneratedChanges = {};
   
   // Process entity types in dependency order (from parent to child)
@@ -202,148 +203,86 @@ export async function generateChanges(
       };
     }
     
-    // For each entity type, determine how many creates/updates/deletes
-    const createCount = entityType === 'user' || existingIds[entityType].length < 2 ? 
-      typeCount : Math.floor(typeCount * operations.create);
+    // For each entity type, determine how many creates/updates/deletes based on mode
+    let createCount, updateCount, deleteCount;
     
-    const updateCount = existingIds[entityType].length > 0 ? 
-      Math.floor(typeCount * operations.update) : 0;
+    if (mode === 'seed') {
+      // In seed mode, do 100% creates
+      createCount = typeCount;
+      updateCount = 0;
+      deleteCount = 0;
+    } else {
+      // In normal mode, respect the operations distribution
+      createCount = entityType === 'user' || existingIds[entityType].length < 2 ? 
+        typeCount : Math.round(typeCount * operations.create);
+      
+      updateCount = existingIds[entityType].length > 0 ? 
+        Math.round(typeCount * operations.update) : 0;
+      
+      deleteCount = !avoidUserDeletes && existingIds[entityType].length > 1 ? 
+        typeCount - createCount - updateCount : 0;
+      
+      // Ensure we get exactly typeCount total operations
+      if (createCount + updateCount + deleteCount !== typeCount) {
+        // Adjust create count to make up the difference
+        createCount += typeCount - (createCount + updateCount + deleteCount);
+      }
+    }
     
-    const deleteCount = !avoidUserDeletes && existingIds[entityType].length > 1 ? 
-      typeCount - createCount - updateCount : 0;
-    
-    // Generate creates with efficient relationships
+    // Generate creates with relationships
     if (createCount > 0) {
-      // For users, just create them directly
       if (entityType === 'user') {
+        // For users, just create them directly
         const newUsers = generateEntities(entityType, createCount, existingIds);
         generatedChanges[entityType].create = newUsers.map((entity: User) => {
           if (!entity.id) entity.id = uuidv4();
           existingIds[entityType].push(entity.id);
           return entity;
         });
-      }
-      // For projects, ensure they reference existing users
-      else if (entityType === 'project') {
-        // Make sure we have at least one user
-        if (existingIds.user.length === 0) {
-          const user = generateEntity('user', existingIds);
-          user.id = uuidv4();
-          existingIds.user.push(user.id);
-          
-          if (!generatedChanges.user) {
-            generatedChanges.user = { create: [], update: [], delete: [] };
-          }
-          generatedChanges.user.create.push(user);
-        }
-        
-        const newProjects = Array(createCount).fill(null).map(() => {
-          const project = generateEntity(entityType, existingIds) as Project;
-          project.id = uuidv4();
+      } else if (entityType === 'project') {
+        // Projects need owner references
+        const newProjects = generateEntities(entityType, createCount, existingIds);
+        generatedChanges[entityType].create = newProjects.map((project: Project) => {
+          if (!project.id) project.id = uuidv4();
           
           // Always link to an existing user
-          const userIndex = Math.floor(Math.random() * existingIds.user.length);
-          project.ownerId = existingIds.user[userIndex];
+          if (existingIds.user.length > 0) {
+            const userIndex = Math.floor(Math.random() * existingIds.user.length);
+            project.ownerId = existingIds.user[userIndex];
+          }
           
           existingIds[entityType].push(project.id);
           return project;
         });
-        
-        generatedChanges[entityType].create = newProjects;
-      }
-      // For tasks, ensure they reference existing projects
-      else if (entityType === 'task') {
-        // Make sure we have at least one project
-        if (existingIds.project.length === 0) {
-          // And we need a user for the project
-          if (existingIds.user.length === 0) {
-            const user = generateEntity('user', existingIds);
-            user.id = uuidv4();
-            existingIds.user.push(user.id);
-            
-            if (!generatedChanges.user) {
-              generatedChanges.user = { create: [], update: [], delete: [] };
-            }
-            generatedChanges.user.create.push(user);
+      } else if (entityType === 'task') {
+        // Tasks need project and assignee references
+        const newTasks = generateEntities(entityType, createCount, existingIds);
+        generatedChanges[entityType].create = newTasks.map((task: Task) => {
+          if (!task.id) task.id = uuidv4();
+          
+          // Link to project
+          if (existingIds.project.length > 0) {
+            const projectIndex = Math.floor(Math.random() * existingIds.project.length);
+            task.projectId = existingIds.project[projectIndex];
           }
           
-          const project = generateEntity('project', existingIds) as Project;
-          project.id = uuidv4();
-          project.ownerId = existingIds.user[0];
-          existingIds.project.push(project.id);
-          
-          if (!generatedChanges.project) {
-            generatedChanges.project = { create: [], update: [], delete: [] };
+          // Link to assignee
+          if (existingIds.user.length > 0) {
+            const userIndex = Math.floor(Math.random() * existingIds.user.length);
+            task.assigneeId = existingIds.user[userIndex];
           }
-          generatedChanges.project.create.push(project);
-        }
-        
-        const newTasks = Array(createCount).fill(null).map(() => {
-          const task = generateEntity(entityType, existingIds) as Task;
-          task.id = uuidv4();
-          
-          // Always link to an existing project and user
-          const projectIndex = Math.floor(Math.random() * existingIds.project.length);
-          task.projectId = existingIds.project[projectIndex];
-          
-          const userIndex = Math.floor(Math.random() * existingIds.user.length);
-          task.assigneeId = existingIds.user[userIndex];
           
           existingIds[entityType].push(task.id);
           return task;
         });
-        
-        generatedChanges[entityType].create = newTasks;
-      }
-      // For comments, ensure they reference existing tasks/projects
-      else if (entityType === 'comment') {
-        // Make sure we have at least one task and one user
-        if (existingIds.task.length === 0) {
-          // We need a project for the task
-          if (existingIds.project.length === 0) {
-            // And we need a user for the project
-            if (existingIds.user.length === 0) {
-              const user = generateEntity('user', existingIds);
-              user.id = uuidv4();
-              existingIds.user.push(user.id);
-              
-              if (!generatedChanges.user) {
-                generatedChanges.user = { create: [], update: [], delete: [] };
-              }
-              generatedChanges.user.create.push(user);
-            }
-            
-            const project = generateEntity('project', existingIds) as Project;
-            project.id = uuidv4();
-            project.ownerId = existingIds.user[0];
-            existingIds.project.push(project.id);
-            
-            if (!generatedChanges.project) {
-              generatedChanges.project = { create: [], update: [], delete: [] };
-            }
-            generatedChanges.project.create.push(project);
-          }
+      } else if (entityType === 'comment') {
+        // Comments need author, entity, and sometimes parent references
+        const newComments = generateEntities(entityType, createCount, existingIds);
+        generatedChanges[entityType].create = newComments.map((comment: Comment) => {
+          if (!comment.id) comment.id = uuidv4();
           
-          const task = generateEntity('task', existingIds) as Task;
-          task.id = uuidv4();
-          task.projectId = existingIds.project[0];
-          task.assigneeId = existingIds.user[0];
-          existingIds[entityType].push(task.id);
-          
-          if (!generatedChanges.task) {
-            generatedChanges.task = { create: [], update: [], delete: [] };
-          }
-          generatedChanges.task.create.push(task);
-        }
-        
-        const newComments = Array(createCount).fill(null).map(() => {
-          const comment = generateEntity(entityType, existingIds) as Comment;
-          comment.id = uuidv4();
-          
-          // Decide whether to link to a task or project
-          const commentOnTask = Math.random() > 0.5 || existingIds.project.length === 0;
-          
-          if (commentOnTask && existingIds.task.length > 0) {
+          // Link to task or project as entity
+          if (existingIds.task.length > 0 && Math.random() > 0.3) {
             const taskIndex = Math.floor(Math.random() * existingIds.task.length);
             comment.entityId = existingIds.task[taskIndex];
             comment.entityType = 'task';
@@ -351,17 +290,20 @@ export async function generateChanges(
             const projectIndex = Math.floor(Math.random() * existingIds.project.length);
             comment.entityId = existingIds.project[projectIndex];
             comment.entityType = 'project';
-          } else {
-            // Fallback
-            comment.entityId = existingIds.task[0];
+          } else if (existingIds.task.length > 0) {
+            // Fallback to task if we have any
+            const taskIndex = Math.floor(Math.random() * existingIds.task.length);
+            comment.entityId = existingIds.task[taskIndex];
             comment.entityType = 'task';
           }
           
           // Always link to an existing user as author
-          const userIndex = Math.floor(Math.random() * existingIds.user.length);
-          comment.authorId = existingIds.user[userIndex];
+          if (existingIds.user.length > 0) {
+            const userIndex = Math.floor(Math.random() * existingIds.user.length);
+            comment.authorId = existingIds.user[userIndex];
+          }
           
-          // Occasionally link to another comment as parent
+          // Occasionally link to another comment as parent (25% chance)
           if (existingIds.comment.length > 0 && Math.random() > 0.75) {
             const parentIndex = Math.floor(Math.random() * existingIds.comment.length);
             comment.parentId = existingIds.comment[parentIndex];
@@ -372,237 +314,176 @@ export async function generateChanges(
           existingIds[entityType].push(comment.id);
           return comment;
         });
-        
-        generatedChanges[entityType].create = newComments;
       }
     }
     
     // Generate updates - if we have existing IDs
     if (updateCount > 0 && existingIds[entityType].length > 0) {
-      // Only try to update a subset of the available IDs
-      const updateCount = Math.min(typeCount - createCount - deleteCount, existingIds[entityType].length);
+      // Get a subset of existing IDs to update
+      const updateIds = [...existingIds[entityType]];
       
-      if (updateCount > 0) {
-        const updatedEntities = existingIds[entityType]
-          .slice(0, updateCount)
-          .map(id => {
-            const entity = generateEntity(entityType, existingIds);
-            entity.id = id;
-            entity.updatedAt = new Date();
-            
-            // Add type-specific updates with minimal changes
-            switch (entityType) {
-              case 'task':
-                (entity as any).status = getRandomEnum(TaskStatus);
-                (entity as any).title = `Updated ${(entity as any).title}`;
-                break;
-              case 'project':
-                (entity as any).status = getRandomEnum(ProjectStatus);
-                (entity as any).name = `Updated ${(entity as any).name}`;
-                break;
-              case 'user':
-                (entity as any).name = `Updated ${(entity as any).name}`;
-                break;
-              case 'comment':
-                (entity as any).content = `Updated ${(entity as any).content}`;
-                break;
+      // Shuffle and take subset
+      const idsToUpdate = updateCount > updateIds.length ? 
+        updateIds : 
+        updateIds.sort(() => 0.5 - Math.random()).slice(0, updateCount);
+      
+      // For each ID, generate an update
+      const updates = [];
+      for (const id of idsToUpdate) {
+        const update: any = { id };
+        
+        // Add specific updates based on entity type
+        if (entityType === 'user') {
+          update.name = faker.person.fullName();
+          update.email = faker.internet.email();
+        } else if (entityType === 'project') {
+          update.name = faker.company.name();
+          update.description = faker.company.catchPhrase();
+        } else if (entityType === 'task') {
+          update.title = faker.company.catchPhrase();
+          update.status = getRandomEnum(TaskStatus);
+          update.priority = getRandomEnum(TaskPriority);
+        } else if (entityType === 'comment') {
+          update.content = `Updated ${faker.lorem.paragraph()}`;
+        }
+        
+        updates.push(update);
+      }
+      
+      generatedChanges[entityType].update = updates;
+    }
+    
+    // Generate deletes - if we have existing IDs and aren't avoiding deletes
+    if (deleteCount > 0 && existingIds[entityType].length > 0 && !avoidUserDeletes) {
+      // Get a subset of existing IDs to delete
+      const deleteIds = [...existingIds[entityType]];
+      
+      // Shuffle and take subset
+      const idsToDelete = deleteCount > deleteIds.length ? 
+        deleteIds : 
+        deleteIds.sort(() => 0.5 - Math.random()).slice(0, deleteCount);
+      
+      generatedChanges[entityType].delete = idsToDelete;
+    }
+  }
+  
+  // Validate total count to ensure we generated exactly what was requested
+  let actualTotal = 0;
+  Object.values(generatedChanges).forEach(entityChanges => {
+    actualTotal += entityChanges.create.length + entityChanges.update.length + entityChanges.delete.length;
+  });
+  
+  if (actualTotal !== count) {
+    logger.warn(`Generated ${actualTotal} changes, which differs from requested count of ${count}. Adjusting...`);
+    
+    // Adjust by adding/removing comments (easiest to adjust)
+    const diff = count - actualTotal;
+    if (diff > 0) {
+      // Need to add more changes - create additional comments
+      const additionalComments = generateEntities('comment', diff, existingIds);
+      
+      // Add author and entity references
+      additionalComments.forEach(comment => {
+        if (!comment.id) comment.id = uuidv4();
+        
+        // Link to task or project
+        if (existingIds.task.length > 0) {
+          const taskIndex = Math.floor(Math.random() * existingIds.task.length);
+          comment.entityId = existingIds.task[taskIndex];
+          comment.entityType = 'task';
+        } else if (existingIds.project.length > 0) {
+          const projectIndex = Math.floor(Math.random() * existingIds.project.length);
+          comment.entityId = existingIds.project[projectIndex];
+          comment.entityType = 'project';
+        }
+        
+        // Add author
+        if (existingIds.user.length > 0) {
+          const userIndex = Math.floor(Math.random() * existingIds.user.length);
+          comment.authorId = existingIds.user[userIndex];
+        }
+        
+        existingIds.comment.push(comment.id);
+      });
+      
+      // Add to the generated changes
+      if (!generatedChanges.comment) {
+        generatedChanges.comment = { create: [], update: [], delete: [] };
+      }
+      generatedChanges.comment.create.push(...additionalComments);
+      
+      logger.info(`Added ${diff} additional comments to match requested count`);
+    } else if (diff < 0) {
+      // Need to remove some changes - remove from comments if possible
+      const excessCount = -diff;
+      
+      if (generatedChanges.comment && generatedChanges.comment.create.length > excessCount) {
+        // Remove from comments.create
+        generatedChanges.comment.create = generatedChanges.comment.create.slice(0, -excessCount);
+        logger.info(`Removed ${excessCount} comments to match requested count`);
+      } else {
+        // Otherwise remove from wherever possible
+        let remaining = excessCount;
+        
+        for (const entityType of ['comment', 'task', 'project', 'user'] as EntityType[]) {
+          if (remaining <= 0) break;
+          
+          if (generatedChanges[entityType]) {
+            // Try to remove from creates first
+            if (generatedChanges[entityType].create.length > remaining) {
+              generatedChanges[entityType].create = generatedChanges[entityType].create.slice(0, -remaining);
+              logger.info(`Removed ${remaining} ${entityType} creates to match requested count`);
+              remaining = 0;
+              break;
+            } else if (generatedChanges[entityType].create.length > 0) {
+              const removed = generatedChanges[entityType].create.length;
+              generatedChanges[entityType].create = [];
+              remaining -= removed;
+              logger.info(`Removed ${removed} ${entityType} creates (${remaining} remaining)`);
             }
             
-            return entity;
-          });
-        
-        generatedChanges[entityType].update = updatedEntities;
-      }
-    }
-    
-    // Generate deletes - use a subset of the IDs we're tracking
-    if (deleteCount > 0 && existingIds[entityType].length > deleteCount) {
-      // Don't delete all our entities - keep at least a few
-      const safeDeleteCount = Math.min(deleteCount, Math.max(0, existingIds[entityType].length - 2));
-      
-      if (safeDeleteCount > 0) {
-        // Take IDs from the end to avoid conflicts with updates
-        const deleteIds = [...existingIds[entityType]].splice(-safeDeleteCount);
-        generatedChanges[entityType].delete = deleteIds;
-        
-        // Remove these IDs from the tracked IDs
-        existingIds[entityType] = existingIds[entityType].filter(
-          id => !deleteIds.includes(id)
-        );
-      }
-    }
-  }
-
-  // Generate duplicate updates if enabled, but WITHIN the original count
-  if (isDuplicationEnabled) {
-    logger.info('Generating duplicate updates for deduplication testing');
-    
-    // Track duplicates we'll create
-    let duplicatesCreated = 0;
-    const duplicatesNeeded = count - Object.values(exactCount).reduce((sum, count) => sum + count, 0);
-    
-    for (const entityType of ORDERED_ENTITY_TYPES) {
-      // Skip if no updates for this type
-      if (!generatedChanges[entityType]?.update?.length) continue;
-      
-      // Calculate how many entities will have duplicates
-      const updates = generatedChanges[entityType].update;
-      const entitiesToDuplicate = Math.max(1, Math.floor(updates.length * duplicationPercentage));
-      
-      // Select random entities to duplicate
-      const entityIndices: number[] = [];
-      for (let i = 0; i < entitiesToDuplicate && duplicatesCreated < duplicatesNeeded; i++) {
-        // Find a random entity that hasn't been selected yet
-        let index: number;
-        do {
-          index = Math.floor(Math.random() * updates.length);
-        } while (entityIndices.includes(index));
-        
-        entityIndices.push(index);
-      }
-      
-      // Generate duplicates for each selected entity
-      for (const index of entityIndices) {
-        const originalEntity = updates[index];
-        
-        // Generate duplicates
-        for (let i = 0; i < duplicateCount - 1 && duplicatesCreated < duplicatesNeeded; i++) {
-          // Create a duplicate with slightly different values
-          const duplicate = { ...originalEntity };
-          
-          // Make some small changes for each duplicate
-          switch (entityType) {
-            case 'task':
-              (duplicate as any).status = getRandomEnum(TaskStatus);
-              (duplicate as any).title = `${(duplicate as any).title} (Duplicate ${i + 1})`;
+            // Then try updates
+            if (remaining > 0 && generatedChanges[entityType].update.length > remaining) {
+              generatedChanges[entityType].update = generatedChanges[entityType].update.slice(0, -remaining);
+              logger.info(`Removed ${remaining} ${entityType} updates to match requested count`);
+              remaining = 0;
               break;
-            case 'project':
-              (duplicate as any).status = getRandomEnum(ProjectStatus);
-              (duplicate as any).name = `${(duplicate as any).name} (Duplicate ${i + 1})`;
+            } else if (remaining > 0 && generatedChanges[entityType].update.length > 0) {
+              const removed = generatedChanges[entityType].update.length;
+              generatedChanges[entityType].update = [];
+              remaining -= removed;
+              logger.info(`Removed ${removed} ${entityType} updates (${remaining} remaining)`);
+            }
+            
+            // Finally try deletes
+            if (remaining > 0 && generatedChanges[entityType].delete.length > remaining) {
+              generatedChanges[entityType].delete = generatedChanges[entityType].delete.slice(0, -remaining);
+              logger.info(`Removed ${remaining} ${entityType} deletes to match requested count`);
+              remaining = 0;
               break;
-            case 'user':
-              (duplicate as any).name = `${(duplicate as any).name} (Duplicate ${i + 1})`;
-              break;
-            case 'comment':
-              (duplicate as any).content = `${(duplicate as any).content} (Duplicate ${i + 1})`;
-              break;
+            } else if (remaining > 0 && generatedChanges[entityType].delete.length > 0) {
+              const removed = generatedChanges[entityType].delete.length;
+              generatedChanges[entityType].delete = [];
+              remaining -= removed;
+              logger.info(`Removed ${removed} ${entityType} deletes (${remaining} remaining)`);
+            }
           }
-          
-          // Ensure updatedAt is slightly different
-          duplicate.updatedAt = new Date(duplicate.updatedAt.getTime() + (i + 1) * 100);
-          
-          // Add to update list
-          updates.push(duplicate);
-          duplicatesCreated++;
         }
       }
-      
-      logger.info(`Added ${duplicatesCreated} duplicate updates within the original count of ${count}`);
     }
   }
   
-  // If we're protecting users from deletion in small batches
-  if (avoidUserDeletes && generatedChanges.user) {
-    const userOps = generatedChanges.user;
-    if (userOps.delete.length > 0) {
-      // Get the count of user deletes
-      const deleteCount = userOps.delete.length;
-      
-      // Save the delete IDs before clearing
-      const deletedIds = [...userOps.delete];
-      
-      // Clear the delete array
-      userOps.delete = [];
-      
-      logger.info(`Avoided ${deleteCount} user deletes in small batch (threshold: ${userDeleteThreshold})`);
-      
-      // Convert deletes to creates to maintain the count
-      if (deleteCount > 0) {
-        const additionalCreate = deleteCount;
-        const newEntities = generateEntities('user', additionalCreate, existingIds);
-        
-        // Add to creates
-        newEntities.forEach((entity: User) => {
-          if (!entity.id) {
-            entity.id = uuidv4();
-          }
-          
-          // Track ID
-          existingIds.user.push(entity.id);
-          userOps.create.push(entity);
-        });
-        
-        logger.info(`Converted ${deleteCount} user deletes to creates to maintain exact count`);
-      }
-    }
-  }
+  // Final validation
+  let finalTotal = 0;
+  Object.entries(generatedChanges).forEach(([entityType, entityChanges]) => {
+    const entityTotal = entityChanges.create.length + entityChanges.update.length + entityChanges.delete.length;
+    finalTotal += entityTotal;
+    logger.info(`${entityType}: ${entityTotal} changes (${entityChanges.create.length} create, ${entityChanges.update.length} update, ${entityChanges.delete.length} delete)`);
+  });
   
-  logger.info('Finished generating changes');
+  logger.info(`Finished generating changes: ${finalTotal} total (requested: ${count})`);
+  
   return generatedChanges;
-}
-
-/**
- * Helper function to get a fixed distribution for small change counts
- */
-function getFixedDistribution(count: number): Record<EntityType, number> {
-  // For very small counts, optimize for minimal entity creation
-  if (count <= 10) {
-    // Create one user and one project, use the rest for tasks and comments
-    const remainingCount = count - 2;
-    const tasks = Math.floor(remainingCount / 2);
-    const comments = remainingCount - tasks;
-    
-    return {
-      user: 1,
-      project: 1,
-      task: tasks,
-      comment: comments
-    };
-  }
-  
-  // For medium counts, use a slightly more balanced distribution
-  if (count <= 20) {
-    const users = Math.max(1, Math.floor(count * 0.15));
-    const projects = Math.max(1, Math.floor(count * 0.15));
-    const tasks = Math.max(1, Math.floor(count * 0.3));
-    const comments = count - users - projects - tasks;
-    
-    return {
-      user: users,
-      project: projects,
-      task: tasks,
-      comment: comments
-    };
-  }
-  
-  // For larger counts (21-100), use a balanced distribution
-  if (count <= 100) {
-    const users = Math.max(2, Math.floor(count * 0.15));
-    const projects = Math.max(2, Math.floor(count * 0.15));
-    const tasks = Math.max(3, Math.floor(count * 0.2));
-    const comments = count - users - projects - tasks;
-    
-    return {
-      user: users,
-      project: projects,
-      task: tasks,
-      comment: comments
-    };
-  }
-  
-  // For very large counts (>100), use a more optimized distribution
-  // with fewer parent entities relative to the total
-  const users = Math.max(5, Math.floor(count * 0.1));
-  const projects = Math.max(5, Math.floor(count * 0.1));
-  const tasks = Math.max(10, Math.floor(count * 0.15));
-  const comments = count - users - projects - tasks;
-  
-  return {
-    user: users,
-    project: projects,
-    task: tasks,
-    comment: comments
-  };
 }
 
 /**
@@ -673,6 +554,129 @@ export async function generateAndApplyChanges(
   
   // Apply changes to database
   return await applyBatchChanges(tableChanges);
+}
+
+/**
+ * Apply changes to the database in smaller batches to avoid overloading the database
+ * This is particularly useful for large change sets that might exceed database limits
+ */
+export async function applyChangesInBatches(
+  tableChanges: TableChange[],
+  options: {
+    batchSize?: number;
+  } = {}
+): Promise<TableChange[]> {
+  // Smaller batch size of 10 instead of 50
+  const { batchSize = 10 } = options;
+  
+  if (!tableChanges.length) {
+    logger.warn('No changes to apply');
+    return [];
+  }
+  
+  logger.info(`Applying ${tableChanges.length} changes to database in batches of ${batchSize}`);
+  
+  // Split changes into smaller batches
+  const batches = [];
+  for (let i = 0; i < tableChanges.length; i += batchSize) {
+    batches.push(tableChanges.slice(i, i + batchSize));
+  }
+  
+  logger.info(`Split changes into ${batches.length} batches`);
+  
+  // Process each batch sequentially
+  const allAppliedChanges: TableChange[] = [];
+  const failedChanges: Array<{change: TableChange, error: any}> = [];
+  
+  // Helper function to generate a unique key for a change
+  const getChangeKey = (change: TableChange): string => {
+    const entityId = change.data.id || change.data.entityId || JSON.stringify(change.data);
+    return `${change.table}:${change.operation}:${entityId}`;
+  };
+  
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    logger.info(`Processing batch ${i+1}/${batches.length} with ${batch.length} changes`);
+    
+    try {
+      // Each batch is processed in a single transaction with dependency ordering
+      const batchAppliedChanges = await applyBatchChanges(batch);
+      allAppliedChanges.push(...batchAppliedChanges);
+      
+      // Check if any changes were skipped
+      if (batchAppliedChanges.length < batch.length) {
+        const skippedCount = batch.length - batchAppliedChanges.length;
+        logger.warn(`${skippedCount} changes were skipped in batch ${i+1}`);
+        
+        // Identify which changes were skipped
+        const appliedKeys = new Set(batchAppliedChanges.map(getChangeKey));
+        const skippedChanges = batch.filter(change => !appliedKeys.has(getChangeKey(change)));
+        
+        // Log skipped changes for debugging
+        skippedChanges.forEach(change => {
+          const entityId = change.data.id || 'unknown';
+          failedChanges.push({
+            change,
+            error: new Error(`Change was skipped during batch processing`)
+          });
+          logger.warn(`Skipped change: ${change.operation} on ${change.table} with ID ${entityId}`);
+        });
+      }
+      
+      logger.info(`Completed batch ${i+1}/${batches.length}, applied ${batchAppliedChanges.length} changes`);
+    } catch (error) {
+      // Log error but continue processing other batches
+      logger.error(`Error processing batch ${i+1}/${batches.length}: ${error}`);
+      
+      // Attempt to apply each change individually
+      logger.info(`Attempting to apply changes individually for batch ${i+1}`);
+      
+      for (const change of batch) {
+        try {
+          const singleChangeResult = await applyBatchChanges([change]);
+          if (singleChangeResult.length > 0) {
+            allAppliedChanges.push(...singleChangeResult);
+            const entityId = change.data.id || 'unknown';
+            logger.info(`Successfully applied individual change: ${change.operation} on ${change.table} with ID ${entityId}`);
+          } else {
+            const entityId = change.data.id || 'unknown';
+            failedChanges.push({
+              change,
+              error: new Error(`Individual change processing failed with no error`)
+            });
+            logger.warn(`Failed to apply individual change: ${change.operation} on ${change.table} with ID ${entityId}`);
+          }
+        } catch (individualError) {
+          const entityId = change.data.id || 'unknown';
+          failedChanges.push({
+            change,
+            error: individualError
+          });
+          logger.warn(`Failed to apply individual change: ${change.operation} on ${change.table} with ID ${entityId}, error: ${individualError}`);
+        }
+      }
+    }
+  }
+  
+  // Log summary of applied and failed changes
+  logger.info(`Successfully applied ${allAppliedChanges.length} changes to database in ${batches.length} batches`);
+  
+  if (failedChanges.length > 0) {
+    logger.warn(`${failedChanges.length} changes failed to apply`);
+    
+    // Group failed changes by entity type and operation
+    const failedByTable: Record<string, number> = {};
+    failedChanges.forEach(({change}) => {
+      failedByTable[change.table] = (failedByTable[change.table] || 0) + 1;
+    });
+    
+    // Log summary of failed changes
+    Object.entries(failedByTable).forEach(([table, count]) => {
+      logger.warn(`Failed changes for table ${table}: ${count}`);
+    });
+  }
+  
+  return allAppliedChanges;
 }
 
 /**

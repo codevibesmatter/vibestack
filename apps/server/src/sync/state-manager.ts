@@ -149,6 +149,7 @@ export class SyncStateManager implements StateManager {
   async cleanupConnection(): Promise<void> {
     // Save clientId before clearing it
     const clientIdToRemove = this.clientId;
+    const previousLSN = this.clientLSN;
     
     // Clear instance state
     this.clientId = null;
@@ -158,14 +159,31 @@ export class SyncStateManager implements StateManager {
     if (clientIdToRemove) {
       const key = `client:${clientIdToRemove}`;
       syncLogger.info('Deactivating client', { 
-        clientId: clientIdToRemove
+        clientId: clientIdToRemove,
+        lsn: previousLSN || 'unknown'
       }, MODULE_NAME);
       
       try {
         // Get current state
         const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
         if (existingData) {
-          const data = JSON.parse(existingData);
+          // Parse carefully to handle potential JSON issues
+          let data;
+          try {
+            data = JSON.parse(existingData);
+          } catch (jsonError) {
+            // Handle JSON parse error by creating a new data object
+            syncLogger.warn('Client data parse error, creating new record', {
+              clientId: clientIdToRemove,
+              error: jsonError instanceof Error ? jsonError.message : String(jsonError)
+            }, MODULE_NAME);
+            
+            data = {
+              lastLSN: previousLSN || '0/0',
+              lastSeen: Date.now()
+            };
+          }
+          
           // Just mark as inactive - ClientManager will handle cleanup
           await this.context.env.CLIENT_REGISTRY.put(
             key,
@@ -173,21 +191,44 @@ export class SyncStateManager implements StateManager {
               ...data,
               active: false,
               lastSeen: Date.now(),
-              disconnectedAt: Date.now()
+              disconnectedAt: Date.now(),
+              // Ensure LSN is preserved
+              lastLSN: data.lastLSN || previousLSN || '0/0'
             })
           );
           
           syncLogger.debug('Client marked inactive', { 
             clientId: clientIdToRemove,
-            lastLSN: data.lastLSN
+            lastLSN: data.lastLSN || previousLSN || '0/0'
           }, MODULE_NAME);
+        } else {
+          // Handle case where client data doesn't exist
+          syncLogger.warn('Client data not found during cleanup', {
+            clientId: clientIdToRemove
+          }, MODULE_NAME);
+          
+          // Create a new inactive record for tracking
+          await this.context.env.CLIENT_REGISTRY.put(
+            key,
+            JSON.stringify({
+              active: false,
+              lastSeen: Date.now(),
+              disconnectedAt: Date.now(),
+              lastLSN: previousLSN || '0/0'
+            })
+          );
         }
       } catch (err) {
         syncLogger.error('Client deactivation failed', {
           clientId: clientIdToRemove,
+          lsn: previousLSN || 'unknown',
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_NAME);
+        
+        // Don't throw the error - we want to continue even if deactivation fails
       }
+    } else {
+      syncLogger.debug('No client ID to deactivate', {}, MODULE_NAME);
     }
   }
 

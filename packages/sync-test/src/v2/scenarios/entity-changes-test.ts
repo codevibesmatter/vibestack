@@ -49,7 +49,7 @@ const dataSource = new DataSource({
   url: process.env.DATABASE_URL,
   entities: serverEntities,
   synchronize: false,
-  logging: false
+  logging: ['error', 'schema']
 });
 
 /**

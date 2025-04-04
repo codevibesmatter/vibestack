@@ -13,31 +13,28 @@ const MODULE_NAME = 'process-changes';
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
 // ====== Constants ======
-const DEFAULT_STORE_BATCH_SIZE = 100;
-const DEFAULT_CHUNK_SIZE = 500; // Added for chunking broadcasts
+const DEFAULT_STORE_BATCH_SIZE = 500;
+
+// Create a Set of tracked tables for O(1) lookup performance
+const TRACKED_TABLES_SET = new Set(SERVER_DOMAIN_TABLES);
 
 // ====== Helper Functions ======
 export function shouldTrackTable(tableName: string): boolean {
-  if (tableName === 'change_history') {
-    // Don't log this at all - it's too noisy and expected behavior
-    return false;
-  }
+  // Remove special case check for change_history as it's not in TRACKED_TABLES_SET anyway
   
-  // First normalize the table name (add quotes if missing)
+  // Normalize the table name (add quotes if missing)
   const normalizedTableName = tableName.startsWith('"') ? tableName : `"${tableName}"`;
   
-  // Check if the normalized table name is in our domain tables list
-  const isTracked = SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
-  
-  replicationLogger.debug('Checking if table should be tracked', {
-    originalTableName: tableName,
-    normalizedTableName,
-    isTracked,
-    allDomainTables: SERVER_DOMAIN_TABLES
-  }, MODULE_NAME);
-  
-  return isTracked;
+  // Check if the normalized table name is in our domain tables list using O(1) Set lookup
+  return TRACKED_TABLES_SET.has(normalizedTableName as any);
 }
+
+// Static list of tracked tables to be logged once on module initialization
+const TRACKED_TABLES = SERVER_DOMAIN_TABLES.join(', ');
+replicationLogger.info('Replication tracking tables', { 
+  count: SERVER_DOMAIN_TABLES.length,
+  tables: TRACKED_TABLES
+}, MODULE_NAME);
 
 /**
  * Get list of all client IDs from KV
@@ -48,6 +45,7 @@ export async function getAllClientIds(env: Env, timeout = 10 * 60 * 1000): Promi
     const { keys } = await env.CLIENT_REGISTRY.list({ prefix: 'client:' });
     const clientIds: string[] = [];
     const now = Date.now();
+    let removedCount = 0;
     
     for (const key of keys) {
       const value = await env.CLIENT_REGISTRY.get(key.name);
@@ -65,11 +63,7 @@ export async function getAllClientIds(env: Env, timeout = 10 * 60 * 1000): Promi
         } else {
           // Clean up inactive or stale clients
           await env.CLIENT_REGISTRY.delete(key.name);
-          // Log only client ID and time since last seen to reduce verbosity
-          replicationLogger.debug('Cleaned up inactive client', {
-            clientId,
-            inactiveSecs: Math.round(timeSinceLastSeen / 1000)
-          }, MODULE_NAME);
+          removedCount++;
         }
       } catch (err) {
         replicationLogger.error('Client parse error', {
@@ -78,12 +72,19 @@ export async function getAllClientIds(env: Env, timeout = 10 * 60 * 1000): Promi
       }
     }
     
-    // Only log the count at debug level
-    replicationLogger.debug('Active clients retrieved', { count: clientIds.length }, MODULE_NAME);
+    // Log summary instead of individual client details
+    if (removedCount > 0) {
+      replicationLogger.debug('Removed inactive clients', { 
+        count: removedCount,
+        remaining: clientIds.length 
+      }, MODULE_NAME);
+    }
     
     return clientIds;
   } catch (error) {
-    replicationLogger.error('Client retrieval failed', {}, MODULE_NAME);
+    replicationLogger.error('Client retrieval failed', {
+      error: error instanceof Error ? error.message : String(error)
+    }, MODULE_NAME);
     return [];
   }
 }
@@ -97,92 +98,101 @@ export function transformWALChanges(changes: WALData[]): {
   const filteredReasons: Record<string, number> = {};
   // Track change count per WAL entry to improve logging
   let totalChangesInWAL = 0;
-  // Track which tables we've already logged for this batch
-  const loggedTables = new Set<string>();
+  // Track changes by table and operation for summary logging
+  const changesByTable: Record<string, Record<string, number>> = {};
 
   // Simple count only
   replicationLogger.debug(`Processing ${changes.length} WAL entries`, {}, MODULE_NAME);
 
   for (const wal of changes) {
-    try {
-      const parsedData = wal.data ? JSON.parse(wal.data) as PostgresWALMessage : null;
-      if (!parsedData?.change || !Array.isArray(parsedData.change)) {
-        addFilterReason(filteredReasons, 'Invalid WAL data structure');
-        continue;
-      }
+    // Early filtering: Skip entries with no data
+    if (!wal.data) {
+      addFilterReason(filteredReasons, 'No WAL data');
+      continue;
+    }
 
-      // Count total changes in this WAL entry for better logging
-      totalChangesInWAL += parsedData.change.length;
-      
-      // Reset logged tables for this WAL entry
-      loggedTables.clear();
-      
-      // Process ALL changes in the WAL entry - this is the key fix
-      for (const change of parsedData.change) {
+    // Fast pre-check before parsing JSON
+    if (!wal.data.includes('"table"')) {
+      addFilterReason(filteredReasons, 'No table data in WAL entry');
+      continue;
+    }
+    
+    let parsedData: PostgresWALMessage;
+    
+    // Isolated JSON parsing in its own try/catch
+    try {
+      parsedData = JSON.parse(wal.data) as PostgresWALMessage;
+    } catch (error) {
+      addFilterReason(filteredReasons, `JSON parse error: ${error instanceof Error ? error.message : String(error)}`);
+      replicationLogger.error('WAL JSON parse error', {
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      continue;
+    }
+    
+    // Structure validation after parsing
+    if (!parsedData?.change || !Array.isArray(parsedData.change)) {
+      addFilterReason(filteredReasons, 'Invalid WAL data structure');
+      continue;
+    }
+
+    // Count total changes for metrics
+    totalChangesInWAL += parsedData.change.length;
+    
+    // Process changes with early table filtering
+    for (const change of parsedData.change) {
+      try {
+        // Quick structural validation
         if (!change?.schema || !change?.table) {
           addFilterReason(filteredReasons, 'Missing schema or table');
           continue;
         }
         
-        // Only log non-change_history tables to reduce noise, and only log once per table type per WAL entry
-        if (change.table !== 'change_history' && !loggedTables.has(change.table)) {
-          replicationLogger.debug(`Processing ${change.kind} on ${change.table}`, {}, MODULE_NAME);
-          loggedTables.add(change.table);
-        }
-        
+        // Early table tracking check
         if (!shouldTrackTable(change.table)) {
-          // Use a clearer message for change_history table but don't log it
-          if (change.table === 'change_history') {
-            addFilterReason(filteredReasons, 'Intentionally skipping change_history table (expected)');
-          } else {
-            addFilterReason(filteredReasons, `Table ${change.table} not in tracked tables`);
-            // Only log non-tracked tables once per WAL entry
-            if (!loggedTables.has(`skip:${change.table}`)) {
-              replicationLogger.debug(`Skipping non-tracked table: ${change.table}`, {}, MODULE_NAME);
-              loggedTables.add(`skip:${change.table}`);
-            }
-          }
+          addFilterReason(filteredReasons, `Table ${change.table} not in tracked tables`);
           continue;
         }
 
-        // Only log when keeping a domain table change - minimal info and only once per table type
-        if (!loggedTables.has(`keep:${change.table}`)) {
-          replicationLogger.debug(`Keeping ${change.kind} on ${change.table}`, {}, MODULE_NAME);
-          loggedTables.add(`keep:${change.table}`);
+        // Track for summary stats
+        if (!changesByTable[change.table]) {
+          changesByTable[change.table] = {};
         }
-
-        if (change.kind === 'delete') {
-          if (!change.oldkeys) {
-            addFilterReason(filteredReasons, 'Delete operation missing oldkeys');
-            continue;
-          }
-        } else {
-          if (!change.columnnames || !change.columnvalues) {
-            addFilterReason(filteredReasons, 'Insert/Update operation missing column data');
-            continue;
-          }
+        if (!changesByTable[change.table][change.kind]) {
+          changesByTable[change.table][change.kind] = 0;
         }
+        changesByTable[change.table][change.kind]++;
 
-        let data: Record<string, unknown> = {};
+        // Extract data efficiently
+        const data: Record<string, unknown> = {};
         
-        if (change.kind === 'delete') {
-          if (change.oldkeys) {
-            data = change.oldkeys.keyvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
-              acc[change.oldkeys!.keynames[index]] = value;
-              return acc;
-            }, {});
-          }
-        } else {
-          if (change.columnnames && change.columnvalues) {
-            data = change.columnvalues.reduce((acc: Record<string, unknown>, value: unknown, index: number) => {
-              acc[change.columnnames![index]] = value;
-              return acc;
-            }, {});
+        // Column data extraction
+        if (change.columnnames && Array.isArray(change.columnnames) && 
+            change.columnvalues && Array.isArray(change.columnvalues)) {
+          const colCount = Math.min(change.columnnames.length, change.columnvalues.length);
+          
+          for (let i = 0; i < colCount; i++) {
+            data[change.columnnames[i]] = change.columnvalues[i];
           }
         }
+        
+        // Oldkeys extraction for deletes
+        if (change.kind === 'delete' && change.oldkeys && 
+            change.oldkeys.keynames && Array.isArray(change.oldkeys.keynames) && 
+            change.oldkeys.keyvalues && Array.isArray(change.oldkeys.keyvalues)) {
+          const keyCount = Math.min(change.oldkeys.keynames.length, change.oldkeys.keyvalues.length);
+          
+          for (let i = 0; i < keyCount; i++) {
+            data[change.oldkeys.keynames[i]] = change.oldkeys.keyvalues[i];
+          }
+        }
+        
+        // Set timestamp - either from the data or current time
+        const timestamp = 
+          (data.updated_at as string) || 
+          new Date().toISOString();
 
-        const timestamp = data.updated_at as string || new Date().toISOString();
-
+        // Add to result array
         tableChanges.push({
           table: change.table,
           operation: change.kind,
@@ -190,15 +200,13 @@ export function transformWALChanges(changes: WALData[]): {
           lsn: wal.lsn,
           updated_at: timestamp
         });
+      } catch (error) {
+        // More focused error handling at the change level
+        addFilterReason(
+          filteredReasons, 
+          `Error processing change: ${error instanceof Error ? error.message : String(error)}`
+        );
       }
-    } catch (error) {
-      addFilterReason(filteredReasons, 
-        `Error transforming WAL data: ${error instanceof Error ? error.message : String(error)}`
-      );
-      
-      replicationLogger.error('WAL transform error', {
-        error: error instanceof Error ? error.message : String(error)
-      }, MODULE_NAME);
     }
   }
 
@@ -206,9 +214,8 @@ export function transformWALChanges(changes: WALData[]): {
   if (tableChanges.length > 0 || Object.keys(filteredReasons).length > 0) {
     // Extract table names from filtered reasons
     const filteredTables = Object.keys(filteredReasons)
-      .filter(reason => reason.includes('Table ') || reason.includes('change_history'))
+      .filter(reason => reason.includes('Table '))
       .map(reason => {
-        if (reason.includes('change_history')) return 'change_history';
         const match = reason.match(/Table ([^ ]+) not in tracked/);
         return match ? match[1] : null;
       })
@@ -217,18 +224,6 @@ export function transformWALChanges(changes: WALData[]): {
     // Combine kept tables and filtered tables for reporting
     const keptTables = tableChanges.length > 0 ? 
       [...new Set(tableChanges.map(c => c.table))] : [];
-    
-    // Group changes by table and operation for more concise logging
-    const changesByTable: Record<string, Record<string, number>> = {};
-    tableChanges.forEach(change => {
-      if (!changesByTable[change.table]) {
-        changesByTable[change.table] = {};
-      }
-      if (!changesByTable[change.table][change.operation]) {
-        changesByTable[change.table][change.operation] = 0;
-      }
-      changesByTable[change.table][change.operation]++;
-    });
     
     // Create a summary of operations by table
     const tableOperationSummary = Object.entries(changesByTable).map(([table, ops]) => {
@@ -246,15 +241,8 @@ export function transformWALChanges(changes: WALData[]): {
       filtered: totalChangesInWAL - tableChanges.length,
       tables: tableOperationSummary,
       keptTables: keptTables.length > 0 ? keptTables.join(',') : 'none',
-      filteredTables: (filteredTables.length > 0 && filteredTables[0] !== 'change_history') ? 
-                      filteredTables.filter(t => t !== 'change_history').join(',') : 
-                      'none',
-      reasons: Object.keys(filteredReasons).length > 0 && 
-               Object.keys(filteredReasons).some(r => !r.includes('change_history')) ? 
-               Object.fromEntries(
-                 Object.entries(filteredReasons)
-                   .filter(([key]) => !key.includes('change_history'))
-               ) : undefined
+      filteredTables: filteredTables.length > 0 ? filteredTables.join(',') : 'none',
+      reasons: Object.keys(filteredReasons).length > 0 ? filteredReasons : undefined
     }, MODULE_NAME);
   }
 
@@ -285,6 +273,7 @@ export async function storeChangesInHistory(
     .map(([table, count]) => `${table}:${count}`)
     .join(',');
   
+  // Single log at start with essential info
   replicationLogger.info('Storing changes', {
     count: changes.length,
     tables: tablesStr
@@ -297,19 +286,22 @@ export async function storeChangesInHistory(
     await client.connect();
     connected = true;
     
+    // Use a single transaction for all batches
+    await client.query('BEGIN');
+    
     // Track success count
     let successCount = 0;
-    let batchNumber = 0;
+    let failureCount = 0;
     const totalBatches = Math.ceil(changes.length / storeBatchSize);
     
     for (let i = 0; i < changes.length; i += storeBatchSize) {
-      batchNumber++;
       const batch = changes.slice(i, i + storeBatchSize);
       
-      const values = batch.map((change, index) => {
-        const baseIndex = index * 5;
-        return `($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, $${baseIndex + 5}::timestamptz)`;
-      }).join(', ');
+      // Create a multi-row insert with parameterized values
+      const valueRows = batch.map((_, idx) => {
+        const base = idx * 5;
+        return `($${base + 1}, $${base + 2}, $${base + 3}::jsonb, $${base + 4}, $${base + 5}::timestamptz)`;
+      }).join(',\n');
       
       const params: any[] = [];
       batch.forEach(change => {
@@ -324,51 +316,53 @@ export async function storeChangesInHistory(
         );
       });
       
-      // Simple direct insert without transaction
+      // Execute the multi-row insert in a single query
       const query = `
         INSERT INTO change_history 
           (table_name, operation, data, lsn, timestamp) 
         VALUES 
-          ${values};
+          ${valueRows};
       `;
       
       try {
         await client.query(query, params);
         successCount += batch.length;
-        
-        // Only log batch progress at debug level with minimal info
-        // Skip logging individual batches if there's only one batch
-        if (totalBatches > 1) {
-          replicationLogger.debug('Batch inserted', { 
-            batchNumber,
-            totalBatches,
-            batchSize: batch.length,
-            progress: `${successCount}/${changes.length}`
-          }, MODULE_NAME);
-        }
       } catch (insertError) {
-        // Log minimal info for batch errors
+        failureCount += batch.length;
         replicationLogger.error('Batch insert error', {
-          batchNumber,
           batchSize: batch.length,
-          table: batch.length > 0 ? batch[0].table : 'unknown'
+          error: insertError instanceof Error ? insertError.message : String(insertError),
+          batchNumber: Math.floor(i / storeBatchSize) + 1
         }, MODULE_NAME);
         
-        // Continue with next batch instead of failing the whole operation
-        continue;
+        // Continue with next batch - we'll commit what succeeded
       }
     }
     
-    // Log only essential info at info level
+    // Commit the transaction
+    await client.query('COMMIT');
+    
+    // Single log at end with summary results
     replicationLogger.info('Changes stored', { 
-      count: successCount,
-      total: changes.length
+      success: successCount,
+      failed: failureCount,
+      totalBatches
     }, MODULE_NAME);
     
     return successCount > 0;
   } catch (error) {
+    // If we have an open transaction, roll it back
+    if (connected) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        // Ignore rollback errors
+      }
+    }
+    
     replicationLogger.error('Store changes failed', {
-      count: changes.length
+      count: changes.length,
+      error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     
     return false;
@@ -401,6 +395,7 @@ export async function processChanges(
 
   try {
     // Step 1: Transform
+    // Reduced to a single debug log
     replicationLogger.debug(`Processing ${changes.length} WAL entries`, {}, MODULE_NAME);
     const { tableChanges, filteredReasons } = transformWALChanges(changes);
     const filteredCount = changes.length - tableChanges.length;
@@ -437,7 +432,6 @@ export async function processChanges(
     }
 
     // Step 2: Store raw changes in history 
-    // (storeChangesInHistory now handles its own logging more concisely)
     const storedSuccessfully = await storeChangesInHistory(context, tableChanges, storeBatchSize);
     
     if (!storedSuccessfully) {
@@ -466,65 +460,76 @@ export async function processChanges(
     try {
       const clientIds = await getAllClientIds(env);
       
-      // Only log client notification if there are clients
-      if (clientIds.length > 0) {
-        replicationLogger.info('Notifying clients', {
-          count: clientIds.length
-        }, MODULE_NAME);
+      // Skip logging if no clients to notify
+      if (clientIds.length === 0) {
+        return { 
+          success: true, 
+          storedChanges: storedSuccessfully,
+          changeCount: tableChanges.length,
+          filteredCount,
+          lastLSN
+        };
       }
       
-      // Track successful notifications
-      let successCount = 0;
-      let failureCount = 0;
+      // Single log at start of notification with client count only
+      replicationLogger.info('Notifying clients in parallel', {
+        count: clientIds.length
+      }, MODULE_NAME);
       
-      // For each client, send simple notification to check for changes
-      for (const clientId of clientIds) {
-        try {
-          // Get the client's SyncDO
-          const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
-          const clientDo = env.SYNC.get(clientDoId);
-          
-          // Send notification to check for changes
-          const response = await clientDo.fetch(
-            `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                lsn: lastLSN
-              })
-            }
-          );
-          
-          if (response.status === 200) {
-            successCount++;
-          } else {
-            failureCount++;
-            // Only log failures at warn level with minimal info
-            replicationLogger.warn('Client notify failed', {
-              clientId,
-              status: response.status
-            }, MODULE_NAME);
+      // Process all clients in parallel
+      const results = await Promise.all(
+        clientIds.map(async (clientId) => {
+          try {
+            const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
+            const clientDo = env.SYNC.get(clientDoId);
+            
+            const response = await clientDo.fetch(
+              `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ lsn: lastLSN })
+              }
+            );
+            
+            return { 
+              clientId, 
+              success: response.status === 200,
+              error: response.status !== 200 ? `Status ${response.status}` : undefined
+            };
+          } catch (error) {
+            return { 
+              clientId, 
+              success: false, 
+              error: error instanceof Error ? error.message : String(error)
+            };
           }
-        } catch (error) {
-          failureCount++;
-          replicationLogger.error('Client notify error', {
-            clientId
-          }, MODULE_NAME);
-        }
-      }
+        })
+      );
       
-      // Only log notification summary if there were clients
-      if (clientIds.length > 0) {
-        replicationLogger.info('Client notifications completed', {
-          success: successCount,
-          failed: failureCount
+      // Process results
+      const successCount = results.filter(r => r.success).length;
+      const failureCount = results.length - successCount;
+      const failedClients = results.filter(r => !r.success).map(r => r.clientId);
+      
+      // Log any failures individually
+      results.filter(r => !r.success).forEach(result => {
+        replicationLogger.warn('Client notify failed', {
+          clientId: result.clientId,
+          error: result.error
         }, MODULE_NAME);
-      }
+      });
+      
+      // Summary log
+      replicationLogger.info('Client notifications completed', {
+        success: successCount,
+        failed: failureCount,
+        failedClients: failedClients.length > 0 ? failedClients : undefined
+      }, MODULE_NAME);
     } catch (notifyError) {
-      replicationLogger.error('Client notification process failed', {}, MODULE_NAME);
+      replicationLogger.error('Client notification process failed', {
+        error: notifyError instanceof Error ? notifyError.message : String(notifyError)
+      }, MODULE_NAME);
     }
     
     return { 
@@ -548,7 +553,8 @@ export async function processChanges(
     }
     
     replicationLogger.error('Changes processing failed', {
-      lsn: lastLSN
+      lsn: lastLSN,
+      error: errorMsg
     }, MODULE_NAME);
     
     return {

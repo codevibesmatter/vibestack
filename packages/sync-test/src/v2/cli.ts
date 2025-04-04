@@ -67,6 +67,40 @@ commands['live-sync'] = {
   }
 };
 
+// Register the simplified-live-sync command
+commands['simplified-live-sync'] = {
+  name: 'simplified-live-sync',
+  description: 'Run a simplified live sync test with multiple clients',
+  options: [
+    { name: '--clients', description: 'Number of clients to run in parallel', defaultValue: 1 },
+    { name: '--count', description: 'Number of changes to create', defaultValue: 5 }
+  ],
+  handler: async (args: string[]) => {
+    const options = parseCommandOptions(args);
+    const clientCount = parseInt(options['--clients'] as string, 10) || 1;
+    const changeCount = parseInt(options['--count'] as string, 10) || 5;
+    
+    await runSimplifiedLiveSyncTest(clientCount, changeCount);
+  }
+};
+
+// Register the streamlined-live-sync command
+commands['streamlined-live-sync'] = {
+  name: 'streamlined-live-sync',
+  description: 'Run a streamlined live sync test with the new batch changes system',
+  options: [
+    { name: '--clients', description: 'Number of clients to run in parallel', defaultValue: 1 },
+    { name: '--count', description: 'Number of changes to create', defaultValue: 5 }
+  ],
+  handler: async (args: string[]) => {
+    const options = parseCommandOptions(args);
+    const clientCount = parseInt(options['--clients'] as string, 10) || 1;
+    const changeCount = parseInt(options['--count'] as string, 10) || 5;
+    
+    await runStreamlinedLiveSyncTest(clientCount, changeCount);
+  }
+};
+
 // Add more commands here for different test scenarios
 
 /**
@@ -97,23 +131,134 @@ async function runLiveSyncTest(clientCount: number, changeCount: number): Promis
   
   try {
     // We use dynamic import to prevent auto-execution when the module is loaded
-    const { runLiveSyncTest } = await import('./scenarios/live-sync.ts');
+    // Fix the import: get LiveSyncScenario and ScenarioRunner instead of non-existent runLiveSyncTest
+    const { LiveSyncScenario } = await import('./scenarios/live-sync.ts');
+    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
     
     console.log(`\n🔄 Running live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
     
-    const results = await runLiveSyncTest(clientCount, changeCount);
+    // Create a new ScenarioRunner and configure the scenario
+    const runner = new ScenarioRunner();
+    const scenario = LiveSyncScenario;
     
-    // Check if all tests succeeded
-    const allSucceeded = results.every(r => r.success);
-    if (allSucceeded) {
-      console.log('\n✅ Live sync test completed successfully!');
-    } else {
-      console.log('\n❌ Some live sync tests failed. Check the logs above for details.');
-      // Force exit immediately to avoid hanging
-      clearTimeout(globalTimeout);
-      process.exit(1);
-      return;
-    }
+    // Configure the scenario with our parameters
+    scenario.config.customProperties = {
+      ...scenario.config.customProperties,
+      clientCount,
+      changeCount,
+      mode: 'normal'
+    };
+    
+    // Override the default change count
+    scenario.config.changeCount = changeCount;
+    
+    // Set high timeout for long-running tests
+    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
+    
+    // Run the scenario
+    await runner.runScenario(scenario);
+    
+    console.log('\n✅ Live sync test completed successfully!');
+    
+    // Clear the global timeout and exit cleanly
+    clearTimeout(globalTimeout);
+    console.log('Test completed, exiting...');
+    process.exit(0);
+  } catch (error) {
+    console.error('\n❌ Test failed:', error);
+    // Force exit immediately to avoid hanging
+    clearTimeout(globalTimeout);
+    process.exit(1);
+  }
+}
+
+/**
+ * Run a simplified live sync test with specified parameters
+ */
+async function runSimplifiedLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
+  // Set a global timeout to ensure the process exits even if something hangs
+  const globalTimeout = setTimeout(() => {
+    console.error('\n⚠️ Global timeout reached! Forcing exit.');
+    process.exit(1);
+  }, 180000); // 3 minutes max run time
+  
+  try {
+    // We use dynamic import to prevent auto-execution when the module is loaded
+    const { LiveSyncSimplifiedScenario } = await import('./scenarios/live-sync-simplified.ts');
+    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
+    
+    console.log(`\n🔄 Running simplified live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
+    
+    // Create a new ScenarioRunner and configure the scenario
+    const runner = new ScenarioRunner();
+    const scenario = LiveSyncSimplifiedScenario;
+    
+    // Configure the scenario with our parameters
+    scenario.config.customProperties = {
+      ...scenario.config.customProperties,
+      clientCount
+    };
+    
+    // Override the default change count
+    scenario.config.changeCount = changeCount;
+    
+    // Set high timeout for long-running tests
+    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
+    
+    // Run the scenario
+    await runner.runScenario(scenario);
+    
+    console.log('\n✅ Simplified live sync test completed successfully!');
+    
+    // Clear the global timeout and exit cleanly
+    clearTimeout(globalTimeout);
+    console.log('Test completed, exiting...');
+    process.exit(0);
+  } catch (error) {
+    console.error('\n❌ Test failed:', error);
+    // Force exit immediately to avoid hanging
+    clearTimeout(globalTimeout);
+    process.exit(1);
+  }
+}
+
+/**
+ * Run a streamlined live sync test with specified parameters
+ */
+async function runStreamlinedLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
+  // Set a global timeout to ensure the process exits even if something hangs
+  const globalTimeout = setTimeout(() => {
+    console.error('\n⚠️ Global timeout reached! Forcing exit.');
+    process.exit(1);
+  }, 180000); // 3 minutes max run time
+  
+  try {
+    // We use dynamic import to prevent auto-execution when the module is loaded
+    const { StreamlinedLiveSyncScenario } = await import('./scenarios/streamlined-live-sync.ts');
+    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
+    
+    console.log(`\n🔄 Running streamlined live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
+    
+    // Create a new ScenarioRunner and configure the scenario
+    const runner = new ScenarioRunner();
+    const scenario = StreamlinedLiveSyncScenario;
+    
+    // Configure the scenario with our parameters
+    scenario.config.customProperties = {
+      ...scenario.config.customProperties,
+      clientCount
+    };
+    
+    // Override the default change count
+    scenario.config.changeCount = changeCount;
+    
+    // Set high timeout for long-running tests
+    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
+    
+    // Run the scenario
+    await runner.runScenario(scenario);
+    
+    console.log('\n✅ Streamlined live sync test completed successfully!');
     
     // Clear the global timeout and exit cleanly
     clearTimeout(globalTimeout);
