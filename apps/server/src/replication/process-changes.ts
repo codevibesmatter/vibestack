@@ -405,14 +405,6 @@ export async function processChanges(
       !r.includes('Intentionally skipping change_history')
     );
     
-    if (hasImportantFilters) {
-      replicationLogger.info('Changes filtered', {
-        valid: tableChanges.length,
-        filtered: filteredCount,
-        reasons: filteredReasons
-      }, MODULE_NAME);
-    }
-    
     if (tableChanges.length === 0) {
       // Only log for non-change_history updates to reduce noise
       if (hasImportantFilters) {
