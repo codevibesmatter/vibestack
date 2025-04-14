@@ -3,8 +3,9 @@
   "private": true,
   "scripts": {
     "build": "turbo build",
-    "dev": "turbo run dev --filter=./apps/web --filter=./apps/server",
-    "dev:local-db": "bash local-neon/setup-local-neon.sh start && turbo run dev --filter=./apps/web --filter=./apps/server",
+    "dev": "turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/web-dex",
+    "dev:web-dex": "turbo run dev --filter=./apps/web-dex",
+    "dev:local-db": "bash local-neon/setup-local-neon.sh start && turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/web-dex",
     "db:start": "bash local-neon/setup-local-neon.sh start",
     "db:stop": "bash local-neon/setup-local-neon.sh stop",
     "db:down": "bash local-neon/setup-local-neon.sh down",

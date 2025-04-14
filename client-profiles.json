@@ -1,0 +1,38 @@
+[
+  {
+    "id": "d19a2532-5222-4aea-ab4d-c9919a548430",
+    "name": "Client 1",
+    "profileId": 1,
+    "lsn": "0/17A4D428",
+    "timestamp": 1744490224215,
+    "testHistory": {
+      "initial": 0,
+      "liveSync": 0,
+      "catchup": 0
+    }
+  },
+  {
+    "id": "95395f0f-8cf6-426a-a652-8b4abdad24a8",
+    "name": "Client 2",
+    "profileId": 2,
+    "lsn": "0/1764C828",
+    "timestamp": 1744428620512,
+    "testHistory": {
+      "initial": 0,
+      "liveSync": 0,
+      "catchup": 0
+    }
+  },
+  {
+    "id": "42a75c89-1469-4171-8dea-0f17ac8751c6",
+    "name": "Client 101",
+    "profileId": 101,
+    "lsn": "0/17567C60",
+    "timestamp": 1744426945489,
+    "testHistory": {
+      "initial": 0,
+      "liveSync": 0,
+      "catchup": 0
+    }
+  }
+]

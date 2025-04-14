@@ -83,9 +83,10 @@ export class Task extends BaseDomainEntity {
   @IsString({ each: true })
   tags!: string[];
   
-  @Column({ type: "uuid", name: "project_id" })
+  @Column({ type: "uuid", name: "project_id", nullable: true })
+  @IsOptional()
   @IsUUID(4)
-  projectId!: string;
+  projectId?: string;
   
   @Column({ type: "uuid", nullable: true, name: "assignee_id" })
   @IsOptional()
@@ -93,9 +94,9 @@ export class Task extends BaseDomainEntity {
   assigneeId?: string;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
-  @ManyToOne(() => Project, (project) => project.tasks)
+  @ManyToOne(() => Project, (project) => project.tasks, { nullable: true })
   @JoinColumn({ name: "project_id" })
-  project!: Relation<Project>;
+  project?: Relation<Project>;
   
   @ManyToOne(() => User, (user) => user.tasks, { nullable: true })
   @JoinColumn({ name: "assignee_id" })

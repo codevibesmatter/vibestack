@@ -1,676 +1,1561 @@
 /**
- * Entity Changes - Validation Module
+ * Entity Changes - Validation Module V2
  * 
- * This module provides validation functions for WAL and change history.
- * It contains utilities for verifying entity changes have been properly 
- * recorded in both the WAL (Write-Ahead Log) and change_history table.
+ * Provides validation utilities that interface directly with ChangeTracker
+ * for validating entity changes across database and clients.
+ * 
+ * Enhanced with schema validation, reference validation, and pluggable validation rules.
  */
 
-import { getDataSource } from './db-utils.ts';
+import { getDataSource } from './change-applier.ts';
 import { createLogger } from '../logger.ts';
+import { TableChangeTest, ValidationResult } from './types.ts';
+import { ChangeTracker, globalChangeTracker } from './change-tracker.ts';
+import { 
+  EntityType, 
+  TABLE_TO_ENTITY, 
+  getEntityClass,
+  EntityRelationship,
+  getOutgoingRelationships,
+  getIncomingRelationships,
+  findRelationshipByInverseName
+} from './entity-adapter.ts';
+import { TableChange } from '@repo/sync-types';
+import { validate, ValidationError, ValidatorOptions } from 'class-validator';
+import { In } from 'typeorm';
 
 // Create logger for this module
-const logger = createLogger('entity-changes:validation');
+const logger = createLogger('entity-changes.validation');
+
+// Types and interfaces for enhanced validation
 
 /**
- * Verify that entity changes appear in WAL and/or change history
- * 
- * @param changedEntityIds Map of table names to arrays of entity IDs to look for
- * @param startLSN Starting LSN
- * @param endLSN Ending LSN
- * @returns Map of table names to arrays of entity IDs that were found
+ * Schema validation options
  */
-export async function verifyWALChanges(
-  changedEntityIds: Record<string, string[]>,
-  startLSN: string,
-  endLSN: string
-): Promise<Record<string, string[]>> {
-  logger.info(`Verifying WAL changes between LSN ${startLSN} and ${endLSN}`);
-  
-  // Main approach: Check the change_history table for entity IDs
-  const changeHistoryEntries = await queryChangeHistory(startLSN, endLSN, 500);
-  
-  // Group change_history entries by table
-  const entriesByTable: Record<string, { ids: string[], count: number }> = {};
-  
-  // Process each entry from change_history
-  changeHistoryEntries.forEach(entry => {
-    const tableName = entry.table_name;
-    const entityId = entry.data?.id?.toString();
-    
-    if (!entriesByTable[tableName]) {
-      entriesByTable[tableName] = { ids: [], count: 0 };
-    }
-    
-    entriesByTable[tableName].count++;
-    
-    if (entityId && !entriesByTable[tableName].ids.includes(entityId)) {
-      entriesByTable[tableName].ids.push(entityId);
-    }
-  });
-  
-  // Log findings from change_history
-  if (Object.keys(entriesByTable).length > 0) {
-    logger.info(`Found changes in change_history table:`);
-    Object.entries(entriesByTable).forEach(([table, data]) => {
-      logger.info(`  ${table}: ${data.count} changes with ${data.ids.length} unique IDs`);
-      if (data.ids.length > 0) {
-        logger.debug(`    IDs: ${data.ids.join(', ')}`);
-      }
-    });
-  } else {
-    logger.warn(`No changes found in change_history table between LSN ${startLSN} and ${endLSN}`);
-    
-    // If no changes were found in change_history, check if the LSN range is valid
-    logger.info(`Checking if LSN range ${startLSN} -> ${endLSN} is valid`);
-    if (startLSN === endLSN) {
-      logger.warn(`Start and end LSN are identical (${startLSN}), which means no changes were recorded in WAL`);
-    }
-  }
-  
-  // Secondary approach: Check directly in WAL
-  // Using a simplified version that just checks for the existence of WAL entries
-  let foundIdsByWAL: Record<string, string[]> = {};
-  
-  try {
-    // First, make sure we have the most up-to-date list of replication slots
-    const slots = await listReplicationSlots();
-    
-    // Find active logical replication slots with the wal2json plugin
-    const activeSlots = slots.filter(s => s.active && s.plugin === 'wal2json').map(s => s.slot_name);
-    const inactiveSlots = slots.filter(s => !s.active && s.plugin === 'wal2json').map(s => s.slot_name);
-    
-    logger.info(`Found ${activeSlots.length} active and ${inactiveSlots.length} inactive wal2json slots`);
-    
-    // Try to query active slots first, then inactive as fallback
-    let walEntries: Array<{lsn: string, data: string}> = [];
-    const slotsToTry = [...activeSlots, ...inactiveSlots, 'vibestack'];
-    
-    for (const slotName of slotsToTry) {
-      if (walEntries.length > 0) break; // Stop if we already found entries
-      
-      logger.info(`Trying to query WAL from slot '${slotName}'`);
-      // Use startLSN to match server polling behavior
-      const entries = await queryWALDirectly(slotName, { 
-        limit: 100,
-        startLSN: startLSN // This will filter changes with LSN > startLSN
-      });
-      
-      if (entries.length > 0) {
-        walEntries = entries;
-        logger.info(`Found ${entries.length} WAL entries in slot '${slotName}'`);
-        break;
-      }
-    }
-    
-    // If we found WAL entries, check for the entity IDs
-    if (walEntries.length > 0) {
-      foundIdsByWAL = extractEntityIdsFromWAL(walEntries, changedEntityIds);
-      
-      // Log findings from WAL
-      logger.info(`Entity IDs found in WAL:`);
-      Object.entries(foundIdsByWAL).forEach(([table, ids]) => {
-        logger.info(`  ${table}: ${ids.length} entities`);
-        if (ids.length > 0) {
-          logger.debug(`    IDs: ${ids.join(', ')}`);
-        }
-      });
-    } else {
-      logger.warn(`No WAL entries found in any replication slot`);
-    }
-  } catch (error: any) {
-    logger.error(`Error querying WAL directly: ${error.message || error}`);
-  }
-  
-  // Merge findings from both sources
-  const mergedResults: Record<string, string[]> = {};
-  
-  // Get all unique tables
-  const allTables = [...new Set([
-    ...Object.keys(entriesByTable),
-    ...Object.keys(foundIdsByWAL)
-  ])];
-  
-  // Combine findings for each table
-  allTables.forEach(table => {
-    const historyIds = entriesByTable[table]?.ids || [];
-    const walIds = foundIdsByWAL[table] || [];
-    
-    // Combine and deduplicate
-    mergedResults[table] = [...new Set([...historyIds, ...walIds])];
-  });
-  
-  // Final report
-  logger.info(`Combined entities found in WAL and change_history:`);
-  Object.entries(mergedResults).forEach(([table, ids]) => {
-    logger.info(`  ${table}: ${ids.length} entities found`);
-  });
-  
-  return mergedResults;
+export interface SchemaValidationOptions extends ValidatorOptions {
+  allowUnknownProperties?: boolean;
+  requiredProperties?: string[];
+  customValidators?: CustomValidator[];
 }
 
 /**
- * Extract entity IDs from WAL entries
+ * Reference validation options
  */
-function extractEntityIdsFromWAL(
-  walEntries: Array<{lsn: string, data: string}>,
-  targetEntityIds: Record<string, string[]>
-): Record<string, string[]> {
-  const foundIds: Record<string, string[]> = {};
-  // New: Track LSN values for each entity
-  const entityLSNs: Record<string, Record<string, string>> = {};
-  
-  try {
-    // Initialize foundIds with empty arrays for each target table
-    Object.keys(targetEntityIds).forEach(table => {
-      foundIds[table] = [];
-      entityLSNs[table] = {};
-    });
-    
-    // Process each WAL entry
-    walEntries.forEach(entry => {
-      // Parse the WAL entry data
-      try {
-        const jsonData = JSON.parse(entry.data);
-        
-        if (jsonData.change && Array.isArray(jsonData.change)) {
-          jsonData.change.forEach((change: any) => {
-            const tableName = change.table;
-            
-            // Convert to plural form if necessary to match our entity tables
-            const normalizedTable = tableName.endsWith('s') ? tableName : `${tableName}s`;
-            
-            // Skip tables we don't care about
-            if (!targetEntityIds[normalizedTable]) return;
-            
-            // Try to extract entity ID
-            let entityId: string | null = null;
-            
-            // Check for id in columnvalues (INSERT)
-            if (change.columnnames && change.columnvalues) {
-              const idIndex = change.columnnames.indexOf('id');
-              if (idIndex !== -1 && idIndex < change.columnvalues.length) {
-                entityId = change.columnvalues[idIndex]?.toString();
-              }
-            }
-            
-            // Check for id in newvalues (UPDATE)
-            if (!entityId && change.newvalues && change.newvalues.id) {
-              entityId = change.newvalues.id.toString();
-            }
-            
-            // Check for id in oldvalues (DELETE)
-            if (!entityId && change.oldvalues && change.oldvalues.id) {
-              entityId = change.oldvalues.id.toString();
-            }
-            
-            // If we found an entity ID, record it
-            if (entityId && !foundIds[normalizedTable].includes(entityId)) {
-              foundIds[normalizedTable].push(entityId);
-              // Store the LSN for this entity
-              entityLSNs[normalizedTable][entityId] = entry.lsn;
-            }
-          });
-        }
-      } catch (parseError) {
-        logger.error(`Error parsing WAL data: ${parseError}`);
-      }
-    });
-    
-    // Log detailed LSN information for debugging
-    logger.info('--- Detailed WAL entity LSN values ---');
-    Object.entries(entityLSNs).forEach(([table, idToLsn]) => {
-      if (Object.keys(idToLsn).length > 0) {
-        logger.info(`Table: ${table}`);
-        Object.entries(idToLsn).forEach(([entityId, lsn]) => {
-          logger.info(`  Entity ID: ${entityId}, LSN: ${lsn}`);
-        });
-      }
-    });
-    
-    // Count unique LSN values for each table
-    const lsnStats: Record<string, { uniqueLSNs: number, lsnValues: string[] }> = {};
-    Object.entries(entityLSNs).forEach(([table, idToLsn]) => {
-      const lsnSet = new Set(Object.values(idToLsn));
-      lsnStats[table] = {
-        uniqueLSNs: lsnSet.size,
-        lsnValues: [...lsnSet]
-      };
-    });
-    
-    logger.info('--- LSN Statistics ---');
-    Object.entries(lsnStats).forEach(([table, stats]) => {
-      if (foundIds[table].length > 0) {
-        logger.info(`Table: ${table}, Entities: ${foundIds[table].length}, Unique LSNs: ${stats.uniqueLSNs}`);
-        logger.info(`  LSN values: ${stats.lsnValues.join(', ')}`);
-      }
-    });
-    
-  } catch (error) {
-    logger.error(`Error extracting entity IDs from WAL: ${error}`);
-  }
-  
-  return foundIds;
+export interface ReferenceValidationOptions {
+  checkRelatedEntities?: boolean;
+  validateRelationships?: boolean;
+  allowMissingReferences?: boolean;
+  allowDanglingReferences?: boolean;
+  customReferenceValidators?: CustomReferenceValidator[];
 }
 
 /**
- * Query the change_history table for changes within an LSN range
+ * Combined validation options
  */
-export async function queryChangeHistory(
-  startLSN: string,
-  endLSN: string,
-  limit: number = 100
-): Promise<Array<{
-  id: number;
-  table_name: string;
-  operation: 'insert' | 'update' | 'delete';
-  data: any;
-  lsn: string;
-  timestamp: string;
-}>> {
-  const dataSource = await getDataSource();
-  
-  try {
-    // Query the change_history table
-    const result = await dataSource.query(
-      `SELECT 
-        id, table_name, operation, data, lsn, timestamp
-      FROM 
-        change_history
-      WHERE 
-        lsn >= $1 AND lsn <= $2
-      ORDER BY 
-        id ASC
-      LIMIT $3`,
-      [startLSN, endLSN, limit]
-    );
-    
-    // Parse the JSON data field for each row
-    return result.map((row: any) => ({
-      ...row,
-      data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data
-    }));
-  } catch (error) {
-    logger.error(`Error querying change_history: ${error}`);
-    return [];
-  }
+export interface ValidationOptions {
+  schema?: SchemaValidationOptions;
+  reference?: ReferenceValidationOptions;
+  intentionalDuplicates?: { original: TableChangeTest, duplicate: TableChangeTest }[];
+  allowExtraChanges?: boolean;
 }
 
 /**
- * Initialize replication setup in the database
+ * Custom validator function type
  */
-export async function initializeReplication(): Promise<boolean> {
-  const dataSource = await getDataSource();
-  
-  try {
-    // Check if the change_history table exists
-    const tableExists = await dataSource.query(
-      `SELECT EXISTS (
-        SELECT FROM pg_tables 
-        WHERE schemaname = 'public' 
-        AND tablename = 'change_history'
-      )`
-    );
-    
-    if (!tableExists[0].exists) {
-      // Create the table if it doesn't exist
-      await dataSource.query(`
-        CREATE TABLE IF NOT EXISTS change_history (
-          id SERIAL PRIMARY KEY,
-          table_name VARCHAR(100) NOT NULL,
-          operation VARCHAR(10) NOT NULL,
-          data JSONB NOT NULL,
-          lsn VARCHAR(50) NOT NULL,
-          timestamp TIMESTAMPTZ NOT NULL
-        )
-      `);
-      logger.info('Created change_history table');
-    }
-    
-    // Check if replication slot exists
-    const slotExists = await dataSource.query(
-      `SELECT EXISTS (
-        SELECT 1 FROM pg_replication_slots 
-        WHERE slot_name = 'vibestack'
-      )`
-    );
-    
-    if (!slotExists[0].exists) {
-      // Create replication slot
-      try {
-        await dataSource.query(
-          `SELECT pg_create_logical_replication_slot('vibestack', 'wal2json')`
-        );
-        logger.info('Created vibestack replication slot');
-      } catch (slotError: any) {
-        // Check if it's a duplicate name error - this is fine
-        if (slotError.message && slotError.message.includes('already exists')) {
-          logger.info('Replication slot vibestack already exists');
-        } else {
-          logger.error(`Error creating replication slot: ${slotError.message}`);
-          throw slotError;
-        }
-      }
-    }
-    
-    return true;
-  } catch (error) {
-    logger.error(`Error initializing replication: ${error}`);
-    return false;
-  }
+export type CustomValidator = (
+  entity: any, 
+  entityType: EntityType, 
+  operation: 'create' | 'update' | 'delete'
+) => Promise<string[]>;
+
+/**
+ * Custom reference validator function type
+ */
+export type CustomReferenceValidator = (
+  entity: any,
+  entityType: EntityType,
+  relatedEntities: Record<string, any[]>
+) => Promise<string[]>;
+
+/**
+ * Detailed validation error format
+ */
+export interface DetailedValidationError {
+  entityId: string;
+  entityType: EntityType;
+  property?: string;
+  errors: string[];
+  operation: string;
+  severity: 'error' | 'warning';
 }
 
 /**
- * Get the current Log Sequence Number (LSN) from the database
+ * Extended validation result with detailed errors
  */
-export async function getCurrentLSN(): Promise<string> {
-  const dataSource = await getDataSource();
-  
-  try {
-    // Query current LSN
-    const result = await dataSource.query('SELECT pg_current_wal_lsn() as lsn');
-    return result[0].lsn;
-  } catch (error) {
-    logger.error(`Error getting current LSN: ${error}`);
-    return '0/0';
-  }
-}
-
-/**
- * Query WAL changes directly from a replication slot
- * 
- * @param slotName Name of the replication slot to query
- * @param options Additional options
- * @returns Array of WAL entries
- */
-export async function queryWALDirectly(
-  slotName: string = 'vibestack',
-  options: {
-    limit?: number;
-    startLSN?: string;
-  } = {}
-): Promise<Array<{
-  lsn: string;
-  data: string;
-  xid: number;
-}>> {
-  const dataSource = await getDataSource();
-  const limit = options.limit || 100;
-  const startLSN = options.startLSN || null;
-  
-  try {
-    // Get slot info first to check if it exists and is active
-    const slotInfo = await getReplicationSlotInfo(slotName);
-    
-    if (!slotInfo) {
-      logger.warn(`Replication slot '${slotName}' does not exist`);
-      return [];
-    }
-    
-    // Query changes from the replication slot using peek to match server behavior
-    let query: string;
-    let params: any[];
-    
-    if (startLSN) {
-      // Filter by LSN if provided (matching server behavior)
-      logger.info(`Querying WAL with LSN filter: LSN > ${startLSN}`);
-      query = `
-        SELECT lsn, data, xid 
-        FROM pg_logical_slot_peek_changes(
-          $1,
-          NULL,
-          NULL,
-          'include-xids', '1',
-          'include-timestamp', 'true'
-        )
-        WHERE lsn > $2::pg_lsn
-        LIMIT $3
-      `;
-      params = [slotName, startLSN, limit];
-    } else {
-      // No LSN filter
-      logger.info(`Querying WAL without LSN filter`);
-      query = `
-        SELECT lsn, data, xid 
-        FROM pg_logical_slot_peek_changes(
-          $1,
-          NULL,
-          NULL,
-          'include-xids', '1',
-          'include-timestamp', 'true'
-        )
-        LIMIT $2
-      `;
-      params = [slotName, limit];
-    }
-    
-    const result = await dataSource.query(query, params);
-    
-    if (result.length > 0) {
-      logger.info(`Found ${result.length} WAL entries in slot '${slotName}' using peek (matching server behavior)`);
-      
-      // Log LSN values for each WAL entry
-      logger.info('--- WAL Entry LSNs ---');
-      result.forEach((entry: {lsn: string, xid: number}, index: number) => {
-        logger.info(`  Entry ${index + 1}: LSN=${entry.lsn}, XID=${entry.xid}`);
-      });
-      
-      // Summarize LSN range
-      if (result.length > 0) {
-        const firstLSN = result[0].lsn;
-        const lastLSN = result[result.length - 1].lsn;
-        logger.info(`WAL entries span LSN range: ${firstLSN} → ${lastLSN}`);
-      }
-    } else {
-      if (startLSN) {
-        logger.warn(`No WAL entries found in slot '${slotName}' with LSN > ${startLSN}`);
-      } else {
-        logger.warn(`No WAL entries found in slot '${slotName}' using peek`);
-      }
-    }
-    
-    return result;
-  } catch (error: any) {
-    // Special handling for "replication slot is active" errors
-    if (error.message && error.message.includes('is active')) {
-      logger.warn(`Could not read from slot '${slotName}' because it's active`);
-    } else {
-      logger.error(`Error querying WAL from slot '${slotName}': ${error.message || error}`);
-    }
-    return [];
-  }
-}
-
-/**
- * Get detailed information about a replication slot
- */
-export async function getReplicationSlotInfo(
-  slotName: string = 'vibestack'
-): Promise<{
-  slot_name: string;
-  plugin: string;
-  slot_type: string;
-  database: string;
-  active: boolean;
-  xmin: string | null;
-  catalog_xmin: string | null;
-  restart_lsn: string;
-  confirmed_flush_lsn: string | null;
-} | null> {
-  const dataSource = await getDataSource();
-  
-  try {
-    const result = await dataSource.query(
-      `SELECT 
-        slot_name,
-        plugin,
-        slot_type,
-        database,
-        active,
-        xmin,
-        catalog_xmin,
-        restart_lsn,
-        confirmed_flush_lsn
-      FROM 
-        pg_replication_slots
-      WHERE 
-        slot_name = $1`,
-      [slotName]
-    );
-    
-    return result.length > 0 ? result[0] : null;
-  } catch (error) {
-    logger.error(`Error getting replication slot info: ${error}`);
-    return null;
-  }
-}
-
-/**
- * List all replication slots in the database
- */
-export async function listReplicationSlots(): Promise<Array<{
-  slot_name: string;
-  plugin: string;
-  slot_type: string;
-  database: string;
-  active: boolean;
-  restart_lsn: string;
-}>> {
-  const dataSource = await getDataSource();
-  
-  try {
-    const result = await dataSource.query(
-      `SELECT 
-        slot_name,
-        plugin,
-        slot_type,
-        database,
-        active,
-        restart_lsn
-      FROM 
-        pg_replication_slots`
-    );
-    
-    return result;
-  } catch (error) {
-    logger.error(`Error listing replication slots: ${error}`);
-    return [];
-  }
-}
-
-/**
- * Validate that changes were properly recorded
- * This is a comprehensive validation that combines several checks
- * 
- * @param appliedChanges The changes that were applied
- * @param startLSN The starting LSN before changes were applied
- * @param endLSN The ending LSN after changes were applied
- */
-export async function validateEntityChanges(
-  appliedChanges: Array<any>,
-  startLSN: string,
-  endLSN: string
-): Promise<{
+export interface DetailedValidationResult {
   success: boolean;
-  lsnAdvanced: boolean;
-  entityVerificationSuccess: boolean;
-  appliedIdsByTable: Record<string, string[]>;
-  foundIdsByTable: Record<string, string[]>;
-  missingIdsByTable: Record<string, string[]>;
-  startLSN: string;
-  endLSN: string;
-}> {
-  // Check if LSN has advanced, which is the primary indicator of WAL changes
-  const lsnAdvanced = startLSN !== endLSN;
-  logger.info(`LSN advanced from ${startLSN} to ${endLSN}: ${lsnAdvanced ? 'YES ✅' : 'NO ❌'}`);
+  errors: DetailedValidationError[];
+  warnings: DetailedValidationError[];
+  summary: {
+    total: number;
+    errors: number;
+    warnings: number;
+    byEntityType: Record<string, number>;
+    byOperation: Record<string, number>;
+  };
+}
+
+/**
+ * Extended ValidationResult type with additional properties for sync validation
+ */
+export interface SyncValidationResult {
+  success: boolean;
+  summary: {
+    total: {
+      database: number;
+      received: number;
+      expected: number;
+      intentionalDuplicates: number;
+      deduplicationSuccess: boolean;
+    };
+    byTable: Record<string, {
+      database: number;
+      received: number;
+      missing: number;
+      extra: number;
+    }>;
+    byOperation: Record<string, {
+      database: number;
+      received: number;
+      missing: number;
+      extra: number;
+    }>;
+  };
+  details: {
+    missingChanges: TableChangeTest[];
+    extraChanges: TableChangeTest[];
+    intentionalDuplicates: { original: TableChangeTest, duplicate: TableChangeTest }[];
+    deduplicatedChanges: { original: TableChangeTest, duplicate: TableChangeTest }[];
+    receivedDuplicates: {original: TableChangeTest, duplicates: TableChangeTest[]}[];
+  };
+}
+
+// Global registry for custom validators
+const customValidators: CustomValidator[] = [];
+const customReferenceValidators: CustomReferenceValidator[] = [];
+
+/**
+ * Register a custom validator
+ * @param validator The custom validator to register
+ */
+export function registerCustomValidator(validator: CustomValidator): void {
+  customValidators.push(validator);
+  logger.info(`Registered custom validator, total: ${customValidators.length}`);
+}
+
+/**
+ * Register a custom reference validator
+ * @param validator The custom reference validator to register
+ */
+export function registerCustomReferenceValidator(validator: CustomReferenceValidator): void {
+  customReferenceValidators.push(validator);
+  logger.info(`Registered custom reference validator, total: ${customReferenceValidators.length}`);
+}
+
+/**
+ * Clear all registered custom validators
+ */
+export function clearCustomValidators(): void {
+  customValidators.length = 0;
+  customReferenceValidators.length = 0;
+  logger.info('Cleared all custom validators');
+}
+
+// SCHEMA VALIDATION FUNCTIONS
+
+/**
+ * Validate entity schema using class-validator enhanced with custom validation
+ * @param entity The entity to validate
+ * @param entityType The type of the entity
+ * @param operation The operation being performed
+ * @param options Validation options
+ * @returns Array of validation error messages
+ */
+export async function validateEntitySchema(
+  entity: any, 
+  entityType: EntityType,
+  operation: 'create' | 'update' | 'delete',
+  options: SchemaValidationOptions = {}
+): Promise<string[]> {
+  const errors: string[] = [];
   
-  // If LSN has not advanced, no changes were recorded
-  if (!lsnAdvanced) {
-    logger.error('LSN did not advance, indicating WAL changes were not recorded');
+  try {
+    // Use class-validator for standard validation
+    const validationErrors = await validate(entity, options);
+    
+    if (validationErrors.length > 0) {
+      errors.push(
+        ...validationErrors.map(error => 
+          `${error.property}: ${Object.values(error.constraints || {}).join(', ')}`
+        )
+      );
+    }
+    
+    // Check for required properties
+    if (options.requiredProperties && operation !== 'delete') {
+      for (const prop of options.requiredProperties) {
+        if (entity[prop] === undefined || entity[prop] === null) {
+          errors.push(`${prop}: Property is required`);
+        }
+      }
+    }
+    
+    // Check for unknown properties
+    if (!options.allowUnknownProperties && operation !== 'delete') {
+      const EntityClass = getEntityClass(entityType);
+      const entity_instance = new EntityClass();
+      const knownProps = Object.getOwnPropertyNames(entity_instance);
+      
+      // Also consider id as a known property
+      knownProps.push('id');
+      
+      for (const prop in entity) {
+        if (!knownProps.includes(prop) && !prop.startsWith('__')) {
+          errors.push(`${prop}: Unknown property not defined in entity schema`);
+        }
+      }
+    }
+    
+    // Apply custom validators
+    const customValidatorsToApply = [
+      ...(options.customValidators || []),
+      ...customValidators
+    ];
+    
+    for (const validator of customValidatorsToApply) {
+      const customErrors = await validator(entity, entityType, operation);
+      errors.push(...customErrors);
+    }
+    
+    return errors;
+  } catch (error) {
+    logger.error(`Error validating entity schema: ${error}`);
+    return [`Schema validation error: ${error}`];
+  }
+}
+
+/**
+ * Validate multiple entities' schemas
+ * @param entities Entities to validate
+ * @param entityType The type of the entities
+ * @param operation The operation being performed
+ * @param options Validation options
+ * @returns Record of validation errors by entity ID
+ */
+export async function validateEntitiesSchema(
+  entities: any[],
+  entityType: EntityType,
+  operation: 'create' | 'update' | 'delete',
+  options: SchemaValidationOptions = {}
+): Promise<Record<string, string[]>> {
+  const validationErrors: Record<string, string[]> = {};
+  
+  for (let i = 0; i < entities.length; i++) {
+    const entity = entities[i];
+    const errors = await validateEntitySchema(entity, entityType, operation, options);
+    
+    if (errors.length > 0) {
+      const idOrIndex = entity.id || `index_${i}`;
+      validationErrors[idOrIndex] = errors;
+    }
+  }
+  
+  return validationErrors;
+}
+
+// REFERENCE VALIDATION FUNCTIONS
+
+/**
+ * Get all relationships for an entity type (both incoming and outgoing)
+ * @param entityType The entity type to get relationships for
+ * @returns Record of relationships by property name
+ */
+function getEntityRelationships(entityType: EntityType): Record<string, EntityRelationship> {
+  const outgoing = getOutgoingRelationships(entityType);
+  const incoming = getIncomingRelationships(entityType);
+  
+  // Combine and index by property name
+  const result: Record<string, EntityRelationship> = {};
+  
+  // Process outgoing relationships (where this entity is the source)
+  for (const rel of outgoing) {
+    if (rel.sourceField) {
+      result[rel.sourceField] = rel;
+    }
+  }
+  
+  // Process incoming relationships (where this entity is the target)
+  for (const rel of incoming) {
+    if (rel.targetField) {
+      result[rel.targetField] = rel;
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Validate entity references based on relationships defined in entity-adapter
+ * @param entity The entity to validate
+ * @param entityType The type of the entity
+ * @param options Reference validation options
+ * @returns Array of validation error messages
+ */
+export async function validateEntityReferences(
+  entity: any,
+  entityType: EntityType,
+  options: ReferenceValidationOptions = {}
+): Promise<string[]> {
+  if (!entity.id) {
+    return ['Cannot validate references without entity ID'];
+  }
+  
+  const errors: string[] = [];
+  const dataSource = await getDataSource();
+  const relationships = getEntityRelationships(entityType);
+  
+  // Skip if no relationships to validate
+  if (!relationships || Object.keys(relationships).length === 0) {
+    return [];
+  }
+  
+  // Gather all referenced IDs to check
+  const referencesToCheck: Record<EntityType, string[]> = {
+    user: [],
+    project: [],
+    task: [],
+    comment: []
+  };
+  
+  // Find all referenced entities
+  for (const [prop, rel] of Object.entries(relationships)) {
+    const referencedId = entity[prop];
+    if (referencedId && typeof referencedId === 'string') {
+      referencesToCheck[rel.targetEntity].push(referencedId);
+    }
+  }
+  
+  // Check if all referenced entities exist
+  const relatedEntities: Record<string, any[]> = {};
+  
+  for (const [refEntityType, ids] of Object.entries(referencesToCheck)) {
+    if (ids.length === 0) continue;
+    
+    const refType = refEntityType as EntityType;
+    const EntityClass = getEntityClass(refType);
+    const repository = dataSource.getRepository(EntityClass);
+    
+    // Find all referenced entities in one query
+    try {
+      const foundEntities = await repository.find({
+        where: { id: In(ids) }
+      });
+      
+      // Store found entities for custom validators
+      relatedEntities[refEntityType] = foundEntities;
+      
+      // Validation will be skipped if allowed by options
+      if (options.allowMissingReferences) {
+        continue;
+      }
+      
+      // Create a set of found IDs for efficient lookup
+      const foundIds = new Set<string>(foundEntities.map(e => e.id));
+      
+      // Check if all referenced IDs were found
+      for (const [prop, rel] of Object.entries(relationships)) {
+        if (rel.targetEntity === refType) {
+          const referencedId = entity[prop];
+          if (referencedId && !foundIds.has(referencedId)) {
+            errors.push(`${prop}: Referenced ${refEntityType} with ID ${referencedId} does not exist`);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`Error checking references for ${refEntityType}: ${error}`);
+      errors.push(`Reference check error for ${refEntityType}: ${error}`);
+    }
+  }
+  
+  // Apply custom reference validators
+  const customRefsToApply = [
+    ...(options.customReferenceValidators || []),
+    ...customReferenceValidators
+  ];
+  
+  for (const validator of customRefsToApply) {
+    const customErrors = await validator(entity, entityType, relatedEntities);
+    errors.push(...customErrors);
+  }
+  
+  return errors;
+}
+
+/**
+ * Validate multiple entities' references
+ * @param entities Entities to validate
+ * @param entityType The type of the entities
+ * @param options Reference validation options
+ * @returns Record of validation errors by entity ID
+ */
+export async function validateEntitiesReferences(
+  entities: any[],
+  entityType: EntityType,
+  options: ReferenceValidationOptions = {}
+): Promise<Record<string, string[]>> {
+  const validationErrors: Record<string, string[]> = {};
+  
+  for (const entity of entities) {
+    if (!entity.id) continue;
+    
+    const errors = await validateEntityReferences(entity, entityType, options);
+    
+    if (errors.length > 0) {
+      validationErrors[entity.id] = errors;
+    }
+  }
+  
+  return validationErrors;
+}
+
+/**
+ * Validate changes from different perspectives
+ * @param arg1 First argument - could be an array of changes to validate or database changes
+ * @param arg2 Optional second argument - could be client changes or options
+ * @param arg3 Optional third argument - options when first two are dbChanges and clientChanges
+ * @returns Validation result with appropriate structure based on arguments
+ */
+export async function validateChanges(
+  arg1: TableChangeTest[] | TableChange[],
+  arg2?: ValidationOptions | TableChange[],
+  arg3?: ValidationOptions
+): Promise<DetailedValidationResult | SyncValidationResult> {
+  // Case 1: Single array of changes with validation options
+  if (!arg2 || typeof arg2 === 'object' && !Array.isArray(arg2)) {
+    const changes = arg1 as TableChangeTest[];
+    const options = arg2 as ValidationOptions || {};
+    
+    return validateEntitiesWithSchema(changes, options);
+  }
+  
+  // Case 2: Database changes and client changes with options
+  const dbChanges = arg1 as TableChangeTest[];
+  const clientChanges = arg2 as TableChange[];
+  const options = arg3 || {};
+  
+  // Call the sync validation function
+  return validateSyncChanges(dbChanges, clientChanges, options);
+}
+
+/**
+ * Internal function for validating entities with schema
+ */
+async function validateEntitiesWithSchema(
+  changes: TableChangeTest[],
+  options: ValidationOptions = {}
+): Promise<DetailedValidationResult> {
+  if (!changes.length) {
     return {
-      success: false,
-      lsnAdvanced: false,
-      entityVerificationSuccess: false,
-      appliedIdsByTable: {},
-      foundIdsByTable: {},
-      missingIdsByTable: {},
-      startLSN,
-      endLSN
+      success: true,
+      errors: [],
+      warnings: [],
+      summary: {
+        total: 0,
+        errors: 0,
+        warnings: 0,
+        byEntityType: {},
+        byOperation: {}
+      }
     };
   }
   
-  // Ensure replication is initialized
-  logger.info('Ensuring replication system is initialized');
-  await initializeReplication();
+  logger.info(`Validating ${changes.length} changes with enhanced validation`);
   
-  // Extract applied entity IDs by table from the applied changes
-  const appliedIdsByTable: Record<string, string[]> = {};
+  // Group changes by entity type and operation for more efficient validation
+  const changesByEntityType: Record<EntityType, {
+    create: TableChangeTest[],
+    update: TableChangeTest[],
+    delete: TableChangeTest[]
+  }> = {
+    user: { create: [], update: [], delete: [] },
+    project: { create: [], update: [], delete: [] },
+    task: { create: [], update: [], delete: [] },
+    comment: { create: [], update: [], delete: [] }
+  };
   
-  // Group entity IDs by table from applied changes
-  for (const change of appliedChanges) {
-    if (!change.data || !change.data.id) continue;
+  // Organize changes by entity type and operation
+  for (const change of changes) {
+    const entityType = TABLE_TO_ENTITY[change.table];
+    if (!entityType) continue;
     
-    const table = change.table;
-    const entityId = change.data.id.toString();
-    
-    if (!appliedIdsByTable[table]) {
-      appliedIdsByTable[table] = [];
-    }
-    
-    if (!appliedIdsByTable[table].includes(entityId)) {
-      appliedIdsByTable[table].push(entityId);
+    const operation = change.operation;
+    if (operation === 'insert') {
+      changesByEntityType[entityType].create.push(change);
+    } else if (operation === 'update') {
+      changesByEntityType[entityType].update.push(change);
+    } else if (operation === 'delete') {
+      changesByEntityType[entityType].delete.push(change);
     }
   }
   
-  // Log what we're looking for in the WAL
-  logger.info('Looking for the following entity IDs in WAL:');
-  Object.entries(appliedIdsByTable).forEach(([table, ids]) => {
-    logger.info(`  ${table}: ${ids.length} entities [${ids.slice(0, 5).join(', ')}${ids.length > 5 ? '...' : ''}]`);
-  });
+  // Collect validation errors and warnings
+  const errors: DetailedValidationError[] = [];
+  const warnings: DetailedValidationError[] = [];
   
-  // Verify these entity IDs in the WAL and change_history
-  const foundIdsByTable = await verifyWALChanges(
-    appliedIdsByTable,
-    startLSN,
-    endLSN
-  );
-  
-  // Check which entities were found vs. missing
-  const missingIdsByTable: Record<string, string[]> = {};
-  let entityVerificationSuccess = true;
-  
-  // Compare applied IDs with found IDs
-  Object.entries(appliedIdsByTable).forEach(([table, ids]) => {
-    const foundIds = foundIdsByTable[table] || [];
-    const missing = ids.filter(id => !foundIds.includes(id));
-    
-    if (missing.length > 0) {
-      entityVerificationSuccess = false;
-      missingIdsByTable[table] = missing;
+  // Validate all entity types
+  for (const entityType of Object.keys(changesByEntityType) as EntityType[]) {
+    for (const [operation, opChanges] of Object.entries(changesByEntityType[entityType])) {
+      if (opChanges.length === 0) continue;
+      
+      // Map operation to the right type for schema validation
+      const opType = operation === 'insert' ? 'create' : 
+                    operation === 'update' ? 'update' : 'delete';
+      
+      // Extract entity data from changes
+      const entities = opChanges.map(change => change.data);
+      
+      // Validate schema if requested
+      if (options.schema) {
+        const schemaErrors = await validateEntitiesSchema(
+          entities,
+          entityType,
+          opType as 'create' | 'update' | 'delete',
+          options.schema
+        );
+        
+        // Process schema validation errors
+        for (const [entityId, entityErrors] of Object.entries(schemaErrors)) {
+          errors.push({
+            entityId,
+            entityType,
+            errors: entityErrors,
+            operation,
+            severity: 'error'
+          });
+        }
+      }
+      
+      // Validate references if requested and not a delete operation
+      if (options.reference && operation !== 'delete') {
+        const referenceErrors = await validateEntitiesReferences(
+          entities,
+          entityType,
+          options.reference
+        );
+        
+        // Process reference validation errors
+        for (const [entityId, entityErrors] of Object.entries(referenceErrors)) {
+          // Reference errors can be warnings if allowMissingReferences is true
+          const severity = options.reference.allowMissingReferences ? 'warning' : 'error';
+          
+          (severity === 'error' ? errors : warnings).push({
+            entityId,
+            entityType,
+            errors: entityErrors,
+            operation,
+            severity
+          });
+        }
+      }
     }
-  });
+  }
   
-  // Log verification results
-  if (entityVerificationSuccess) {
-    logger.info('✅ All entity IDs were found in WAL or change_history');
-  } else {
-    logger.warn('⚠️ Missing entity IDs in WAL and change_history:');
-    Object.entries(missingIdsByTable).forEach(([table, ids]) => {
-      logger.warn(`  ${table}: missing ${ids.length}/${appliedIdsByTable[table].length} entities [${ids.slice(0, 5).join(', ')}${ids.length > 5 ? '...' : ''}]`);
+  // Count errors and warnings by entity type and operation
+  const byEntityType: Record<string, number> = {};
+  const byOperation: Record<string, number> = {};
+  
+  for (const error of errors) {
+    byEntityType[error.entityType] = (byEntityType[error.entityType] || 0) + 1;
+    byOperation[error.operation] = (byOperation[error.operation] || 0) + 1;
+  }
+  
+  const success = errors.length === 0;
+  
+  // Log validation summary
+  logger.info(`Validation ${success ? 'succeeded' : 'failed'} with ${errors.length} errors and ${warnings.length} warnings`);
+  
+  if (errors.length > 0) {
+    logger.error(`Validation errors by entity type:`);
+    Object.entries(byEntityType).forEach(([entityType, count]) => {
+      if (count > 0) {
+        logger.error(`- ${entityType}: ${count} errors`);
+      }
     });
-    
-    // Even with missing IDs, we consider the test a success if the LSN has advanced
-    logger.info('✅ Test still passes because LSN has advanced, but entity ID verification is incomplete');
   }
   
   return {
-    success: lsnAdvanced, // Primary success indicator is LSN advancement
-    lsnAdvanced,
-    entityVerificationSuccess, // Secondary indicator is entity ID verification
-    appliedIdsByTable,
-    foundIdsByTable,
-    missingIdsByTable,
-    startLSN,
-    endLSN
+    success,
+    errors,
+    warnings,
+    summary: {
+      total: changes.length,
+      errors: errors.length,
+      warnings: warnings.length,
+      byEntityType,
+      byOperation
+    }
+  };
+}
+
+/**
+ * Validate that client-received changes match database changes tracked by ChangeTracker
+ * 
+ * @param clientReceived Changes received by the client
+ * @param tracker ChangeTracker instance (defaults to global)
+ * @returns Validation result with summary and details
+ */
+export async function validateClientChanges(
+  clientReceived: TableChangeTest[],
+  tracker: ChangeTracker = globalChangeTracker
+): Promise<ValidationResult> {
+  logger.info(`Validating ${clientReceived.length} client-received changes against ChangeTracker`);
+  
+  // Get all applied changes from the tracker
+  const databaseChanges = tracker.getAllAppliedChanges();
+  const intentionalDuplicates = tracker.getIntentionalDuplicates();
+  
+  // Create maps for efficient lookup
+  const databaseChangeMap = new Map<string, TableChangeTest>();
+  const clientChangeMap = new Map<string, TableChangeTest>();
+  
+  // Initialize counters for the summary
+  const byTable: Record<string, {
+    database: number;
+    received: number;
+    missing: number;
+    extra: number;
+  }> = {};
+  
+  const byOperation: Record<string, {
+    database: number;
+    received: number;
+    missing: number;
+    extra: number;
+  }> = {};
+  
+  // Create a set of intentional duplicate keys for quick lookup
+  const intentionalDuplicateKeys = new Set<string>();
+  for (const change of intentionalDuplicates) {
+    if (change.data?.id) {
+      const key = `${change.table}:${change.operation}:${change.data.id}`;
+      intentionalDuplicateKeys.add(key);
+    }
+  }
+  
+  // Index database changes
+  for (const change of databaseChanges) {
+    if (change.data?.id) {
+      const key = `${change.table}:${change.operation}:${change.data.id}`;
+      databaseChangeMap.set(key, change as TableChangeTest);
+      
+      // Initialize or update table counters
+      if (!byTable[change.table || 'unknown']) {
+        byTable[change.table || 'unknown'] = { database: 0, received: 0, missing: 0, extra: 0 };
+      }
+      byTable[change.table || 'unknown'].database++;
+      
+      // Initialize or update operation counters
+      if (!byOperation[change.operation || 'unknown']) {
+        byOperation[change.operation || 'unknown'] = { database: 0, received: 0, missing: 0, extra: 0 };
+      }
+      byOperation[change.operation || 'unknown'].database++;
+    }
+  }
+  
+  // Index client changes
+  for (const change of clientReceived) {
+    if (change.data?.id) {
+      const key = `${change.table}:${change.operation}:${change.data.id}`;
+      clientChangeMap.set(key, change);
+      
+      // Initialize or update table counters
+      if (!byTable[change.table || 'unknown']) {
+        byTable[change.table || 'unknown'] = { database: 0, received: 0, missing: 0, extra: 0 };
+      }
+      byTable[change.table || 'unknown'].received++;
+      
+      // Initialize or update operation counters
+      if (!byOperation[change.operation || 'unknown']) {
+        byOperation[change.operation || 'unknown'] = { database: 0, received: 0, missing: 0, extra: 0 };
+      }
+      byOperation[change.operation || 'unknown'].received++;
+    }
+  }
+  
+  // Find missing changes (in database but not received by client)
+  const missingChanges: TableChangeTest[] = [];
+  for (const [key, change] of databaseChangeMap.entries()) {
+    if (!clientChangeMap.has(key) && !intentionalDuplicateKeys.has(key)) {
+      missingChanges.push(change);
+      
+      // Update missing counters
+      if (change.table) {
+        byTable[change.table].missing++;
+      }
+      if (change.operation) {
+        byOperation[change.operation].missing++;
+      }
+    }
+  }
+  
+  // Find extra changes (received by client but not in database)
+  const extraChanges: TableChangeTest[] = [];
+  for (const [key, change] of clientChangeMap.entries()) {
+    if (!databaseChangeMap.has(key)) {
+      extraChanges.push(change);
+      
+      // Update extra counters
+      if (change.table) {
+        byTable[change.table].extra++;
+      }
+      if (change.operation) {
+        byOperation[change.operation].extra++;
+      }
+    }
+  }
+  
+  // Log validation summary
+  logger.info(`Validation summary:`);
+  logger.info(`- Database changes: ${databaseChanges.length}`);
+  logger.info(`- Client received: ${clientReceived.length}`);
+  logger.info(`- Missing changes: ${missingChanges.length}`);
+  logger.info(`- Extra changes: ${extraChanges.length}`);
+  logger.info(`- Intentional duplicates: ${intentionalDuplicates.length}`);
+  
+  const success = missingChanges.length === 0;
+  if (success) {
+    logger.info(`✅ Validation successful - client has all expected changes`);
+  } else {
+    logger.warn(`❌ Validation failed - ${missingChanges.length} changes missing`);
+    
+    // Log missing changes by table
+    const missingByTable = missingChanges.reduce((acc, change) => {
+      const table = change.table || 'unknown';
+      acc[table] = (acc[table] || 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    
+    Object.entries(missingByTable).forEach(([table, count]) => {
+      logger.warn(`  - Missing ${count} ${table} changes`);
+    });
+  }
+  
+  return {
+    success,
+    summary: {
+      total: {
+        database: databaseChanges.length,
+        received: clientReceived.length
+      },
+      byTable,
+      byOperation,
+      intentionalDuplicates: intentionalDuplicates.length
+    },
+    details: {
+      missingChanges,
+      extraChanges,
+      intentionalDuplicates: intentionalDuplicates as TableChangeTest[]
+    }
+  };
+}
+
+/**
+ * Validate changes with batch ID were properly recorded in the database
+ * 
+ * @param batchId The batch ID to validate
+ * @param tracker ChangeTracker instance (defaults to global)
+ * @returns Validation results with success status
+ */
+export async function validateBatchChanges(
+  batchId: string,
+  tracker: ChangeTracker = globalChangeTracker
+): Promise<{
+  success: boolean;
+  batchId: string;
+  summary: {
+    total: number;
+    byTable: Record<string, number>;
+    byOperation: Record<string, number>;
+  };
+  trackerChanges: TableChangeTest[];
+  databaseRecords: Record<EntityType, any[]>;
+}> {
+  if (!batchId) {
+    logger.warn('No batch ID provided for validation');
+    return {
+      success: false,
+      batchId: '',
+      summary: {
+        total: 0,
+        byTable: {},
+        byOperation: {}
+      },
+      trackerChanges: [],
+      databaseRecords: {
+        user: [],
+        project: [],
+        task: [],
+        comment: []
+      }
+    };
+  }
+
+  logger.info(`Validating changes for batch ID: ${batchId}`);
+
+  // Get data source for database queries
+  const dataSource = await getDataSource();
+  
+  // Get tracked changes for this batch from the tracker
+  const trackerChanges = tracker.getAppliedChangesForBatch(batchId) as TableChangeTest[];
+  
+  // Query the database for records with this batch ID
+  const tables = ['users', 'projects', 'tasks', 'comments'];
+  const databaseRecords: Record<EntityType, any[]> = {
+    user: [],
+    project: [],
+    task: [],
+    comment: []
+  };
+  
+  // Try to find entities in each table
+  for (const table of tables) {
+    try {
+      // For inserts and updates, we can find entities with __batchId
+      const entities = await dataSource.query(
+        `SELECT * FROM "${table}" WHERE "__batchId" = $1`,
+        [batchId]
+      );
+      
+      if (entities.length > 0) {
+        const entityType = getEntityTypeFromTable(table);
+        if (entityType) {
+          databaseRecords[entityType] = entities;
+        }
+      }
+    } catch (error) {
+      // If the table doesn't have __batchId column, we'll get an error
+      // This is expected for some tables, so just log a debug message
+      logger.debug(`Could not query ${table} for batch ID: ${error}`);
+    }
+  }
+  
+  // Generate summary by table and operation
+  const byTable: Record<string, number> = {};
+  const byOperation: Record<string, number> = {};
+  
+  trackerChanges.forEach(change => {
+    // Count by table
+    const table = change.table || 'unknown';
+    byTable[table] = (byTable[table] || 0) + 1;
+    
+    // Count by operation
+    const operation = change.operation || 'unknown';
+    byOperation[operation] = (byOperation[operation] || 0) + 1;
+  });
+  
+  // Count database records found
+  const totalDatabaseRecords = Object.values(databaseRecords)
+    .reduce((sum, records) => sum + records.length, 0);
+  
+  // Validation logic
+  const success = trackerChanges.length > 0 && totalDatabaseRecords > 0;
+  
+  // Log summary
+  logger.info(`Found ${trackerChanges.length} tracked changes and ${totalDatabaseRecords} database records for batch ${batchId}`);
+  Object.entries(byTable).forEach(([table, count]) => {
+    logger.info(`  ${table}: ${count} changes`);
+  });
+  
+  return {
+    success,
+    batchId,
+    summary: {
+      total: trackerChanges.length,
+      byTable,
+      byOperation
+    },
+    trackerChanges,
+    databaseRecords
+  };
+}
+
+/**
+ * Validate database changes directly by checking database records
+ * 
+ * @param changes Array of TableChange objects to validate in the database
+ * @returns Validation results with success status
+ */
+export async function validateDatabaseChanges(changes: TableChangeTest[]): Promise<{
+  success: boolean;
+  summary: {
+    total: number;
+    byTable: Record<string, number>;
+    byOperation: Record<string, number>;
+  };
+  details: {
+    verified: TableChangeTest[];
+    notVerified: TableChangeTest[];
+  };
+}> {
+  if (!changes.length) {
+    logger.warn('No changes to validate');
+    return {
+      success: true,
+      summary: {
+        total: 0,
+        byTable: {},
+        byOperation: {}
+      },
+      details: {
+        verified: [],
+        notVerified: []
+      }
+    };
+  }
+
+  logger.info(`Validating ${changes.length} changes in the database`);
+
+  // Get data source
+  const dataSource = await getDataSource();
+  
+  // Group changes by table and operation for easier validation
+  const changesByTable: Record<string, TableChangeTest[]> = {};
+  const changesByOperation: Record<string, number> = {
+    insert: 0,
+    update: 0,
+    delete: 0
+  };
+  
+  // Track validation results
+  const verified: TableChangeTest[] = [];
+  const notVerified: TableChangeTest[] = [];
+  
+  // Organize changes by table
+  for (const change of changes) {
+    if (!change.table || !change.operation) continue;
+    
+    if (!changesByTable[change.table]) {
+      changesByTable[change.table] = [];
+    }
+    
+    changesByTable[change.table].push(change);
+    changesByOperation[change.operation] = (changesByOperation[change.operation] || 0) + 1;
+  }
+  
+  // Log summary of changes to validate
+  logger.info('Changes to validate by table:');
+  Object.entries(changesByTable).forEach(([table, tableChanges]) => {
+    logger.info(`  ${table}: ${tableChanges.length} changes`);
+  });
+  
+  // Validate each change by checking the database
+  for (const [table, tableChanges] of Object.entries(changesByTable)) {
+    logger.info(`Validating ${tableChanges.length} changes for table ${table}`);
+    
+    // Group changes by operation for this table
+    const insertChanges = tableChanges.filter(c => c.operation === 'insert');
+    const updateChanges = tableChanges.filter(c => c.operation === 'update');
+    const deleteChanges = tableChanges.filter(c => c.operation === 'delete');
+    
+    // Validate inserts and updates by checking if records exist
+    if (insertChanges.length > 0 || updateChanges.length > 0) {
+      const idsToCheck = [
+        ...insertChanges.map(c => c.data?.id).filter(Boolean),
+        ...updateChanges.map(c => c.data?.id).filter(Boolean)
+      ];
+      
+      if (idsToCheck.length > 0) {
+        try {
+          // Check if these records exist in the database
+          const found = await dataSource.query(
+            `SELECT id FROM "${table}" WHERE id IN (${idsToCheck.map((_, i) => `$${i+1}`).join(',')})`,
+            idsToCheck
+          );
+          
+          // Map of found IDs for quick lookup
+          const foundIds = new Set(found.map((row: any) => row.id));
+          
+          // Mark changes as verified if their IDs were found
+          for (const change of [...insertChanges, ...updateChanges]) {
+            if (change.data?.id && foundIds.has(change.data.id)) {
+              verified.push(change);
+            } else {
+              notVerified.push(change);
+            }
+          }
+          
+          logger.info(`  ${foundIds.size}/${idsToCheck.length} records verified for inserts/updates in ${table}`);
+        } catch (error) {
+          logger.error(`Error validating inserts/updates for ${table}: ${error}`);
+          notVerified.push(...insertChanges, ...updateChanges);
+        }
+      }
+    }
+    
+    // Validate deletes by checking that records DON'T exist
+    if (deleteChanges.length > 0) {
+      const idsToCheck = deleteChanges.map(c => c.data?.id).filter(Boolean);
+      
+      if (idsToCheck.length > 0) {
+        try {
+          // Check how many of these records still exist (should be 0 if properly deleted)
+          const found = await dataSource.query(
+            `SELECT id FROM "${table}" WHERE id IN (${idsToCheck.map((_, i) => `$${i+1}`).join(',')})`,
+            idsToCheck
+          );
+          
+          // Map of found IDs for quick lookup
+          const foundIds = new Set(found.map((row: any) => row.id));
+          
+          // Mark deletes as verified if their IDs were NOT found (they should be deleted)
+          for (const change of deleteChanges) {
+            if (change.data?.id && !foundIds.has(change.data.id)) {
+              verified.push(change);
+            } else {
+              notVerified.push(change);
+            }
+          }
+          
+          const verifiedCount = idsToCheck.length - foundIds.size;
+          logger.info(`  ${verifiedCount}/${idsToCheck.length} records verified for deletes in ${table}`);
+        } catch (error) {
+          logger.error(`Error validating deletes for ${table}: ${error}`);
+          notVerified.push(...deleteChanges);
+        }
+      }
+    }
+  }
+  
+  // Generate summary information
+  const byTable: Record<string, number> = {};
+  Object.entries(changesByTable).forEach(([table, tableChanges]) => {
+    byTable[table] = tableChanges.length;
+  });
+  
+  // Calculate success percentage
+  const successPercentage = changes.length > 0 
+    ? Math.round((verified.length / changes.length) * 100) 
+    : 100;
+  
+  logger.info(`Validation complete: ${verified.length}/${changes.length} changes verified (${successPercentage}%)`);
+  
+  return {
+    success: verified.length === changes.length,
+    summary: {
+      total: changes.length,
+      byTable,
+      byOperation: changesByOperation
+    },
+    details: {
+      verified,
+      notVerified
+    }
+  };
+}
+
+/**
+ * Validate that client received all expected changes from database, with support for intentional duplicates
+ * 
+ * @param dbChanges Database changes that were applied
+ * @param clientChanges Changes received by the client
+ * @param options Validation options
+ * @returns Validation result with summary and details
+ */
+export async function validateSyncChanges(
+  dbChanges: TableChangeTest[],
+  clientChanges: TableChange[],
+  options: {
+    intentionalDuplicates?: { original: TableChangeTest, duplicate: TableChangeTest }[];
+    allowExtraChanges?: boolean;
+  } = {}
+): Promise<SyncValidationResult> {
+  logger.info(`Validating ${clientChanges.length} client-received changes against ${dbChanges.length} database changes`);
+  
+  const intentionalDuplicates = options.intentionalDuplicates || [];
+  const allowExtraChanges = options.allowExtraChanges || false;
+  
+  // Create maps for efficient lookup
+  const dbChangeMap = new Map<string, TableChangeTest>();
+  const clientChangeMap = new Map<string, TableChangeTest>();
+  
+  // Track duplicates received by client (same change received multiple times)
+  const clientDuplicatesMap = new Map<string, TableChangeTest[]>();
+  const receivedDuplicates: {original: TableChangeTest, duplicates: TableChangeTest[]}[] = [];
+  
+  // Initialize counters for the summary
+  const byTable: Record<string, {
+    database: number;
+    received: number;
+    missing: number;
+    extra: number;
+  }> = {};
+  
+  const byOperation: Record<string, {
+    database: number;
+    received: number;
+    missing: number;
+    extra: number;
+  }> = {};
+  
+  // Create a set of intentional duplicate keys for quick lookup
+  const intentionalDuplicateKeys = new Set<string>();
+  for (const dup of intentionalDuplicates) {
+    if (dup.duplicate?.data?.id) {
+      const key = `${dup.duplicate.table}:${dup.duplicate.operation}:${dup.duplicate.data.id}`;
+      intentionalDuplicateKeys.add(key);
+    }
+  }
+  
+  // Process database changes
+  for (const change of dbChanges) {
+    if (!change.table || !change.operation || !change.data?.id) {
+      logger.warn(`Skipping invalid database change without table, operation, or ID: ${JSON.stringify(change)}`);
+      continue;
+    }
+    
+    // Initialize table counters if needed
+    if (!byTable[change.table]) {
+      byTable[change.table] = { database: 0, received: 0, missing: 0, extra: 0 };
+    }
+    byTable[change.table].database++;
+    
+    // Initialize operation counters if needed
+    if (!byOperation[change.operation]) {
+      byOperation[change.operation] = { database: 0, received: 0, missing: 0, extra: 0 };
+    }
+    byOperation[change.operation].database++;
+    
+    // Create a unique key for the change
+    const key = `${change.table}:${change.operation}:${change.data.id}`;
+    dbChangeMap.set(key, change);
+  }
+  
+  // Process client changes
+  for (const change of clientChanges) {
+    if (!change.table || !change.operation || !change.data?.id) {
+      logger.warn(`Skipping invalid client change without table, operation, or ID: ${JSON.stringify(change)}`);
+      continue;
+    }
+    
+    // Initialize table counters if needed
+    if (!byTable[change.table]) {
+      byTable[change.table] = { database: 0, received: 0, missing: 0, extra: 0 };
+    }
+    byTable[change.table].received++;
+    
+    // Initialize operation counters if needed
+    if (!byOperation[change.operation]) {
+      byOperation[change.operation] = { database: 0, received: 0, missing: 0, extra: 0 };
+    }
+    byOperation[change.operation].received++;
+    
+    // Create a unique key for the change
+    const key = `${change.table}:${change.operation}:${change.data.id}`;
+    
+    // Check if we've already seen this change from the client
+    if (clientChangeMap.has(key)) {
+      // Track duplicates
+      if (!clientDuplicatesMap.has(key)) {
+        clientDuplicatesMap.set(key, [clientChangeMap.get(key) as TableChangeTest]);
+      }
+      clientDuplicatesMap.get(key)?.push(change as TableChangeTest);
+    } else {
+      clientChangeMap.set(key, change as TableChangeTest);
+    }
+  }
+  
+  // Process received duplicates
+  for (const [key, duplicates] of clientDuplicatesMap.entries()) {
+    const original = duplicates.shift() as TableChangeTest;
+    receivedDuplicates.push({
+      original,
+      duplicates
+    });
+    
+    logger.warn(`Found duplicate change received ${duplicates.length + 1} times: ${key}`);
+  }
+  
+  // Find missing changes (in database but not in client)
+  const missingChanges: TableChangeTest[] = [];
+  for (const [key, change] of dbChangeMap.entries()) {
+    if (!clientChangeMap.has(key) && !intentionalDuplicateKeys.has(key)) {
+      missingChanges.push(change);
+      
+      // Update missing counters
+      if (change.table) {
+        byTable[change.table].missing++;
+      }
+      if (change.operation) {
+        byOperation[change.operation].missing++;
+      }
+    }
+  }
+  
+  // Find extra changes (received by client but not in database)
+  const extraChanges: TableChangeTest[] = [];
+  for (const [key, change] of clientChangeMap.entries()) {
+    if (!dbChangeMap.has(key)) {
+      extraChanges.push(change);
+      
+      // Update extra counters
+      if (change.table) {
+        byTable[change.table].extra++;
+      }
+      if (change.operation) {
+        byOperation[change.operation].extra++;
+      }
+    }
+  }
+  
+  // Calculate deduplicated changes (intentional duplicates that were successfully deduplicated by server)
+  const deduplicatedChanges = intentionalDuplicates.filter(dup => {
+    if (dup.duplicate?.data?.id) {
+      const key = `${dup.duplicate.table}:${dup.duplicate.operation}:${dup.duplicate.data.id}`;
+      return !clientChangeMap.has(key);
+    }
+    return false;
+  });
+  
+  // Check if any of the intentional duplicates are hard to identify because they lack explicit markers
+  for (const dup of intentionalDuplicates) {
+    if (!dup.duplicate?.data?.__intentionalDuplicate) {
+      logger.warn(`Intentional duplicate lacks an explicit marker: ${dup.duplicate?.data?.id}`);
+    }
+  }
+  
+  // Calculate deduplication success rate - all duplicates are accounted for if:
+  // 1. We have the proper number of changes (matching count minus dupes)
+  // 2. We don't have any missing essential changes
+  const expectedCountWithoutDuplicates = dbChanges.length - intentionalDuplicates.length;
+  const deduplicationResult = analyzeDeduplication(
+    dbChanges.length,
+    clientChanges.length,
+    deduplicatedChanges.length,
+    missingChanges.length
+  );
+  
+  // Determine if validation succeeded
+  let success = deduplicationResult.success;
+  
+  // If extra changes are allowed, ignore them for determining success
+  if (allowExtraChanges && extraChanges.length > 0) {
+    if (missingChanges.length === 0) {
+      logger.info('✅ Validation successful - client has all expected changes');
+      if (extraChanges.length > 0) {
+        logger.warn(`  - Extra ${extraChanges.length} changes allowed`);
+        
+        // Group extra changes by table for cleaner reporting
+        const extraByTable = extraChanges.reduce((acc, change) => {
+          const table = change.table || 'unknown';
+          acc[table] = (acc[table] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>);
+        
+        Object.entries(extraByTable).forEach(([table, count]) => {
+          logger.warn(`  - Extra ${count} ${table} changes`);
+        });
+      }
+    }
+  } else if (success && extraChanges.length > 0) {
+    logger.warn(`⚠️ Client received ${extraChanges.length} unexpected extra changes`);
+    
+    // Only mark as failure if extra changes should fail the validation
+    if (!allowExtraChanges) {
+      success = false;
+    }
+  }
+  
+  // Log validation status
+  const statusSymbol = success ? '✅' : '❌';
+  logger.info(`Validation ${success ? '✅ SUCCESS' : '❌ FAILURE'}: DB=${dbChanges.length}, Client=${clientChanges.length}, ` +
+    `Missing=${missingChanges.length}, Extra=${extraChanges.length}, ` +
+    `Dupes=${intentionalDuplicates.length}, Dedup=${deduplicationResult.success ? 'Yes' : 'No'}, ` +
+    `Unintended dupes=${receivedDuplicates.length} (${receivedDuplicates.reduce((sum, rd) => sum + rd.duplicates.length, 0)} copies)`);
+  
+  // Display more details if validation failed
+  if (!success) {
+    logger.error(`❌ Validation failed - ${missingChanges.length} required changes missing from client`);
+    
+    // Only log missing changes by table if there are any
+    if (missingChanges.length > 0) {
+      const missingByTable = missingChanges.reduce((acc, change) => {
+        const table = change.table || 'unknown';
+        acc[table] = (acc[table] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
+      Object.entries(missingByTable).forEach(([table, count]) => {
+        logger.error(`  - Missing ${count} ${table} changes`);
+      });
+    }
+  }
+  
+  // Only log extra changes in detail if there are any and only at warning level
+  if (extraChanges.length > 0) {
+    logger.info('\nExtra Changes:');
+    logDetailedChangesTable('Extra Changes', extraChanges);
+  }
+  
+  // Return validation result with full details
+  return {
+    success,
+    summary: {
+      total: {
+        database: dbChanges.length,
+        received: clientChanges.length,
+        expected: expectedCountWithoutDuplicates,
+        intentionalDuplicates: intentionalDuplicates.length,
+        deduplicationSuccess: deduplicationResult.success
+      },
+      byTable,
+      byOperation
+    },
+    details: {
+      missingChanges,
+      extraChanges,
+      intentionalDuplicates,
+      deduplicatedChanges,
+      receivedDuplicates
+    }
+  };
+}
+
+/**
+ * Helper function to analyze deduplication results
+ */
+function analyzeDeduplication(
+  dbCount: number,
+  clientCount: number,
+  intentionalDuplicatesCount: number,
+  missingCount: number
+): { success: boolean; expected: number; clientCount: number; intentionalDuplicatesCount: number } {
+  const expected = dbCount - intentionalDuplicatesCount;
+  const success = clientCount === expected && missingCount === 0;
+  
+  return {
+    success,
+    expected,
+    clientCount,
+    intentionalDuplicatesCount
+  };
+}
+
+/**
+ * Helper function to convert table name to entity type
+ */
+function getEntityTypeFromTable(table: string): EntityType | undefined {
+  return TABLE_TO_ENTITY[table];
+}
+
+/**
+ * Helper function to log a detailed table of changes
+ * @param title Title for the table
+ * @param changes Array of changes to display
+ */
+function logDetailedChangesTable(title: string, changes: TableChangeTest[]): void {
+  if (changes.length === 0) return;
+  
+  logger.info(`\n${title}:`);
+  logger.info('┌────────────┬──────────┬──────────────────────────────────┬────────────────┐');
+  logger.info('│ Table      │ Operation│ Entity ID                        │ Batch ID       │');
+  logger.info('├────────────┼──────────┼──────────────────────────────────┼────────────────┤');
+  
+  changes.slice(0, 20).forEach(change => {
+    const table = (change.table || 'unknown').padEnd(10);
+    const operation = (change.operation || 'unknown').padEnd(8);
+    const id = (change.data?.id || 'no-id').toString().padEnd(32);
+    const batchId = (change.batchId || 'no-batch').toString().padEnd(12);
+    
+    logger.info(`│ ${table} │ ${operation} │ ${id} │ ${batchId} │`);
+  });
+  
+  if (changes.length > 20) {
+    logger.info('├────────────┴──────────┴──────────────────────────────────┴────────────────┤');
+    logger.info(`│ ... and ${changes.length - 20} more changes (showing first 20 only)`.padEnd(77) + '│');
+  }
+  
+  logger.info('└────────────┴──────────┴──────────────────────────────────┴────────────────┘\n');
+}
+
+/**
+ * Look up extra changes in the database change tables for additional context
+ * @param extraChanges The extra changes that were not in the original database changes
+ * @returns Detailed information about where these changes came from
+ */
+export async function lookupExtraChangesDetails(
+  extraChanges: TableChangeTest[]
+): Promise<{
+  historyFound: TableChangeTest[];
+  entityDataFound: Record<string, any[]>;
+  unmatchedChanges: TableChangeTest[];
+  details: Record<string, any>;
+}> {
+  if (extraChanges.length === 0) {
+    return {
+      historyFound: [],
+      entityDataFound: {},
+      unmatchedChanges: [],
+      details: {}
+    };
+  }
+
+  logger.info(`Looking up ${extraChanges.length} extra changes in database change tables`);
+  
+  const dataSource = await getDataSource();
+  const historyFound: TableChangeTest[] = [];
+  const entityDataFound: Record<string, any[]> = {};
+  const unmatchedChanges: TableChangeTest[] = [];
+  const details: Record<string, any> = {};
+  
+  // Extract all entity IDs from extra changes
+  const entityIds = extraChanges
+    .map(change => change.data?.id)
+    .filter(Boolean) as string[];
+  
+  if (entityIds.length === 0) {
+    logger.warn('No entity IDs found in extra changes');
+    return {
+      historyFound: [],
+      entityDataFound: {},
+      unmatchedChanges: extraChanges,
+      details: {}
+    };
+  }
+  
+  // Group extra changes by table to look up entity data
+  const changesByTable: Record<string, TableChangeTest[]> = {};
+  for (const change of extraChanges) {
+    if (change.table) {
+      if (!changesByTable[change.table]) {
+        changesByTable[change.table] = [];
+      }
+      changesByTable[change.table].push(change);
+    }
+  }
+  
+  // Query each entity table for actual entity data
+  for (const [tableName, changes] of Object.entries(changesByTable)) {
+    const tableEntityIds = changes
+      .map(change => change.data?.id)
+      .filter(Boolean) as string[];
+    
+    if (tableEntityIds.length === 0) continue;
+    
+    try {
+      const entityResults = await dataSource.query(
+        `SELECT * FROM "${tableName}" WHERE id = ANY($1) LIMIT 100`,
+        [tableEntityIds]
+      );
+      
+      if (entityResults.length > 0) {
+        logger.info(`Found ${entityResults.length} records in the ${tableName} table`);
+        entityDataFound[tableName] = entityResults;
+        
+        // Map entity details by ID for easy lookup
+        for (const entity of entityResults) {
+          if (entity.id) {
+            const id = String(entity.id);
+            if (!details[id]) {
+              details[id] = {};
+            }
+            
+            details[id].entity_data = {
+              found: true,
+              table: tableName,
+              created_at: entity.created_at,
+              updated_at: entity.updated_at,
+              data: entity
+            };
+            
+            // Special handling for comments table - check for null parent_id fields
+            if (tableName === 'comments') {
+              const commentsWithNullParent = entityResults.filter((entity: { parent_id: string | null }) => entity.parent_id === null);
+              if (commentsWithNullParent.length > 0) {
+                logger.info(`Found ${commentsWithNullParent.length} comments with null parent_id field`);
+                
+                // Add parent_id info to details for each comment with null parent_id
+                for (const comment of commentsWithNullParent) {
+                  const id = String(comment.id);
+                  if (details[id]?.entity_data) {
+                    details[id].entity_data.has_null_parent_id = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn(`Error querying ${tableName} table: ${error}`);
+    }
+  }
+  
+  // Query the change_history table
+  try {
+    const historyResults = await dataSource.query(
+      `SELECT * FROM "change_history" WHERE data->>'id' = ANY($1) LIMIT 100`,
+      [entityIds]
+    );
+    
+    if (historyResults.length > 0) {
+      logger.info(`Found ${historyResults.length} matches in the change_history table`);
+      historyFound.push(...historyResults);
+      
+      // Map details by ID for easy lookup
+      for (const change of historyResults) {
+        if (change.data?.id) {
+          const id = String(change.data.id);
+          if (!details[id]) {
+            details[id] = {};
+          }
+          
+          details[id].changes_history_table = {
+            found: true,
+            recorded_at: change.created_at,
+            client_id: change.client_id,
+            sequence: change.sequence,
+            batch_id: change.batch_id,
+            lsn: change.lsn,
+            synced_at: change.synced_at
+          };
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn(`Error querying change_history table: ${error}`);
+  }
+  
+  // Identify which extra changes were not found in any table
+  for (const change of extraChanges) {
+    if (change.data?.id) {
+      const id = String(change.data.id);
+      if (!details[id]?.changes_history_table && !details[id]?.entity_data) {
+        unmatchedChanges.push(change);
+      }
+    }
+  }
+  
+  // Log a summary of findings
+  logger.info(`Change lookup summary:`);
+  logger.info(`- Extra changes: ${extraChanges.length}`);
+  logger.info(`- Found in original entity tables: ${Object.values(entityDataFound).flat().length}`);
+  logger.info(`- Found in change_history table: ${historyFound.length}`);
+  logger.info(`- Not found in any table: ${unmatchedChanges.length}`);
+  
+  return {
+    historyFound,
+    entityDataFound,
+    unmatchedChanges,
+    details
   };
 } 

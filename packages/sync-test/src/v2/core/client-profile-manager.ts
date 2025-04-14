@@ -26,7 +26,7 @@ export interface ClientProfile {
  * Manages client profiles for sync tests
  */
 export class ClientProfileManager {
-  private logger = createLogger('ProfileMgr');
+  private logger = createLogger('sync.profile');
   private profiles: Map<number, ClientProfile> = new Map();
   private profilesPath: string;
   

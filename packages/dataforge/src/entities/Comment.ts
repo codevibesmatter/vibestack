@@ -36,13 +36,15 @@ export class Comment extends BaseDomainEntity {
   /**
    * The ID of the entity this comment is associated with
    */
-  @Column({ type: "uuid", name: "entity_id" })
+  @Column({ type: "uuid", name: "entity_id", nullable: true })
+  @IsOptional()
   @IsUUID(4)
-  entityId!: string;
+  entityId?: string;
   
-  @Column({ type: "uuid", name: "author_id" })
+  @Column({ type: "uuid", name: "author_id", nullable: true })
+  @IsOptional()
   @IsUUID(4)
-  authorId!: string;
+  authorId?: string;
   
   /**
    * Optional parent comment ID for threaded comments
@@ -53,9 +55,9 @@ export class Comment extends BaseDomainEntity {
   parentId?: string;
   
   // Relationship fields with explicit JoinColumn decorators
-  @ManyToOne(() => User)
+  @ManyToOne(() => User, { nullable: true })
   @JoinColumn({ name: "author_id" })
-  author!: Relation<User>;
+  author?: Relation<User>;
   
   @ManyToOne(() => Comment, { nullable: true })
   @JoinColumn({ name: "parent_id" })

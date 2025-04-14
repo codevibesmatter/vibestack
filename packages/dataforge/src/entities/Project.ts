@@ -48,14 +48,15 @@ export class Project extends BaseDomainEntity {
   @IsEnum(ProjectStatus)
   status!: ProjectStatus;
   
-  @Column({ type: "uuid", name: "owner_id" })
+  @Column({ type: "uuid", name: "owner_id", nullable: true })
+  @IsOptional()
   @IsUUID(4, { message: "Owner ID must be a valid UUID" })
-  ownerId!: string;
+  ownerId?: string;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
-  @ManyToOne(() => User, (user) => user.ownedProjects)
+  @ManyToOne(() => User, (user) => user.ownedProjects, { nullable: true })
   @JoinColumn({ name: "owner_id" })
-  owner!: Relation<User>;
+  owner?: Relation<User>;
   
   @ManyToMany(() => User, (user) => user.memberProjects)
   @JoinTable({

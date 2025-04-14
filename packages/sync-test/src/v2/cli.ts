@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import inquirer from 'inquirer';
 import { createLogger } from './core/logger.ts';
+import { Scenario, ScenarioRunner } from './core/scenario-runner.ts';
 
 // Set up global error handlers to ensure we never hang
 process.on('unhandledRejection', (reason, promise) => {
@@ -50,231 +51,126 @@ type Command = {
 // Commands registry - easy to add new commands
 const commands: Record<string, Command> = {};
 
-// Register the live-sync command
-commands['live-sync'] = {
-  name: 'live-sync',
-  description: 'Run a live sync test with multiple clients',
-  options: [
-    { name: '--clients', description: 'Number of clients to run in parallel', defaultValue: 1 },
-    { name: '--count', description: 'Number of changes to create', defaultValue: 10 }
-  ],
-  handler: async (args: string[]) => {
-    const options = parseCommandOptions(args);
-    const clientCount = parseInt(options['--clients'] as string, 10) || 1;
-    const changeCount = parseInt(options['--count'] as string, 10) || 10;
-    
-    await runLiveSyncTest(clientCount, changeCount);
-  }
+// --- Scenario Definitions --- 
+// Use dynamic imports within the runner function to avoid loading all scenarios upfront
+
+// Map scenario names to their file paths and expected export names
+const scenarioRegistry: Record<string, { path: string; exportName: string }> = {
+  'live-sync': { path: './scenarios/live-sync.ts', exportName: 'LiveSyncScenario' },
+  'client-submit': { path: './scenarios/client-submit-sync.ts', exportName: 'ClientSubmitSyncScenario' },
+  'stale-client-reconnection': { path: './scenarios/stale-client-reconnection.ts', exportName: 'StaleClientReconnectionScenario' }
+  // Add other scenarios here
 };
 
-// Register the simplified-live-sync command
-commands['simplified-live-sync'] = {
-  name: 'simplified-live-sync',
-  description: 'Run a simplified live sync test with multiple clients',
-  options: [
-    { name: '--clients', description: 'Number of clients to run in parallel', defaultValue: 1 },
-    { name: '--count', description: 'Number of changes to create', defaultValue: 5 }
-  ],
-  handler: async (args: string[]) => {
-    const options = parseCommandOptions(args);
-    const clientCount = parseInt(options['--clients'] as string, 10) || 1;
-    const changeCount = parseInt(options['--count'] as string, 10) || 5;
-    
-    await runSimplifiedLiveSyncTest(clientCount, changeCount);
+/**
+ * Runs a specified test scenario with given options.
+ * Dynamically imports the scenario module.
+ */
+async function runTestScenario(scenarioName: string, cliOptions: Record<string, string | number | boolean>): Promise<void> {
+  const scenarioInfo = scenarioRegistry[scenarioName];
+  if (!scenarioInfo) {
+    console.error(`\n❌ Unknown scenario: ${scenarioName}`);
+    console.log(`Available scenarios: ${Object.keys(scenarioRegistry).join(', ')}`);
+    process.exit(1);
   }
-};
 
-// Register the streamlined-live-sync command
-commands['streamlined-live-sync'] = {
-  name: 'streamlined-live-sync',
-  description: 'Run a streamlined live sync test with the new batch changes system',
-  options: [
-    { name: '--clients', description: 'Number of clients to run in parallel', defaultValue: 1 },
-    { name: '--count', description: 'Number of changes to create', defaultValue: 5 }
-  ],
-  handler: async (args: string[]) => {
-    const options = parseCommandOptions(args);
-    const clientCount = parseInt(options['--clients'] as string, 10) || 1;
-    const changeCount = parseInt(options['--count'] as string, 10) || 5;
+  // Set a global timeout 
+  const globalTimeout = setTimeout(() => {
+    console.error('\n⚠️ Global timeout reached! Forcing exit.');
+    process.exit(1);
+  }, 180000); // 3 minutes max run time
+
+  try {
+    // Dynamically import the scenario module
+    const scenarioModule = await import(scenarioInfo.path);
+    const scenario: Scenario = scenarioModule[scenarioInfo.exportName];
+
+    if (!scenario) {
+      throw new Error(`Could not load scenario object '${scenarioInfo.exportName}' from ${scenarioInfo.path}`);
+    }
     
-    await runStreamlinedLiveSyncTest(clientCount, changeCount);
-  }
-};
+    // --- Extract CLI options with fallbacks to scenario defaults --- 
+    const clientCount = parseInt(cliOptions['--clients'] as string, 10) || 
+                        scenario.config.customProperties?.clientCount || 
+                        2;
+    const changesPerClient = parseInt(cliOptions['--changes'] as string, 10) ||
+                           scenario.config.customProperties?.changesPerClient || 
+                           5;
+    const scenarioTimeout = parseInt(cliOptions['--timeout'] as string, 10) || 
+                          scenario.config.timeout || 
+                          60000;
+    
+    // REMOVE conflictEnabled parsing - assume always true for this scenario type
+    const conflictEnabled = true; 
+    
+    // TODO: Add parsing for --distribution JSON string if needed
 
-// Add more commands here for different test scenarios
+    console.log(`\n🔄 Running scenario '${scenario.name}' (${scenarioName})...`);
+    console.log(`   Clients: ${clientCount}, Changes/Client: ${changesPerClient}, Conflict: ${conflictEnabled}, Timeout: ${scenarioTimeout}ms\n`);
+
+    // Create a new ScenarioRunner
+    const runner = new ScenarioRunner();
+
+    // Configure the scenario with CLI parameters or defaults
+    scenario.config.customProperties = scenario.config.customProperties || {};
+    scenario.config.customProperties.clientCount = clientCount;
+    scenario.config.customProperties.changesPerClient = changesPerClient;
+    
+    // Ensure conflictConfig exists and set enabled to true (as it's always enabled now)
+    scenario.config.customProperties.conflictConfig = scenario.config.customProperties.conflictConfig || {};
+    scenario.config.customProperties.conflictConfig.enabled = conflictEnabled; 
+    
+    // Update other config fields
+    scenario.config.timeout = Math.max(scenarioTimeout, changesPerClient * clientCount * 500); 
+
+    // Run the scenario
+    await runner.runScenario(scenario);
+
+    console.log(`\n✅ Scenario '${scenario.name}' completed successfully!`);
+
+    // Clear the global timeout and exit cleanly
+    clearTimeout(globalTimeout);
+    console.log('Test completed, exiting...');
+    process.exit(0);
+  } catch (error) {
+    console.error(`\n❌ Scenario '${scenarioName}' failed:`, error);
+    // Force exit immediately to avoid hanging
+    clearTimeout(globalTimeout);
+    process.exit(1);
+  }
+}
 
 /**
  * Parse command line options for a specific command
  */
-function parseCommandOptions(args: string[]): Record<string, string | number> {
-  const options: Record<string, string | number> = {};
+function parseCommandOptions(args: string[]): Record<string, string | number | boolean> {
+  const options: Record<string, string | number | boolean> = {};
   
   for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith('--') && i + 1 < args.length) {
-      options[args[i]] = args[i + 1];
-      i++; // Skip the next argument as it's the value
+    if (args[i].startsWith('--')) {
+        const key = args[i];
+        // Check if it's a flag (no value follows or next arg is another option)
+        if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+            options[key] = true; // Treat as boolean flag
+        } else {
+            // Argument has a value
+            const potentialValue = args[i + 1];
+            const numberValue = parseInt(potentialValue, 10);
+            if (!isNaN(numberValue) && potentialValue === numberValue.toString()) {
+                options[key] = numberValue; // Store as number
+            } else if (potentialValue.toLowerCase() === 'true' || potentialValue.toLowerCase() === 'false') {
+                options[key] = potentialValue.toLowerCase() === 'true'; // Store as boolean
+            } else {
+                options[key] = potentialValue; // Store as string
+            }
+            i++; // Skip the value argument
+        }
     }
   }
   
   return options;
 }
 
-/**
- * Run a live sync test with specified parameters
- */
-async function runLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
-  // Set a global timeout to ensure the process exits even if something hangs
-  const globalTimeout = setTimeout(() => {
-    console.error('\n⚠️ Global timeout reached! Forcing exit.');
-    process.exit(1);
-  }, 180000); // 3 minutes max run time
-  
-  try {
-    // We use dynamic import to prevent auto-execution when the module is loaded
-    // Fix the import: get LiveSyncScenario and ScenarioRunner instead of non-existent runLiveSyncTest
-    const { LiveSyncScenario } = await import('./scenarios/live-sync.ts');
-    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
-    
-    console.log(`\n🔄 Running live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
-    
-    // Create a new ScenarioRunner and configure the scenario
-    const runner = new ScenarioRunner();
-    const scenario = LiveSyncScenario;
-    
-    // Configure the scenario with our parameters
-    scenario.config.customProperties = {
-      ...scenario.config.customProperties,
-      clientCount,
-      changeCount,
-      mode: 'normal'
-    };
-    
-    // Override the default change count
-    scenario.config.changeCount = changeCount;
-    
-    // Set high timeout for long-running tests
-    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
-    
-    // Run the scenario
-    await runner.runScenario(scenario);
-    
-    console.log('\n✅ Live sync test completed successfully!');
-    
-    // Clear the global timeout and exit cleanly
-    clearTimeout(globalTimeout);
-    console.log('Test completed, exiting...');
-    process.exit(0);
-  } catch (error) {
-    console.error('\n❌ Test failed:', error);
-    // Force exit immediately to avoid hanging
-    clearTimeout(globalTimeout);
-    process.exit(1);
-  }
-}
-
-/**
- * Run a simplified live sync test with specified parameters
- */
-async function runSimplifiedLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
-  // Set a global timeout to ensure the process exits even if something hangs
-  const globalTimeout = setTimeout(() => {
-    console.error('\n⚠️ Global timeout reached! Forcing exit.');
-    process.exit(1);
-  }, 180000); // 3 minutes max run time
-  
-  try {
-    // We use dynamic import to prevent auto-execution when the module is loaded
-    const { LiveSyncSimplifiedScenario } = await import('./scenarios/live-sync-simplified.ts');
-    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
-    
-    console.log(`\n🔄 Running simplified live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
-    
-    // Create a new ScenarioRunner and configure the scenario
-    const runner = new ScenarioRunner();
-    const scenario = LiveSyncSimplifiedScenario;
-    
-    // Configure the scenario with our parameters
-    scenario.config.customProperties = {
-      ...scenario.config.customProperties,
-      clientCount
-    };
-    
-    // Override the default change count
-    scenario.config.changeCount = changeCount;
-    
-    // Set high timeout for long-running tests
-    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
-    
-    // Run the scenario
-    await runner.runScenario(scenario);
-    
-    console.log('\n✅ Simplified live sync test completed successfully!');
-    
-    // Clear the global timeout and exit cleanly
-    clearTimeout(globalTimeout);
-    console.log('Test completed, exiting...');
-    process.exit(0);
-  } catch (error) {
-    console.error('\n❌ Test failed:', error);
-    // Force exit immediately to avoid hanging
-    clearTimeout(globalTimeout);
-    process.exit(1);
-  }
-}
-
-/**
- * Run a streamlined live sync test with specified parameters
- */
-async function runStreamlinedLiveSyncTest(clientCount: number, changeCount: number): Promise<void> {
-  // Set a global timeout to ensure the process exits even if something hangs
-  const globalTimeout = setTimeout(() => {
-    console.error('\n⚠️ Global timeout reached! Forcing exit.');
-    process.exit(1);
-  }, 180000); // 3 minutes max run time
-  
-  try {
-    // We use dynamic import to prevent auto-execution when the module is loaded
-    const { StreamlinedLiveSyncScenario } = await import('./scenarios/streamlined-live-sync.ts');
-    const { ScenarioRunner } = await import('./core/scenario-runner.ts');
-    
-    console.log(`\n🔄 Running streamlined live sync test with ${clientCount} client(s) and ${changeCount} changes...\n`);
-    
-    // Create a new ScenarioRunner and configure the scenario
-    const runner = new ScenarioRunner();
-    const scenario = StreamlinedLiveSyncScenario;
-    
-    // Configure the scenario with our parameters
-    scenario.config.customProperties = {
-      ...scenario.config.customProperties,
-      clientCount
-    };
-    
-    // Override the default change count
-    scenario.config.changeCount = changeCount;
-    
-    // Set high timeout for long-running tests
-    scenario.config.timeout = Math.max(scenario.config.timeout || 30000, changeCount * 1000);
-    
-    // Run the scenario
-    await runner.runScenario(scenario);
-    
-    console.log('\n✅ Streamlined live sync test completed successfully!');
-    
-    // Clear the global timeout and exit cleanly
-    clearTimeout(globalTimeout);
-    console.log('Test completed, exiting...');
-    process.exit(0);
-  } catch (error) {
-    console.error('\n❌ Test failed:', error);
-    // Force exit immediately to avoid hanging
-    clearTimeout(globalTimeout);
-    process.exit(1);
-  }
-}
-
-/**
- * Display help for a specific command or general help
- */
 function showHelp(commandName?: string): void {
   if (commandName && commands[commandName]) {
     const command = commands[commandName];
@@ -426,29 +322,36 @@ async function main() {
     }
   };
   
-  // Parse command line arguments
-  const args = process.argv.slice(2);
+  // Simple argument parsing for direct execution
+  const args = process.argv.slice(2); // Remove 'tsx' and script path
   
-  if (args.length === 0) {
-    // No arguments, show interactive menu
-    await showInteractiveMenu();
-  } else {
-    const commandName = args[0];
-    const commandArgs = args.slice(1);
+  if (args[0] === 'test' && args.includes('--scenario')) {
+    const scenarioIndex = args.indexOf('--scenario');
+    const scenarioName = args[scenarioIndex + 1];
     
-    // Check if command exists
-    if (commands[commandName]) {
-      await commands[commandName].handler(commandArgs);
+    if (scenarioName) {
+        // Pass all remaining args to parseCommandOptions
+        const cliOptions = parseCommandOptions(args);
+        await runTestScenario(scenarioName, cliOptions);
     } else {
-      console.log(`\n❌ Unknown command: ${commandName}`);
-      showHelp();
-      process.exit(1);
+        console.error('Missing scenario name after --scenario');
+        showHelp();
+        process.exit(1);
     }
+  } else if (args[0] === 'help') {
+     showHelp(args[1]);
+     process.exit(0);
+  } else if (args[0] === 'interactive' || args.length === 0) {
+     await showInteractiveMenu(); 
+  } else {
+    console.log(`Unknown command: ${args.join(' ')}`);
+    showHelp();
+    process.exit(1);
   }
-}
+} // Added missing closing brace for main function
 
-// Start the CLI
+// Execute main function
 main().catch(error => {
-  console.error('Fatal error:', error);
+  console.error("\n❌ An unexpected error occurred in the CLI:", error);
   process.exit(1);
 }); 

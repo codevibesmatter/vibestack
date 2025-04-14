@@ -240,8 +240,6 @@ export function transformWALChanges(changes: WALData[]): {
       keptChanges: tableChanges.length,
       filtered: totalChangesInWAL - tableChanges.length,
       tables: tableOperationSummary,
-      keptTables: keptTables.length > 0 ? keptTables.join(',') : 'none',
-      filteredTables: filteredTables.length > 0 ? filteredTables.join(',') : 'none',
       reasons: Object.keys(filteredReasons).length > 0 ? filteredReasons : undefined
     }, MODULE_NAME);
   }
@@ -275,7 +273,10 @@ export async function storeChangesInHistory(
   
   // Single log at start with essential info
   replicationLogger.info('Storing changes', {
-    count: changes.length,
+    count: changes.length
+  }, MODULE_NAME);
+  // Add debug log for table details
+  replicationLogger.debug('Storing changes table details', {
     tables: tablesStr
   }, MODULE_NAME);
   
@@ -300,7 +301,7 @@ export async function storeChangesInHistory(
       // Create a multi-row insert with parameterized values
       const valueRows = batch.map((_, idx) => {
         const base = idx * 5;
-        return `($${base + 1}, $${base + 2}, $${base + 3}::jsonb, $${base + 4}, $${base + 5}::timestamptz)`;
+        return `($${base + 1}, $${base + 2}, $${base + 3}::jsonb, $${base + 4}::pg_lsn, $${base + 5}::timestamptz)`;
       }).join(',\n');
       
       const params: any[] = [];
@@ -463,9 +464,22 @@ export async function processChanges(
         };
       }
       
-      // Single log at start of notification with client count only
+      // Capture the changes we're about to send for verification purposes
+      const changeRecordIds = tableChanges.map(change => {
+        const id = change.data?.id ? String(change.data.id).substring(0, 8) + '...' : 'unknown';
+        return `${change.table}:${change.operation}:${id}`;
+      });
+      
+      // Single log at start of notification with client count and change count only
       replicationLogger.info('Notifying clients in parallel', {
-        count: clientIds.length
+        count: clientIds.length,
+        changeCount: tableChanges.length
+      }, MODULE_NAME);
+      // Add debug log for change sample
+      replicationLogger.debug('Notifying clients change sample', {
+        changeRecordSample: changeRecordIds.length > 5 
+          ? changeRecordIds.slice(0, 5).join(', ') + ` (and ${changeRecordIds.length - 5} more)`
+          : changeRecordIds.join(', ')
       }, MODULE_NAME);
       
       // Process all clients in parallel
@@ -475,19 +489,41 @@ export async function processChanges(
             const clientDoId = env.SYNC.idFromName(`client:${clientId}`);
             const clientDo = env.SYNC.get(clientDoId);
             
+            // Set a diagnostic header so we can correlate client processing logs
+            const processingId = `proc-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+            
             const response = await clientDo.fetch(
               `https://internal/new-changes?clientId=${encodeURIComponent(clientId)}`,
               {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ lsn: lastLSN })
+                headers: { 
+                  "Content-Type": "application/json",
+                  "X-Processing-Id": processingId
+                },
+                body: JSON.stringify({ 
+                  lsn: lastLSN,
+                  changeCount: tableChanges.length,
+                })
               }
             );
             
+            // Attempt to parse response body for more details
+            let responseDetails = {};
+            try {
+              const responseBody = await response.text();
+              if (responseBody) {
+                responseDetails = JSON.parse(responseBody);
+              }
+            } catch (parseError) {
+              // Ignore parse errors
+            }
+            
             return { 
               clientId, 
+              processingId,
               success: response.status === 200,
-              error: response.status !== 200 ? `Status ${response.status}` : undefined
+              error: response.status !== 200 ? `Status ${response.status}` : undefined,
+              details: responseDetails
             };
           } catch (error) {
             return { 
@@ -512,11 +548,59 @@ export async function processChanges(
         }, MODULE_NAME);
       });
       
+      // Extract details about changes processed
+      const changeStats = results
+        .filter(r => r.success && r.details && (r.details as any).processingStats)
+        .map(r => ({
+          clientId: r.clientId,
+          stats: (r.details as any).processingStats
+        }));
+      
+      // If we have processing stats, log them
+      if (changeStats.length > 0) {
+        // For each client, log the change counts
+        changeStats.forEach(stat => {
+          const processingStats = stat.stats || {};
+          
+          // Log detailed deduplication information if available
+          if (processingStats.deduplication) {
+            const dedup = processingStats.deduplication;
+            const transformations = dedup.transformations || [];
+            
+            // Log a summary of transformations
+            if (transformations.length > 0) {
+              const transformationsByType: Record<string, number> = {};
+              transformations.forEach((t: any) => {
+                const key = `${t.from}->${t.to}`;
+                transformationsByType[key] = (transformationsByType[key] || 0) + 1;
+              });
+              
+              replicationLogger.info('Change transformations for client', {
+                clientId: stat.clientId,
+                transformations: Object.entries(transformationsByType)
+                  .map(([type, count]) => `${type}:${count}`)
+                  .join(', ')
+              }, MODULE_NAME);
+            }
+            
+            // Log information about any missing entities
+            if (dedup.missingIds?.length > 0) {
+              replicationLogger.warn('Changes with missing IDs detected', {
+                clientId: stat.clientId,
+                count: dedup.missingIds.length,
+                tables: dedup.missingIds.map((c: any) => c.table).join(', ')
+              }, MODULE_NAME);
+            }
+          }
+        });
+      }
+      
       // Summary log
       replicationLogger.info('Client notifications completed', {
         success: successCount,
         failed: failureCount,
-        failedClients: failedClients.length > 0 ? failedClients : undefined
+        failedClients: failedClients.length > 0 ? failedClients : undefined,
+        processingTime: Date.now() - startTime
       }, MODULE_NAME);
     } catch (notifyError) {
       replicationLogger.error('Client notification process failed', {

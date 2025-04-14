@@ -29,6 +29,64 @@ type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 const MODULE_NAME = 'server-changes';
 
 /**
+ * Helper function to process a raw batch of changes fetched from the database.
+ * Applies deduplication, domain-specific ordering, and client filtering.
+ * 
+ * @param rawChanges The raw changes array from change_history.
+ * @param clientId The ID of the client requesting the sync, to filter out their own changes.
+ * @returns Processed and filtered array of TableChange.
+ */
+function processRawChangesBatch(
+  rawChanges: TableChange[],
+  clientId: string
+): TableChange[] {
+  if (rawChanges.length === 0) {
+    return [];
+  }
+
+  // 1. Deduplicate changes
+  const dedupResult = deduplicateChanges(rawChanges);
+  const dedupChanges = dedupResult.changes;
+
+  // Add debug log for deduplication details
+  if (rawChanges.length !== dedupChanges.length) {
+    syncLogger.debug('Deduplication applied', {
+      clientId,
+      before: rawChanges.length,
+      after: dedupChanges.length,
+      removed: rawChanges.length - dedupChanges.length,
+      skippedMissingIdCount: dedupResult.skipped?.missingId?.length || 0,
+      skippedOutdatedCount: dedupResult.skipped?.outdated?.length || 0,
+      transformationCount: dedupResult.transformations?.count || 0
+    }, MODULE_NAME);
+  }
+
+  if (dedupChanges.length === 0) {
+    return [];
+  }
+  
+  // 2. Order changes by domain hierarchy
+  // Assuming orderChangesByDomain function exists and works correctly
+  // If it doesn't exist, this step needs implementation or removal.
+  const orderedChanges = baseOrderChangesByDomain(dedupChanges); // Using imported base function
+
+  // 3. Filter out changes originated by the requesting client
+  const filteredChanges = orderedChanges.filter(change => {
+    return !change.data?.client_id || change.data.client_id !== clientId;
+  });
+
+  syncLogger.debug('Processed raw changes batch', {
+    clientId,
+    rawCount: rawChanges.length,
+    deduplicatedCount: dedupChanges.length,
+    orderedCount: orderedChanges.length, // Usually same as deduped
+    filteredCount: filteredChanges.length
+  }, MODULE_NAME);
+
+  return filteredChanges;
+}
+
+/**
  * Send catchup changes to client using the message handler with chunking support and flow control
  */
 export async function sendCatchupChanges(
@@ -37,7 +95,14 @@ export async function sendCatchupChanges(
   clientId: string,
   messageHandler: WebSocketHandler
 ): Promise<boolean> {
+  syncLogger.info('Starting catchup changes send', {
+    clientId,
+    changeCount: changes.length,
+    lastLSN
+  }, MODULE_NAME);
+
   if (!changes.length) {
+    syncLogger.info('No changes to send for catchup', { clientId }, MODULE_NAME);
     return false;
   }
 
@@ -45,10 +110,36 @@ export async function sendCatchupChanges(
   const chunks = Math.ceil(changes.length / DEFAULT_CHUNK_SIZE);
   const success: boolean[] = [];
 
+  syncLogger.info('Preparing to send catchup chunks', {
+    clientId,
+    totalChunks: chunks,
+    changesPerChunk: DEFAULT_CHUNK_SIZE
+  }, MODULE_NAME);
+
   for (let i = 0; i < chunks; i++) {
     const start = i * DEFAULT_CHUNK_SIZE;
     const end = Math.min(start + DEFAULT_CHUNK_SIZE, changes.length);
     const chunkChanges = changes.slice(start, end);
+
+    // Ensure all changes have proper table property set as string
+    for (const change of chunkChanges) {
+      if (change.table === undefined) {
+        syncLogger.warn('Found change with undefined table property', { 
+          clientId,
+          operation: change.operation,
+          id: change.data?.id
+        }, MODULE_NAME);
+        // Set a default value to prevent it from being dropped during serialization
+        change.table = 'unknown';
+      }
+    }
+
+    syncLogger.debug('Preparing catchup chunk', {
+      clientId,
+      chunk: i + 1,
+      total: chunks,
+      changesInChunk: chunkChanges.length
+    }, MODULE_NAME);
 
     const message: ServerChangesMessage = {
       type: 'srv_catchup_changes',
@@ -61,6 +152,13 @@ export async function sendCatchupChanges(
     };
 
     try {
+      syncLogger.debug('Sending catchup chunk', {
+        clientId,
+        chunk: i + 1,
+        total: chunks,
+        messageId: message.messageId
+      }, MODULE_NAME);
+
       await messageHandler.send(message);
       
       // Wait for client acknowledgment (flow control for catchup sync)
@@ -96,7 +194,7 @@ export async function sendCatchupChanges(
       
       success.push(true);
       
-      syncLogger.info('Sent catchup changes chunk', {
+      syncLogger.debug('Sent catchup changes chunk', {
         clientId,
         chunk: i + 1,
         total: chunks,
@@ -116,7 +214,15 @@ export async function sendCatchupChanges(
   }
 
   // Return true only if all chunks were sent successfully
-  return success.every(s => s);
+  const allSuccess = success.every(s => s);
+  syncLogger.info('Catchup changes send completed', {
+    clientId,
+    success: allSuccess,
+    totalChunks: chunks,
+    successfulChunks: success.filter(s => s).length
+  }, MODULE_NAME);
+
+  return allSuccess;
 }
 
 /**
@@ -163,81 +269,268 @@ export function createCatchupSyncError(
 
 /**
  * Perform catchup sync for a client
- * This uses changes from the change_history table
+ * This fetches changes directly from the change_history table in batches.
  */
 export async function performCatchupSync(
   context: MinimalContext,
   clientId: string,
   clientLSN: string,
-  serverLSN: string, // Add serverLSN parameter to avoid redundant LSN fetching
+  initialServerLSN: string, // The server LSN when the catchup request was initiated
   messageHandler: WebSocketHandler,
   stateManager: SyncStateManager
 ): Promise<void> {
-  syncLogger.info('Catchup sync started', {
+  const functionStartTime = Date.now(); // Log function start time
+  syncLogger.info('Starting catchup sync', {
     clientId,
     clientLSN,
-    serverLSN
+    initialServerLSN
   }, MODULE_NAME);
 
+  let currentLSN = clientLSN;
+  let totalChangeCount = 0;
+  let success = true;
+  const BATCH_SIZE = 5000; // Size of batches to query from DB
+
   try {
-    // Use the shared fetchAndProcessChanges function with isLiveSync=false
-    const result = await fetchAndProcessChanges(
-      context,
-      clientId,
-      clientLSN,
-      serverLSN,
-      messageHandler,
-      false // This is catchup sync, not live sync
-    );
+    // --- Phase 1: Bulk Catch-up Loop --- 
+    let phase1Complete = false;
+    let phase1Iteration = 0;
     
-    // Complete the sync
+    const phase1StartTime = Date.now();
+    syncLogger.debug('[TIMING] Phase 1: Starting bulk catch-up processing', {
+      clientId,
+      startLSN: currentLSN,
+      targetLSN: initialServerLSN,
+      timestamp: phase1StartTime
+    }, MODULE_NAME);
+    
+    while (success && !phase1Complete) {
+      phase1Iteration++;
+      const iterationStartTime = Date.now();
+      syncLogger.debug(`[TIMING] Phase 1: Processing batch #${phase1Iteration}`, {
+        clientId,
+        currentLSN,
+        targetLSN: initialServerLSN,
+        timestamp: iterationStartTime
+      }, MODULE_NAME);
+
+      let rawBatchChanges: TableChange[] = [];
+      syncLogger.debug(`[TIMING] Phase 1: Getting DB client for batch #${phase1Iteration}`, { clientId, timestamp: Date.now() });
+      const batchClient = getDBClient(context);
+      try { 
+        const connectStartTime = Date.now();
+        syncLogger.debug(`[TIMING] Phase 1: Connecting DB client for batch #${phase1Iteration}`, { clientId, timestamp: connectStartTime });
+        await batchClient.connect();
+        syncLogger.debug(`[TIMING] Phase 1: DB client connected for batch #${phase1Iteration} (took ${Date.now() - connectStartTime}ms)`, { clientId, timestamp: Date.now() });
+        
+        const queryStartTime = Date.now();
+        syncLogger.debug(`[TIMING] Phase 1: Querying DB for batch #${phase1Iteration}`, { clientId, timestamp: queryStartTime });
+        const batchResult = await batchClient.query<TableChange>(`
+          SELECT lsn, table_name as "table", operation, data, timestamp 
+          FROM change_history 
+          WHERE 
+            lsn::pg_lsn > $1::pg_lsn -- Fetch all changes after client LSN
+            AND (data->>'client_id' IS NULL OR data->>'client_id' != $2) -- Adjusted parameter index
+          ORDER BY lsn::pg_lsn ASC
+          LIMIT $3 -- Adjusted parameter index
+        `, [currentLSN, clientId, BATCH_SIZE]); // Removed initialServerLSN, adjusted indices
+        syncLogger.debug(`[TIMING] Phase 1: DB query finished for batch #${phase1Iteration} (took ${Date.now() - queryStartTime}ms)`, { clientId, timestamp: Date.now(), rowCount: batchResult.rowCount });
+
+        rawBatchChanges = batchResult.rows.map((row: any) => ({
+          table: row.table || 'unknown',
+          operation: row.operation,
+          data: row.data,
+          lsn: row.lsn,
+          updated_at: row.timestamp || new Date().toISOString()
+        }));
+      } finally {
+        const endClientStartTime = Date.now();
+        syncLogger.debug(`[TIMING] Phase 1: Ending DB client connection for batch #${phase1Iteration}`, { clientId, timestamp: endClientStartTime });
+        await batchClient.end();
+        syncLogger.debug(`[TIMING] Phase 1: DB client ended for batch #${phase1Iteration} (took ${Date.now() - endClientStartTime}ms)`, { clientId, timestamp: Date.now() });
+      }
+
+      if (rawBatchChanges.length === 0) {
+        syncLogger.debug('[TIMING] Phase 1: No more changes found', { clientId, iteration: phase1Iteration, timestamp: Date.now() });
+        phase1Complete = true;
+        break; 
+      }
+
+      const processStartTime = Date.now();
+      syncLogger.debug(`[TIMING] Phase 1: Processing raw changes for batch #${phase1Iteration}`, { clientId, rawCount: rawBatchChanges.length, timestamp: processStartTime });
+      const processedBatchChanges = processRawChangesBatch(rawBatchChanges, clientId);
+      syncLogger.debug(`[TIMING] Phase 1: Processing raw changes finished for batch #${phase1Iteration} (took ${Date.now() - processStartTime}ms)`, { clientId, processedCount: processedBatchChanges.length, timestamp: Date.now() });
+
+      if (processedBatchChanges.length > 0) {
+        const sendStartTime = Date.now();
+        syncLogger.debug(`[TIMING] Phase 1: Calling sendCatchupChanges for batch #${phase1Iteration}`, { clientId, changeCount: processedBatchChanges.length, timestamp: sendStartTime });
+        const batchSuccess = await sendCatchupChanges(
+          processedBatchChanges,
+          processedBatchChanges[processedBatchChanges.length - 1].lsn || initialServerLSN, 
+          clientId,
+          messageHandler
+        );
+        syncLogger.debug(`[TIMING] Phase 1: sendCatchupChanges returned for batch #${phase1Iteration} (took ${Date.now() - sendStartTime}ms)`, { clientId, success: batchSuccess, timestamp: Date.now() });
+
+        if (!batchSuccess) {
+          success = false;
+          syncLogger.error(`Phase 1: Failed to send changes for batch #${phase1Iteration}`, { clientId });
+          break; // Exit Phase 1 loop on failure
+        }
+        
+        // Update LSN based on the LAST PROCESSED change sent
+        currentLSN = processedBatchChanges[processedBatchChanges.length - 1].lsn || currentLSN;
+        totalChangeCount += processedBatchChanges.length;
+      } else {
+        // If all changes were filtered/deduped, update LSN based on the last RAW change fetched
+        // Ensure currentLSN only moves forward
+        const lastRawLSN = rawBatchChanges[rawBatchChanges.length - 1]?.lsn;
+        if (lastRawLSN && compareLSN(lastRawLSN, currentLSN) > 0) {
+           currentLSN = lastRawLSN;
+        }
+      }
+
+      if (rawBatchChanges.length < BATCH_SIZE) {
+         syncLogger.debug('[TIMING] Phase 1: Processed partial DB batch, bulk phase complete.', { clientId, iteration: phase1Iteration, timestamp: Date.now() });
+         phase1Complete = true;
+         // currentLSN is already updated above
+         break; // Exit Phase 1 loop
+      }
+      syncLogger.debug(`[TIMING] Phase 1: Completed batch #${phase1Iteration} (total took ${Date.now() - iterationStartTime}ms)`, { clientId, timestamp: Date.now() });
+    }
+    syncLogger.debug(`[TIMING] Catchup loop finished (total took ${Date.now() - phase1StartTime}ms)`, { clientId, success, finalLSN: currentLSN, timestamp: Date.now() });
+    // --- End of Catchup Loop ---
+
+    if (!success) {
+      throw new Error(`Catchup sync failed during processing at LSN ${currentLSN}`);
+    }
+
+    syncLogger.info('Catchup processing completed', {
+      clientId,
+      processedCount: totalChangeCount,
+      finalLSN: currentLSN
+    }, MODULE_NAME);
+
+    // --- Phase 3: Completion --- 
+    const completionStartTime = Date.now();
+    syncLogger.info('Catchup Phase 3 (Completion) starting', {
+      clientId,
+      finalLSN: currentLSN
+    }, MODULE_NAME);
+    syncLogger.debug('[TIMING] Phase 3: Starting completion steps', { clientId, finalLSN: currentLSN, timestamp: completionStartTime });
+    
     const syncCompletedMsg = createCatchupSyncCompletion(
       clientId,
       clientLSN,
-      result.finalLSN,
-      result.changeCount
+      currentLSN, 
+      totalChangeCount
     );
     
-    await messageHandler.send(syncCompletedMsg);
+    // Add retry capability for catchup completion message
+    const MAX_COMPLETION_RETRIES = 3;
+    let completionSuccess = false;
+    let retryCount = 0;
     
-    // Always update the client LSN to the final LSN (which may be serverLSN if no changes)
-    // This ensures LSN advancement even when no changes are found
-    await stateManager.updateClientLSN(clientId, result.finalLSN);
-    syncLogger.info('Updated client LSN after catchup completion', {
-      clientId,
-      finalLSN: result.finalLSN,
-      previousLSN: clientLSN,
-      changeCount: result.changeCount
-    }, MODULE_NAME);
+    while (!completionSuccess && retryCount < MAX_COMPLETION_RETRIES) {
+      try {
+        syncLogger.debug('[TIMING] Phase 3: Sending completion message', { 
+          clientId, 
+          retryCount, 
+          timestamp: Date.now(),
+          messageId: syncCompletedMsg.messageId
+        });
+        
+        await messageHandler.send(syncCompletedMsg);
+        
+        // Mark as successful
+        completionSuccess = true;
+        syncLogger.debug('[TIMING] Phase 3: Completion message sent successfully', { 
+          clientId, 
+          retryCount,
+          timestamp: Date.now(),
+          messageId: syncCompletedMsg.messageId
+        });
+      } catch (err) {
+        retryCount++;
+        syncLogger.error(`[TIMING] Phase 3: Failed to send completion message (attempt ${retryCount})`, { 
+          clientId, 
+          error: err instanceof Error ? err.message : String(err),
+          timestamp: Date.now()
+        });
+        
+        // Add small delay before retrying
+        if (retryCount < MAX_COMPLETION_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
+        }
+      }
+    }
     
-    syncLogger.info('Catchup sync completed', {
-      clientId,
-      clientLSN,
-      finalLSN: result.finalLSN,
-      changeCount: result.changeCount,
-      success: result.success
-    }, MODULE_NAME);
+    if (!completionSuccess) {
+      throw new Error(`Failed to send catchup completion message after ${MAX_COMPLETION_RETRIES} attempts`);
+    }
+    
+    // Update client state with the new LSN
+    try {
+      syncLogger.debug('[TIMING] Phase 3: Updating client LSN in state manager', { 
+        clientId, 
+        finalLSN: currentLSN
+      });
+      
+      await stateManager.updateClientLSN(clientId, currentLSN);
+      
+      syncLogger.debug('[TIMING] Phase 3: Client LSN updated successfully', { 
+        clientId, 
+        lsn: currentLSN
+      });
+    } catch (err) {
+      syncLogger.error('[TIMING] Phase 3: Failed to update client LSN in state manager', { 
+        clientId, 
+        error: err instanceof Error ? err.message : String(err)
+      });
+      // Non-critical error, don't throw
+    }
+    
+    syncLogger.info('Catchup sync completed successfully', { 
+      clientId, 
+      startLSN: clientLSN,
+      finalLSN: currentLSN,
+      totalChangeCount,
+      durationMs: Date.now() - functionStartTime
+    });
+    syncLogger.debug('[TIMING] Phase 3: Catchup sync completed successfully', { 
+      clientId, 
+      startLSN: clientLSN,
+      finalLSN: currentLSN,
+      totalChangeCount,
+      durationMs: Date.now() - functionStartTime
+    });
+
   } catch (error) {
-    syncLogger.error('Catchup sync failed', {
+    syncLogger.error(`[TIMING] performCatchupSync failed (total took ${Date.now() - functionStartTime}ms)`, {
       clientId,
       clientLSN,
+      finalReportedLSN: currentLSN, // Log where we ended up
+      initialServerLSN,
       error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
     
-    // Send a sync completed message with error information
-    const syncCompletedMsg = createCatchupSyncError(
+    // Send failure message to client
+    try {
+      const failureMsg = createCatchupSyncError(
       clientId,
       clientLSN,
       error instanceof Error ? error : String(error)
     );
-    
-    await messageHandler.send(syncCompletedMsg);
-    
-    syncLogger.error('Catchup sync failed, completion message sent', {
+      await messageHandler.send(failureMsg);
+    } catch (msgError) {
+      syncLogger.error('Failed to send catchup failure message', {
       clientId,
-      clientLSN,
-      error: error instanceof Error ? error.message : String(error)
+        error: msgError instanceof Error ? msgError.message : String(msgError)
     }, MODULE_NAME);
+    }
+    
+    // Rethrow the error to ensure the scenario runner sees the failure
+    throw error;
   }
 }
 
@@ -288,7 +581,7 @@ export async function sendLiveChanges(
   const startTime = Date.now();
   
   try {
-    syncLogger.info('Sending live changes', { 
+    syncLogger.debug('Sending live changes', { 
       clientId, 
       changeCount: changes.length,
       tables: [...new Set(changes.map(c => c.table))].join(','),
@@ -367,7 +660,7 @@ export async function sendLiveChanges(
     }
     
     // Send changes to the client
-    syncLogger.info('Sending live changes', {
+    syncLogger.debug('Sending live changes', {
       clientId,
       count: orderedChanges.length,
       lsn: currentLSN
@@ -384,6 +677,19 @@ export async function sendLiveChanges(
       const start = i * DEFAULT_CHUNK_SIZE;
       const end = Math.min(start + DEFAULT_CHUNK_SIZE, orderedChanges.length);
       const chunkChanges = orderedChanges.slice(start, end);
+      
+      // Ensure all changes have proper table property set as string
+      for (const change of chunkChanges) {
+        if (change.table === undefined) {
+          syncLogger.warn('Found change with undefined table property', { 
+            clientId,
+            operation: change.operation,
+            id: change.data?.id
+          }, MODULE_TAG);
+          // Set a default value to prevent it from being dropped during serialization
+          change.table = 'unknown';
+        }
+      }
       
       // For the last chunk, use the overall last LSN
       // For intermediate chunks, use the LSN of the last change in this chunk
@@ -407,10 +713,27 @@ export async function sendLiveChanges(
       };
 
       try {
+        // Log first change in detail to help debug table field issue
+        if (chunkChanges.length > 0) {
+          const sampleChanges = chunkChanges.slice(0, 3);
+          syncLogger.debug('Detailed change inspection before sending', {
+            clientId,
+            sampleProperties: sampleChanges.map(c => ({ 
+              table: c.table, 
+              hasTable: c.table !== undefined,
+              tableType: typeof c.table, 
+              operation: c.operation
+            })),
+            hasTableProperty: sampleChanges.every(c => c.table !== undefined),
+            tableValues: sampleChanges.map(c => c.table).join(','),
+            changeKeys: Object.keys(sampleChanges[0]).join(',')
+          }, MODULE_TAG);
+        }
+        
         await messageHandler.send(message);
         chunkSuccess.push(true);
         
-        syncLogger.info('Sent live changes chunk', {
+        syncLogger.debug('Sent live changes chunk', {
           clientId,
           chunk: i + 1,
           total: chunks,
@@ -477,466 +800,157 @@ export function createLiveSyncConfirmation(
   };
 }
 
+// Remove or comment out the old fetchAndProcessChanges and fetchAndProcessBatch functions
+// as their logic is now integrated into performCatchupSync or handled by sendCatchupChanges
+
+/*
+async function fetchAndProcessChanges(...) { ... }
+async function fetchAndProcessBatch(...) { ... }
+*/
+
+// Helper function to summarize transformations
+function summarizeTransformations(details: Array<{
+  from: string;
+  to: string;
+  entityId: string;
+  table: string;
+  reason: string;
+  timestamp?: string;
+  lsn?: string;
+}>): Array<{ from: string; to: string; count: number; tables: string[] }> {
+  // Group transformations by from->to pattern
+  const groups: Record<string, {
+    from: string;
+    to: string;
+    count: number;
+    tables: Set<string>;
+    entities: Set<string>;
+  }> = {};
+  
+  details.forEach(detail => {
+    const key = `${detail.from}->${detail.to}`;
+    if (!groups[key]) {
+      groups[key] = {
+        from: detail.from,
+        to: detail.to,
+        count: 0,
+        tables: new Set<string>(),
+        entities: new Set<string>()
+      };
+    }
+    
+    groups[key].count++;
+    groups[key].tables.add(detail.table);
+    groups[key].entities.add(`${detail.table}:${detail.entityId}`);
+  });
+  
+  // Convert to array and sort by count (most frequent first)
+  return Object.values(groups)
+    .sort((a, b) => b.count - a.count)
+    .map(group => ({
+      from: group.from,
+      to: group.to,
+      count: group.count,
+      tables: Array.from(group.tables),
+      entities: group.entities.size
+    }));
+} 
+
 /**
- * Fetch changes from the database, process them, and send them to the client
- * This is a unified function for both live updates and catchup sync
+ * Fetches and processes the delta of changes for a live update notification.
+ * Includes deduplication, ordering, and filtering.
+ * Sends the processed changes using the provided handler.
+ * 
+ * @returns Object containing success status, number of changes sent, and the final LSN.
  */
-export async function fetchAndProcessChanges(
+export async function processLiveUpdateNotification(
   context: MinimalContext,
   clientId: string,
   clientLSN: string,
   serverLSN: string,
-  messageHandler: WebSocketHandler,
-  isLiveSync: boolean = true
-): Promise<{
-  success: boolean;
-  changeCount: number;
-  finalLSN: string;
-}> {
-  const startTime = Date.now();
-  let allChanges: TableChange[] = [];
-  let historyLatestLSN = serverLSN; // Default to serverLSN but will be updated
-  
+  messageHandler: WebSocketHandler
+): Promise<{ success: boolean; changeCount: number; finalLSN: string; }> {
+  syncLogger.info('Processing live update notification', {
+    clientId,
+    clientLSN,
+    serverLSN
+  }, MODULE_NAME);
+
+  let finalLSN = clientLSN; // Start with client's known LSN
+  let processedChangeCount = 0;
+  let success = true;
+
   try {
-    syncLogger.info(`Fetching changes for ${isLiveSync ? 'live' : 'catchup'} sync`, {
-      clientId,
-      clientLSN,
-      serverLSN: serverLSN,
-      note: 'Will use latest change_history LSN as upper bound'
-    }, MODULE_NAME);
-    
-    // Query changes from database
-    const client = getDBClient(context);
-    await client.connect();
-    
+    // 1. Fetch raw delta changes
+    let rawDeltaChanges: TableChange[] = [];
+    const deltaClient = getDBClient(context);
     try {
-      // First, get the actual latest LSN from change_history table
-      // This is critical to prevent LSN gaps when serverLSN is ahead of change_history
-      const latestLsnResult = await client.query(`
-        SELECT MAX(lsn) as latest_lsn FROM change_history
-      `);
-      
-      if (latestLsnResult.rows.length > 0 && latestLsnResult.rows[0].latest_lsn) {
-        historyLatestLSN = latestLsnResult.rows[0].latest_lsn;
-        
-        // Log if server LSN and history LSN differ significantly
-        if (compareLSN(serverLSN, historyLatestLSN) > 0) {
-          syncLogger.debug('Server LSN ahead of change_history', {
-            clientId,
-            serverLSN,
-            historyLatestLSN,
-            diff: `${serverLSN} vs ${historyLatestLSN}`
-          }, MODULE_NAME);
-        }
-      }
-      
-      // Set a timeout for the query to avoid WebSocket connection timeout
-      await client.query('SET statement_timeout = 20000'); // 20 seconds timeout
-      
-      const queryStart = Date.now();
-      // Use historyLatestLSN as the upper bound instead of serverLSN
-      const result = await client.query(`
-        SELECT lsn, table_name, operation, data, timestamp 
+      await deltaClient.connect();
+      const deltaResult = await deltaClient.query<TableChange>(`
+        SELECT lsn, table_name as "table", operation, data, timestamp 
         FROM change_history 
         WHERE 
           lsn::pg_lsn > $1::pg_lsn AND
-          lsn::pg_lsn <= $2::pg_lsn AND
-          (data->>'client_id' IS NULL OR data->>'client_id' != $3)
+          lsn::pg_lsn <= $2::pg_lsn
         ORDER BY lsn::pg_lsn ASC
-        LIMIT 500
-      `, [clientLSN, historyLatestLSN, clientId]);
-      const queryDuration = Date.now() - queryStart;
+        LIMIT 1000 -- Reasonable limit for a live update delta
+      `, [clientLSN, serverLSN]);
       
-      // Convert to TableChange format
-      allChanges = result.rows.map(row => ({
-        table: row.table_name,
-        operation: row.operation,
-        data: row.data,
-        lsn: row.lsn,
-        updated_at: row.timestamp || new Date().toISOString()
+      rawDeltaChanges = deltaResult.rows.map((row: any) => ({
+          table: row.table || 'unknown',
+          operation: row.operation,
+          data: row.data,
+          lsn: row.lsn,
+          updated_at: row.timestamp || new Date().toISOString()
       }));
-      
-      syncLogger.debug('Retrieved changes from history', {
-        clientId,
-        clientLSN,
-        historyLatestLSN,
-        count: allChanges.length,
-        queryDuration
-      }, MODULE_NAME);
     } finally {
-      await client.end();
+      await deltaClient.end();
     }
-    
-    // If no changes, return early with historyLatestLSN
-    if (allChanges.length === 0) {
-      syncLogger.info('No changes found for sync, advancing client LSN to latest history LSN', {
-        clientId,
-        clientLSN,
-        historyLatestLSN
-      }, MODULE_NAME);
-      
-      return {
-        success: true,
-        changeCount: 0,
-        finalLSN: historyLatestLSN  // ADVANCE to history latest LSN when no changes to prevent gaps
-      };
-    }
-    
-    // Process changes (deduplicate and order)
-    const deduplicationResult = deduplicateChanges(allChanges);
-    const processedChanges = deduplicationResult.changes;
-    const skippedChanges = deduplicationResult.skipped;
-    
-    // Track metrics for stats message
-    const originalCount = allChanges.length;
-    const processedCount = processedChanges.length;
-    const deduplicationReduction = originalCount - processedCount;
-    
-    // Log deduplication results with detailed breakdown
-    if (deduplicationReduction > 0) {
-      syncLogger.info('Changes reduced during deduplication', {
-        clientId,
-        before: originalCount,
-        after: processedCount,
-        reduced: deduplicationReduction,
-        percentage: ((deduplicationReduction / originalCount) * 100).toFixed(1) + '%',
-        breakdown: {
-          missingId: skippedChanges.missingId.length,
-          outdated: skippedChanges.outdated.length
-        },
-        // Include details of skipped changes with missing IDs for debugging
-        skippedWithoutIds: skippedChanges.missingId.map(c => ({
-          table: c.table,
-          operation: c.operation,
-          lsn: c.lsn,
-          data: c.data
-        }))
-      }, MODULE_NAME);
-      
-      // Log each missing ID change individually for deeper analysis
-      skippedChanges.missingId.forEach(change => {
-        syncLogger.warn('Skipped change missing ID', {
-          clientId,
-          table: change.table,
-          operation: change.operation,
-          lsn: change.lsn,
-          dataKeys: Object.keys(change.data || {}).join(',')
-        }, MODULE_NAME);
-      });
-      
-      // Log outdated changes with details about the newer change that replaced them
-      skippedChanges.outdated.forEach(outdated => {
-        // Find the newer change that replaced this one
-        const newerChange = processedChanges.find(p => 
-          p.table === outdated.table && 
-          p.data?.id === outdated.data?.id
-        );
-        
-        if (newerChange) {
-          syncLogger.info('Skipped outdated change', {
-            clientId,
-            table: outdated.table,
-            operation: outdated.operation,
-            id: outdated.data?.id,
-            lsn: outdated.lsn,
-            timestamp: outdated.updated_at,
-            replacedBy: {
-              operation: newerChange.operation,
-              lsn: newerChange.lsn,
-              timestamp: newerChange.updated_at
-            },
-            timeDiff: new Date(newerChange.updated_at).getTime() - new Date(outdated.updated_at).getTime() + 'ms'
-          }, MODULE_NAME);
-        } else {
-          syncLogger.warn('Skipped outdated change but replacement not found', {
-            clientId,
-            table: outdated.table,
-            operation: outdated.operation,
-            id: outdated.data?.id,
-            lsn: outdated.lsn
-          }, MODULE_NAME);
-        }
-      });
-    }
-    
-    // Filter out changes that originated from this client
-    const beforeClientFilter = processedChanges.length;
-    const filteredChanges = processedChanges.filter(change => {
-      // Track changes that would be filtered out (for debugging)
-      const fromThisClient = change.data?.client_id === clientId;
-      if (fromThisClient) {
-        syncLogger.debug('Filtering client\'s own change', {
-          clientId,
-          table: change.table,
-          operation: change.operation,
-          id: change.data?.id,
-          changeClientId: change.data?.client_id
-        }, MODULE_NAME);
-      }
-      // Return true to keep, false to filter out
-      return !change.data?.client_id || change.data.client_id !== clientId;
-    });
-    
-    // Log client filtering results
-    const clientFilterReduction = beforeClientFilter - filteredChanges.length;
-    if (clientFilterReduction > 0) {
-      // Log detailed info about each filtered change
-      const filteredOutChanges = processedChanges.filter(change => 
-        change.data?.client_id === clientId
-      );
-      
-      syncLogger.info('Changes filtered out (client\'s own changes)', {
-        clientId,
-        before: beforeClientFilter,
-        after: filteredChanges.length,
-        filtered: clientFilterReduction,
-        percentage: ((clientFilterReduction / beforeClientFilter) * 100).toFixed(1) + '%',
-        details: filteredOutChanges.map(c => ({
-          table: c.table,
-          operation: c.operation,
-          id: c.data?.id,
-          client_id: c.data?.client_id,
-          lsn: c.lsn
-        }))
-      }, MODULE_NAME);
-    }
-    
-    // Check for changes that might be missing but not explicitly filtered
-    // Compare original query results with final filtered changes
-    if (allChanges.length > filteredChanges.length) {
-      // Create a set of keys for filtered changes for quick lookup
-      const filteredChangeKeys = new Set(
-        filteredChanges.map(c => `${c.table}:${c.operation}:${c.data?.id}`)
-      );
-      
-      // Find changes that didn't make it through the pipeline
-      const missingChanges = allChanges.filter(c => {
-        const key = `${c.table}:${c.operation}:${c.data?.id}`;
-        return !filteredChangeKeys.has(key);
-      });
-      
-      // Group by reason
-      const missingByReason = {
-        deduplication: [] as any[],
-        clientFiltered: [] as any[],
-        unknown: [] as any[]
-      };
-      
-      // Classify each missing change
-      missingChanges.forEach(c => {
-        const isClientFiltered = c.data?.client_id === clientId;
-        
-        if (isClientFiltered) {
-          missingByReason.clientFiltered.push({
-            table: c.table,
-            operation: c.operation,
-            id: c.data?.id,
-            client_id: c.data?.client_id,
-            lsn: c.lsn
-          });
-        } else {
-          // Check if it's in the skipped changes (outdated)
-          const isOutdated = skippedChanges?.outdated?.some(skipped => 
-            skipped.table === c.table && 
-            skipped.operation === c.operation && 
-            skipped.data?.id === c.data?.id &&
-            skipped.lsn === c.lsn
-          );
-          
-          if (isOutdated) {
-            missingByReason.deduplication.push({
-              table: c.table,
-              operation: c.operation,
-              id: c.data?.id,
-              lsn: c.lsn,
-              reason: 'outdated'
-            });
-          } else {
-            // Check if it was removed during deduplication (duplicate key)
-            const isDuplicate = allChanges.filter(other => 
-              other !== c && 
-              other.table === c.table && 
-              other.operation === c.operation && 
-              other.data?.id === c.data?.id
-            ).length > 0;
-            
-            if (isDuplicate) {
-              missingByReason.deduplication.push({
-                table: c.table,
-                operation: c.operation,
-                id: c.data?.id,
-                lsn: c.lsn,
-                reason: 'duplicate key'
-              });
-            } else {
-              missingByReason.unknown.push({
-                table: c.table,
-                operation: c.operation,
-                id: c.data?.id,
-                lsn: c.lsn
-              });
-            }
-          }
-        }
-      });
-      
-      // Log detailed breakdown of missing changes
-      syncLogger.info('Missing changes breakdown', {
-        clientId,
-        totalMissing: missingChanges.length,
-        byReason: {
-          deduplication: missingByReason.deduplication.length,
-          clientFiltered: missingByReason.clientFiltered.length,
-          unknown: missingByReason.unknown.length
-        },
-        details: {
-          deduplication: missingByReason.deduplication,
-          clientFiltered: missingByReason.clientFiltered,
-          unknown: missingByReason.unknown
-        }
-      }, MODULE_NAME);
-    }
-    
-    // Track operation counts for logging
-    const operationCounts = filteredChanges.reduce((acc, change) => {
-      acc[change.operation] = (acc[change.operation] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
-    
-    const tableStats = filteredChanges.reduce((acc, change) => {
-      acc[change.table] = (acc[change.table] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
-    
-    // Get the LSN of the last change that will be sent
-    // This is critical for ensuring correct continuation in live sync
-    let lastChangeLSN = '';
-    if (filteredChanges.length > 0) {
-      // Find the highest LSN in the processed changes
-      lastChangeLSN = filteredChanges.reduce((highest, change) => {
-        // Skip changes with no LSN
-        if (!change.lsn) return highest;
-        // Compare LSNs and return the higher one
-        return !highest || compareLSN(change.lsn, highest) > 0 ? change.lsn : highest;
-      }, '');
-      
-      syncLogger.debug('Highest LSN in processed changes', {
-        clientId,
-        lsn: lastChangeLSN,
-        changeCount: filteredChanges.length
-      }, MODULE_NAME);
-    }
-    
-    // Send changes to client using the appropriate method
-    let sendResult: { success: boolean; lsn: string };
-    
-    if (isLiveSync) {
-      // For live updates, use sendLiveChanges
-      sendResult = await sendLiveChanges(
-        context,
-        clientId,
-        filteredChanges,
-        messageHandler,
-        lastChangeLSN || historyLatestLSN  // Prefer last change LSN if available
-      );
+
+    if (rawDeltaChanges.length === 0) {
+      syncLogger.info('No new changes found for live update notification', { clientId });
+      // Client is already up to date with the serverLSN provided in the notification
+      finalLSN = serverLSN; 
     } else {
-      // For catchup sync, use sendCatchupChanges with client acknowledgment
-      const success = await sendCatchupChanges(
-        filteredChanges,
-        lastChangeLSN || historyLatestLSN,  // Prefer last change LSN if available
-        clientId,
-        messageHandler
-      );
-      
-      sendResult = {
-        success,
-        lsn: success ? (lastChangeLSN || clientLSN) : clientLSN
-      };
-    }
-    
-    // Extract final LSN from the result
-    // If sending failed, keep client's current LSN
-    // Otherwise use the last change LSN (not server LSN)
-    const finalLSN = sendResult.success ? sendResult.lsn : clientLSN;
-    
-    // Create and send stats message
-    const statsMessage: ServerSyncStatsMessage = {
-      type: 'srv_sync_stats',
-      messageId: `stats_${Date.now()}`,
-      timestamp: Date.now(),
-      clientId,
-      syncType: isLiveSync ? 'live' : 'catchup',
-      originalCount,
-      processedCount,
-      deduplicationStats: {
-        beforeCount: originalCount,
-        afterCount: processedCount,
-        reduction: deduplicationReduction,
-        reductionPercent: originalCount > 0 ?
-          Math.round(((deduplicationReduction) / originalCount) * 100) : 0,
-        reasons: {}
-      },
-      filteringStats: {
-        beforeCount: originalCount,
-        afterCount: processedCount,
-        filtered: clientFilterReduction,
-        reasons: {}
-      },
-      contentStats: {
-        operations: operationCounts,
-        tables: tableStats,
-        clients: {}
-      },
-      performanceStats: {
-        processingTimeMs: Date.now() - startTime
+      // 2. Process raw changes (dedupe, order, filter)
+      const processedChanges = processRawChangesBatch(rawDeltaChanges, clientId);
+      processedChangeCount = processedChanges.length;
+      syncLogger.info(`Fetched ${rawDeltaChanges.length} raw changes, processed to ${processedChangeCount} for live update`, { clientId });
+
+      if (processedChangeCount > 0) {
+        // 3. Determine final LSN for this batch
+        finalLSN = processedChanges[processedChanges.length - 1].lsn || serverLSN;
+
+        // 4. Send processed changes via sendLiveChanges
+        // Assuming sendLiveChanges exists and is appropriate here
+        syncLogger.debug(`Sending ${processedChangeCount} processed live changes`, { clientId, finalLSN });
+        await sendLiveChanges(
+          context, // Pass context if needed by sendLiveChanges
+          clientId,
+          processedChanges,
+          messageHandler,
+          finalLSN
+        );
+      } else {
+        // If all changes were filtered/deduped, client is up to date with the last RAW change fetched
+        finalLSN = rawDeltaChanges[rawDeltaChanges.length - 1].lsn || serverLSN;
       }
-    };
-    
-    if (allChanges.length > 0 && finalLSN) {
-      statsMessage.lsnRange = {
-        first: allChanges[0].lsn || clientLSN,
-        last: finalLSN
-      };
     }
-    
-    // Send stats message
-    try {
-      await messageHandler.send(statsMessage);
-    } catch (statsError) {
-      syncLogger.error('Failed to send stats', {
-        clientId,
-        error: statsError instanceof Error ? statsError.message : String(statsError)
-      }, MODULE_NAME);
-      // Continue even if stats sending fails
-    }
-    
-    syncLogger.info(`${isLiveSync ? 'Live' : 'Catchup'} sync completed`, {
-      clientId,
-      changeCount: filteredChanges.length,
-      success: sendResult.success,
-      clientLSN,
-      finalLSN,
-      duration: Date.now() - startTime
-    }, MODULE_NAME);
-    
-    return {
-      success: sendResult.success,
-      changeCount: filteredChanges.length,
-      finalLSN
-    };
+
   } catch (error) {
-    syncLogger.error(`${isLiveSync ? 'Live' : 'Catchup'} sync failed`, {
+    syncLogger.error('Failed to process live update notification', {
       clientId,
       clientLSN,
-      historyLatestLSN,  // Changed from serverLSN
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
+      serverLSN,
+      error: error instanceof Error ? error.message : String(error)
     }, MODULE_NAME);
-    
-    return {
-      success: false,
-      changeCount: 0,
-      finalLSN: clientLSN
-    };
+    success = false;
+    finalLSN = clientLSN; // Revert to original LSN on error
   }
+
+  return {
+    success,
+    changeCount: processedChangeCount,
+    finalLSN
+  };
 } 

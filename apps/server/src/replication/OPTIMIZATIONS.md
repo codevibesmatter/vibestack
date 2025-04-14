@@ -29,6 +29,7 @@ This document tracks optimization opportunities for the replication system, part
 | L1 | Verbose logging | Reduce log verbosity in production | Pending | Low | Low |
 | L2 | Metrics extraction | Separate telemetry from logging | Pending | Medium | Medium |
 | L3 | Performance metrics | Add processing time tracking per stage | Pending | Low | Medium |
+| L4 | Redundant parsing | Eliminate duplicate JSON parsing in polling process | Completed | Low | Medium |
 
 ## Architectural Improvements
 
@@ -44,10 +45,6 @@ This document tracks optimization opportunities for the replication system, part
 ```typescript
 // Original implementation
 export function shouldTrackTable(tableName: string): boolean {
-  if (tableName === 'change_history') {
-    return false;
-  }
-  
   // Normalize and check against array - O(n) operation
   const normalizedTableName = tableName.startsWith('"') ? tableName : `"${tableName}"`;
   const isTracked = SERVER_DOMAIN_TABLES.includes(normalizedTableName as any);
@@ -59,10 +56,6 @@ export function shouldTrackTable(tableName: string): boolean {
 const TRACKED_TABLES_SET = new Set(SERVER_DOMAIN_TABLES);
 
 export function shouldTrackTable(tableName: string): boolean {
-  if (tableName === 'change_history') {
-    return false;
-  }
-  
   // Normalize the table name as before
   const normalizedTableName = tableName.startsWith('"') ? tableName : `"${tableName}"`;
   
@@ -241,6 +234,59 @@ Key improvements:
 
 This optimization provides significant performance benefits when notifying multiple clients, reducing the notification time from O(n) to O(1) where n is the number of clients. For systems with many connected clients, this can dramatically reduce the overall processing time.
 
+### L4: Redundant Parsing Elimination ✅
+
+Identified and removed redundant JSON parsing in the polling process:
+
+1. **Original Issue**: The polling code was parsing WAL data twice - once for counting changes in `pollAndProcess()` and again in `processChanges()`:
+
+```typescript
+// Inefficient - parsing data just for counting
+let totalEntityChanges = 0;
+for (const walEntry of changes) {
+  try {
+    const parsedData = JSON.parse(walEntry.data);
+    if (parsedData?.change && Array.isArray(parsedData.change)) {
+      totalEntityChanges += parsedData.change.length;
+    }
+  } catch (parseError) {
+    // Ignore parse errors for counting
+  }
+}
+
+// Later the same data gets parsed again in processChanges
+const result = await processChanges(changes, ...);
+```
+
+2. **Optimization**: Removed the redundant parsing and used the counts from `processChanges` results:
+
+```typescript
+// Process the changes and get accurate counts from the result
+const result = await processChanges(
+  changes,
+  this.env,
+  this.c,
+  this.stateManager,
+  this.config.storeBatchSize
+);
+
+// Use the results that already have accurate counts  
+replicationLogger.debug('Polling cycle completed', {
+  walEntriesProcessed: changes.length,
+  entityChangesProcessed: result.changeCount || 0,
+  entityChangesFiltered: result.filteredCount || 0,
+  storedSuccessfully: result.storedChanges,
+  lastLSN: result.lastLSN,
+  nextPollIn: this.config.pollingInterval || DEFAULT_POLL_INTERVAL
+}, MODULE_NAME);
+```
+
+This optimization:
+- Eliminates redundant CPU-intensive JSON parsing
+- Reduces memory allocations for temporary objects
+- Provides more accurate metrics by using the actual processed counts
+- Improves logging with additional helpful information (filtered counts, storage status)
+
 ## Testing Strategy
 
 For each optimization:
@@ -251,7 +297,8 @@ For each optimization:
 
 ## Progress Tracking
 
-- [ ] Prioritize optimizations (Engineering team meeting)
+- [x] Implement high priority optimizations (P1-P5)
+- [x] Implement logging optimizations (L4)
 - [ ] Create benchmark test suite
-- [ ] Implement highest priority optimizations
+- [ ] Implement remaining optimizations
 - [ ] Measure and document improvements 

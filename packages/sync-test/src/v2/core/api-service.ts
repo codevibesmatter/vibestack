@@ -3,7 +3,7 @@ import fetch from 'node-fetch';
 import { API_CONFIG } from '../config.ts';
 
 // Logger instance
-const logger = createLogger('api-service');
+const logger = createLogger('sync.api');
 
 /**
  * Initialize replication by calling the server API

@@ -3,6 +3,7 @@ import type { MinimalContext } from '../types/hono';
 import { syncLogger } from '../middleware/logger';
 import { getDBClient, sql } from '../lib/db';
 import type { InitialSyncState } from './types';
+import { compareLSN } from '../lib/sync-common';
 
 const MODULE_NAME = 'state-manager';
 
@@ -24,7 +25,7 @@ export interface StateManager {
   initializeConnection(): Promise<void>;
   cleanupConnection(): Promise<void>;
   determineStateFromLSN(clientLSN: string, serverLSN: string): SyncState;
-  getLSN(): string | null;
+  getLSN(): Promise<string | null>;
   getClientId(): string | null;
   getMetrics(): SyncMetrics;
   getErrors(): Error[];
@@ -36,7 +37,6 @@ export interface StateManager {
 
 export class SyncStateManager implements StateManager {
   protected clientId: string | null = null;
-  private clientLSN: string | null = null;
   private metrics: SyncMetrics = {
     messagesReceived: 0,
     messagesSent: 0,
@@ -80,9 +80,9 @@ export class SyncStateManager implements StateManager {
       return 'initial';
     }
     
-    // Compare LSNs (simple string comparison works for Postgres LSN format X/Y)
+    // Use proper compareLSN function instead of string comparison
     // If client LSN is less than server LSN, we need catchup
-    if (clientLSN < serverLSN) {
+    if (compareLSN(clientLSN, serverLSN) < 0) {
       return 'catchup';
     }
     
@@ -95,20 +95,15 @@ export class SyncStateManager implements StateManager {
    */
   async initializeConnection(): Promise<void> {
     syncLogger.info('Connection initializing', {
-      clientId: this.clientId,
-      currentLSN: this.clientLSN
+      clientId: this.clientId
     }, MODULE_NAME);
     
     try {
-      const serverLSN = await this.getServerLSN();
-      syncLogger.debug('Server LSN', { serverLSN }, MODULE_NAME);
-      
-      // Only register client existence
+      // Only register client existence in KV
       if (this.clientId) {
         const clientData = { 
           active: true,
-          lastSeen: Date.now(),
-          lastLSN: this.clientLSN || '0/0'
+          lastSeen: Date.now()
         };
         const key = `client:${this.clientId}`;
         
@@ -116,11 +111,9 @@ export class SyncStateManager implements StateManager {
           clientId: this.clientId
         }, MODULE_NAME);
         
-        // Register with NO expiration time - client will stay in registry until explicitly removed
         await this.context.env.CLIENT_REGISTRY.put(
           key,
           JSON.stringify(clientData)
-          // No expirationTtl - client stays in registry until removed
         );
         
         // Verify registration
@@ -147,20 +140,17 @@ export class SyncStateManager implements StateManager {
    * Clean up connection and mark client as inactive
    */
   async cleanupConnection(): Promise<void> {
-    // Save clientId before clearing it
-    const clientIdToRemove = this.clientId;
-    const previousLSN = this.clientLSN;
+    if (!this.clientId) {
+      return;
+    }
     
-    // Clear instance state
-    this.clientId = null;
-    this.clientLSN = null;
-    
-    // Mark client as inactive in registry
+    const clientIdToRemove = this.clientId; // Capture client ID before clearing
+    this.clientId = null; // Clear the client ID reference
+
     if (clientIdToRemove) {
       const key = `client:${clientIdToRemove}`;
-      syncLogger.info('Deactivating client', { 
-        clientId: clientIdToRemove,
-        lsn: previousLSN || 'unknown'
+      syncLogger.debug('Deactivating client', { 
+        clientId: clientIdToRemove
       }, MODULE_NAME);
       
       try {
@@ -179,7 +169,6 @@ export class SyncStateManager implements StateManager {
             }, MODULE_NAME);
             
             data = {
-              lastLSN: previousLSN || '0/0',
               lastSeen: Date.now()
             };
           }
@@ -191,44 +180,20 @@ export class SyncStateManager implements StateManager {
               ...data,
               active: false,
               lastSeen: Date.now(),
-              disconnectedAt: Date.now(),
-              // Ensure LSN is preserved
-              lastLSN: data.lastLSN || previousLSN || '0/0'
+              disconnectedAt: Date.now()
             })
           );
           
           syncLogger.debug('Client marked inactive', { 
-            clientId: clientIdToRemove,
-            lastLSN: data.lastLSN || previousLSN || '0/0'
-          }, MODULE_NAME);
-        } else {
-          // Handle case where client data doesn't exist
-          syncLogger.warn('Client data not found during cleanup', {
             clientId: clientIdToRemove
           }, MODULE_NAME);
-          
-          // Create a new inactive record for tracking
-          await this.context.env.CLIENT_REGISTRY.put(
-            key,
-            JSON.stringify({
-              active: false,
-              lastSeen: Date.now(),
-              disconnectedAt: Date.now(),
-              lastLSN: previousLSN || '0/0'
-            })
-          );
         }
       } catch (err) {
-        syncLogger.error('Client deactivation failed', {
+        syncLogger.error('Failed to deactivate client', {
           clientId: clientIdToRemove,
-          lsn: previousLSN || 'unknown',
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_NAME);
-        
-        // Don't throw the error - we want to continue even if deactivation fails
       }
-    } else {
-      syncLogger.debug('No client ID to deactivate', {}, MODULE_NAME);
     }
   }
 
@@ -244,8 +209,7 @@ export class SyncStateManager implements StateManager {
       // Register client in KV registry
       const clientData = { 
         active: true,
-        lastSeen: Date.now(),
-        lastLSN: '0/0'
+        lastSeen: Date.now()
       };
       const key = `client:${clientId}`;
       
@@ -270,39 +234,69 @@ export class SyncStateManager implements StateManager {
   }
 
   /**
-   * Update client's LSN
+   * Update client's LSN in DO storage
    */
   async updateClientLSN(clientId: string, lsn: string): Promise<void> {
-    this.clientLSN = lsn;
-    
-    // Store this in memory and update client registry
-    if (this.clientId) {
-      const key = `client:${this.clientId}`;
-      try {
-        const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
-        if (existingData) {
-          const data = JSON.parse(existingData);
-          await this.context.env.CLIENT_REGISTRY.put(
-            key,
-            JSON.stringify({
-              ...data,
-              lastLSN: lsn,
-              lastSeen: Date.now()
-            })
-          );
-        }
-      } catch (err) {
-        syncLogger.error('LSN update failed', {
-          clientId,
-          lsn,
-          error: err instanceof Error ? err.message : String(err)
-        }, MODULE_NAME);
+    if (!clientId || !lsn) {
+      throw new Error('Client ID and LSN are required');
+    }
+
+    try {
+      // Store LSN in DO storage
+      const key = `client:${clientId}:lsn`;
+      await this.durableObjectState.storage.put(key, lsn);
+      
+      // Verify the LSN was saved
+      const savedLSN = await this.durableObjectState.storage.get<string>(key);
+      if (savedLSN !== lsn) {
+        throw new Error(`Failed to verify LSN save: expected ${lsn}, got ${savedLSN}`);
       }
+      
+      syncLogger.debug('Updated client LSN', {
+        clientId,
+        lsn,
+        saved: true
+      }, MODULE_NAME);
+    } catch (err) {
+      syncLogger.error('Failed to update client LSN', {
+        clientId,
+        lsn,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
+      throw err;
     }
   }
 
   /**
-   * Update client's sync state internally (not sent to client)
+   * Get client LSN from DO storage
+   */
+  async getLSN(): Promise<string | null> {
+    if (!this.clientId) {
+      return null;
+    }
+
+    try {
+      const key = `client:${this.clientId}:lsn`;
+      const lsn = await this.durableObjectState.storage.get<string>(key);
+      
+      syncLogger.debug('Retrieved client LSN', {
+        clientId: this.clientId,
+        lsn,
+        found: !!lsn
+      }, MODULE_NAME);
+      
+      return lsn || null;
+    } catch (err) {
+      syncLogger.error('Failed to get client LSN', {
+        clientId: this.clientId,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
+      return null;
+    }
+  }
+
+  /**
+   * Update client's sync state in DO storage
    */
   async updateClientSyncState(clientId: string, state: SyncState): Promise<void> {
     // Store state in DO storage
@@ -325,8 +319,7 @@ export class SyncStateManager implements StateManager {
         
         syncLogger.debug('Updated client sync state', {
           clientId,
-          state,
-          lsn: this.clientLSN
+          state
         }, MODULE_NAME);
       }
     } catch (err) {
@@ -370,13 +363,6 @@ export class SyncStateManager implements StateManager {
    */
   getClientId(): string | null {
     return this.clientId;
-  }
-
-  /**
-   * Get client LSN
-   */
-  getLSN(): string | null {
-    return this.clientLSN;
   }
 
   /**

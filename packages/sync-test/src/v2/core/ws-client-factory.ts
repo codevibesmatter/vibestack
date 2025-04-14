@@ -16,7 +16,7 @@ interface WSClient {
 
 export class WebSocketClientFactory {
   private clients: Map<string, WSClient> = new Map();
-  private logger = createLogger('ws-client-factory');
+  private logger = createLogger('sync.ws-client');
   private wsConfig = { ...WS_CONFIG };
   private profileManager: ClientProfileManager;
   

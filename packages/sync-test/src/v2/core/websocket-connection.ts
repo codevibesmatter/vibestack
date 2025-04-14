@@ -28,7 +28,7 @@ export class WebSocketConnection {
   constructor(clientId: string, lsn: string = '0/0') {
     this.clientId = clientId;
     this.lsn = lsn;
-    this.logger = createLogger('websocket-connection');
+    this.logger = createLogger('sync.websocket');
     this.logger.info(`WebSocketConnection instance created for client ${clientId}`);
   }
 

@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import { createLogger } from './logger.ts';
 import type { ServerChangesMessage, TableChange } from '@repo/sync-types';
 import type { EntityChange, EntityType, Operation } from '../types.ts';
+import type { ClientChangeTracker } from './entity-changes/client-change-tracker.ts';
 
 /**
  * Message handler function type
@@ -9,13 +10,14 @@ import type { EntityChange, EntityType, Operation } from '../types.ts';
 export type MessageHandler = (message: any) => Promise<boolean> | boolean;
 
 /**
- * Configuration options for the MessageDispatcher
+ * Options for configuring the MessageDispatcher
  */
 export interface MessageDispatcherOptions {
   verbose?: boolean;
   strictValidation?: boolean;
   allowedEntityTypes?: string[];
   allowedOperations?: string[];
+  clientChangeTracker?: ClientChangeTracker;
 }
 
 /**
@@ -99,9 +101,7 @@ export class MessageDispatcher extends EventEmitter {
     this.logger.debug(`Received message of type: ${messageType} for client: ${clientId}`);
     
     // Pre-process server message types
-    if (messageType.startsWith('srv_')) {
-      this.preprocessServerMessage(message);
-    }
+    this.preprocessServerMessage(message);
     
     // Emit the message as an event (for EventEmitter compatibility)
     this.emit(messageType, message);
@@ -175,6 +175,28 @@ export class MessageDispatcher extends EventEmitter {
         
         // Augment the message with processed changes for handlers
         message._processedChanges = processedChanges;
+
+        // Record changes in the client change tracker
+        const clientChangeTracker = this.options.clientChangeTracker;
+        if (clientChangeTracker) {
+          // Convert EntityChange to TableChangeTest
+          const tableChanges = processedChanges.map(change => {
+            // Convert operation type from Operation to TableChangeTest operation type
+            const operation = change.operation === 'create' ? 'insert' : change.operation;
+            
+            return {
+              table: change.type, // Use type instead of entityType
+              operation: operation as 'insert' | 'update' | 'delete',
+              data: change.data || {},
+              updated_at: new Date().toISOString() // Always set updated_at
+            };
+          });
+          
+          clientChangeTracker.recordClientChanges(clientId, tableChanges);
+          this.logger.debug(`Recorded ${tableChanges.length} changes for client ${clientId}`);
+        } else {
+          this.logger.warn('No client change tracker available to record changes');
+        }
       }
     } else if (message.type === 'srv_catchup_completed') {
       this.logger.info(`Catchup completed message received for client ${clientId}: ${JSON.stringify(message)}`);
@@ -209,6 +231,17 @@ export class MessageDispatcher extends EventEmitter {
     if (this.options.verbose) {
       this.logger.info(`Set ID mapping with ${Object.keys(this.idMapping).length} entries`);
     }
+  }
+  
+  /**
+   * Update the dispatcher's options
+   */
+  public setOptions(options: Partial<MessageDispatcherOptions>): void {
+    this.options = {
+      ...this.options,
+      ...options
+    };
+    this.logger.info('Updated MessageDispatcher options');
   }
   
   /**

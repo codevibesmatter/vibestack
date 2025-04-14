@@ -120,37 +120,17 @@ export class PollingManager {
           const firstLSN = changes[0].lsn;
           const lastLSN = changes[changes.length - 1].lsn;
           
-          // Count the actual database changes within each WAL entry
-          let totalEntityChanges = 0;
-          for (const walEntry of changes) {
-            try {
-              const parsedData = JSON.parse(walEntry.data);
-              if (parsedData?.change && Array.isArray(parsedData.change)) {
-                totalEntityChanges += parsedData.change.length;
-              }
-            } catch (parseError) {
-              // Ignore parse errors for counting
-            }
-          }
-          
+          // Remove redundant parsing - this is already done in processChanges
+          // Let processChanges handle the actual parsing and counting
           replicationLogger.info('WAL changes found', {
             walEntries: changes.length,
-            entityChanges: totalEntityChanges,
             lsnRange: {
               first: firstLSN,
               last: lastLSN
             }
           }, MODULE_NAME);
 
-          replicationLogger.debug('Processing changes', {
-            walEntries: changes.length,
-            entityChanges: totalEntityChanges,
-            lsnRange: {
-              first: firstLSN,
-              last: lastLSN
-            }
-          }, MODULE_NAME);
-
+          // Process the changes and get accurate counts from the result
           const result = await processChanges(
             changes,
             this.env,
@@ -161,11 +141,10 @@ export class PollingManager {
           
           replicationLogger.debug('Polling cycle completed', {
             walEntriesProcessed: changes.length,
-            entitiesProcessed: result.changeCount || 0,
-            lsnRange: {
-              first: firstLSN,
-              last: lastLSN
-            },
+            entityChangesProcessed: result.changeCount || 0,
+            entityChangesFiltered: result.filteredCount || 0,
+            storedSuccessfully: result.storedChanges,
+            lastLSN: result.lastLSN,
             nextPollIn: this.config.pollingInterval || DEFAULT_POLL_INTERVAL
           }, MODULE_NAME);
           

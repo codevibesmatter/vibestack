@@ -10,9 +10,48 @@ const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
   'error': 3
 };
 
+// Module-level variable to store the effective log level
+let effectiveLogLevel: LogLevel = 'info'; // Default to info
+const validLogLevels: LogLevel[] = ['debug', 'info', 'warn', 'error'];
+
+/**
+ * Initializes the logger's effective level based on environment variables.
+ * Should be called early in the request lifecycle (e.g., fetch handler or middleware).
+ * @param env The environment bindings object.
+ */
+export function initializeLogger(env: AppBindings | undefined | Record<string, any>): void {
+  let detectedLevel: LogLevel | undefined;
+  let environment: DeploymentEnv = 'development'; // Default environment
+
+  // Access potentially nested bindings or cast env to any for dynamic properties
+  const bindings = env && typeof env === 'object' ? ('Bindings' in env ? env.Bindings : env) : {};
+
+  if (bindings) {
+    // 1. Check for explicit LOG_LEVEL
+    const envLogLevel = (bindings as any).LOG_LEVEL?.toLowerCase();
+    if (envLogLevel && validLogLevels.includes(envLogLevel as LogLevel)) {
+      detectedLevel = envLogLevel as LogLevel;
+    } else {
+      // 2. Fallback to ENVIRONMENT
+      const envValue = (bindings as any).ENVIRONMENT;
+      if (envValue === 'production' || envValue === 'staging' || envValue === 'development') {
+        environment = envValue;
+      }
+      detectedLevel = (environment === 'production') ? 'info' : 'debug';
+    }
+  } else {
+    // Fallback if env is not available (should ideally not happen in worker context)
+    detectedLevel = 'info'; // Default to info if no env
+  }
+
+  effectiveLogLevel = detectedLevel;
+  // console.log(`Logger Initialized: Level set to ${effectiveLogLevel}`); // Optional: for verification
+}
+
 // Helper to compare log levels
-const isLogLevelEnabled = (configLevel: LogLevel, checkLevel: LogLevel): boolean => {
-  return LOG_LEVEL_PRIORITY[configLevel] <= LOG_LEVEL_PRIORITY[checkLevel];
+const isLogLevelEnabled = (checkLevel: LogLevel): boolean => {
+  // Compare against the globally set effectiveLogLevel
+  return LOG_LEVEL_PRIORITY[effectiveLogLevel] <= LOG_LEVEL_PRIORITY[checkLevel];
 };
 
 // ANSI color codes for terminal output
@@ -60,34 +99,49 @@ export interface LoggerConfig {
 }
 
 // Default configuration based on environment
-const getDefaultConfig = (): LoggerConfig => {
-  // Detect environment from global context
+const getDefaultConfig = (env?: AppBindings | Record<string, any>): LoggerConfig => {
+  // Determine environment primarily for formatting, not level
   let environment: DeploymentEnv = 'development';
-  if (typeof self !== 'undefined' && 'ENVIRONMENT' in self) {
-    const envValue = (self as any).ENVIRONMENT;
-    if (envValue === 'production' || envValue === 'staging' || envValue === 'development') {
-      environment = envValue;
-    }
+  const bindings = env && typeof env === 'object' ? ('Bindings' in env ? env.Bindings : env) : {};
+
+  if (bindings && (bindings as any).ENVIRONMENT) {
+      const envValue = (bindings as any).ENVIRONMENT;
+      if (envValue === 'production' || envValue === 'staging' || envValue === 'development') {
+          environment = envValue;
+      }
+  } else if (typeof self !== 'undefined' && 'ENVIRONMENT' in self) {
+      // Fallback check on self for formatting purposes if env isn't passed (though level uses env)
+      const envValue = (self as any).ENVIRONMENT;
+      if (envValue === 'production' || envValue === 'staging' || envValue === 'development') {
+          environment = envValue;
+      }
   }
 
-  // Get timestamp format from env or use 'full' for development, 'none' for production
+  // Timestamp format logic (can still use env if passed, or fallback)
   let timestampFormat: LoggerConfig['timestampFormat'] = 'none';
-  if (typeof self !== 'undefined' && 'LOG_TIMESTAMP_FORMAT' in self) {
-    const envFormat = (self as any).LOG_TIMESTAMP_FORMAT;
-    if (envFormat === 'iso' || envFormat === 'full') {
-      timestampFormat = 'full';
-    } else if (['short', 'time', 'none'].includes(envFormat)) {
-      timestampFormat = envFormat as LoggerConfig['timestampFormat'];
-    }
+  if (bindings && (bindings as any).LOG_TIMESTAMP_FORMAT) {
+      const envFormat = (bindings as any).LOG_TIMESTAMP_FORMAT;
+      if (envFormat === 'iso' || envFormat === 'full') {
+          timestampFormat = 'full';
+      } else if (['short', 'time', 'none'].includes(envFormat)) {
+          timestampFormat = envFormat as LoggerConfig['timestampFormat'];
+      }
+  } else if (typeof self !== 'undefined' && 'LOG_TIMESTAMP_FORMAT' in self) {
+       const envFormat = (self as any).LOG_TIMESTAMP_FORMAT;
+       if (envFormat === 'iso' || envFormat === 'full') {
+         timestampFormat = 'full';
+       } else if (['short', 'time', 'none'].includes(envFormat)) {
+         timestampFormat = envFormat as LoggerConfig['timestampFormat'];
+       }
   } else if (environment === 'development') {
-    timestampFormat = 'full';
+      timestampFormat = 'full';
   }
-  
+
   const isProduction = environment === 'production';
   const isDevelopment = environment === 'development';
   
   return {
-    level: isProduction ? 'info' : 'debug',
+    level: effectiveLogLevel, // Use the globally set level
     prettyPrint: isDevelopment || !isProduction,
     includeRequestBody: !isProduction,
     includeResponseBody: false,
@@ -249,8 +303,8 @@ const getTimestampPrefix = (timestamp: string, config: LoggerConfig): string => 
  */
 export const logger = {
   debug(message: string, data?: any, context?: string, module?: string): void {
+    if (!isLogLevelEnabled('debug')) return;
     const config = getDefaultConfig();
-    if (!isLogLevelEnabled(config.level, 'debug')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
     const contextStr = getContextString(context, module);
@@ -265,8 +319,8 @@ export const logger = {
   },
 
   info(message: string, data?: any, context?: string, module?: string): void {
+    if (!isLogLevelEnabled('info')) return;
     const config = getDefaultConfig();
-    if (!isLogLevelEnabled(config.level, 'info')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
     const contextStr = getContextString(context, module);
@@ -281,8 +335,8 @@ export const logger = {
   },
 
   warn(message: string, data?: any, context?: string, module?: string): void {
+    if (!isLogLevelEnabled('warn')) return;
     const config = getDefaultConfig();
-    if (!isLogLevelEnabled(config.level, 'warn')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
     const contextStr = getContextString(context, module);
@@ -297,8 +351,8 @@ export const logger = {
   },
 
   error(message: string, errorOrData?: any, additionalData?: any, context?: string, module?: string): void {
+    if (!isLogLevelEnabled('error')) return;
     const config = getDefaultConfig();
-    if (!isLogLevelEnabled(config.level, 'error')) return;
     
     const timestamp = formatTimestamp(new Date(), config.timestampFormat);
     const contextStr = getContextString(context, module);
@@ -352,6 +406,9 @@ export const workerLogger = logger.createLogger('worker');
  */
 export function createStructuredLogger(): MiddlewareHandler<AppBindings> {
   return async (c, next) => {
+    // Initialize logger level at the start of the request
+    initializeLogger(c.env);
+
     const startTime = Date.now();
     const method = c.req.method;
     const url = new URL(c.req.url);

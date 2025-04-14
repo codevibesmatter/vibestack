@@ -76,11 +76,10 @@ export class ChangeProcessor {
       }
       
       // Deduplicate changes
-      const optimizedChanges = deduplicateChanges(changes);
+      const optimizedChangesResult = deduplicateChanges(changes);
       
-      // Process changes - no transaction needed as we're grouping by table/operation
-      // and letting the database handle CRDT conflicts
-      const results = await this.processAllChanges(optimizedChanges);
+      // Process changes - use the .changes property from the deduplication result
+      const results = await this.processAllChanges(optimizedChangesResult.changes);
       
       // Summarize results
       const summary = this.summarizeResults(results);
@@ -100,8 +99,8 @@ export class ChangeProcessor {
         }, MODULE_NAME);
       }
       
-      // Single log at completion with summary
-      syncLogger.info(`Completed processing ${optimizedChanges.length} changes for client ${clientId}`, {
+      // Single log at completion with summary - use .changes.length
+      syncLogger.info(`Completed processing ${optimizedChangesResult.changes.length} changes for client ${clientId}`, {
         clientId,
         appliedCount: summary.appliedCount,
         skippedCount: summary.skippedCount,

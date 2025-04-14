@@ -2,14 +2,49 @@ import { EventEmitter } from 'events';
 import { createLogger } from './logger.ts';
 import { TestConfig } from '../types.ts';
 import { ClientProfileManager } from './client-profile-manager.ts';
-import { ValidationService } from './validation-service.ts';
 import { wsClientFactory, WebSocketClientFactory } from './ws-client-factory.ts';
 import { messageDispatcher } from './message-dispatcher.ts';
 import * as apiService from './api-service.ts';
-import * as entityChanges from './entity-changes/index.ts';
+import { initialize, fetchExistingIds, applyChanges } from './entity-changes/change-applier.ts';
+import { generateMixedChanges, generateAndApplyMixedChanges } from './entity-changes/batch-changes.ts';
+import { entityToChange } from './entity-changes/change-builder.ts';
+import { validateChanges } from './entity-changes/validation.ts';
 import fetch, { RequestInit as FetchRequestInit } from 'node-fetch';
 import { API_CONFIG } from '../config.ts';
 import type { ServerChangesMessage, SrvMessageType } from '@repo/sync-types';
+
+// Define the entityChanges object with all necessary methods to maintain backward compatibility
+const entityChanges = {
+  // Core initialization
+  initialize,
+  
+  // Change generation
+  generateChanges: generateMixedChanges,
+  generateAndApplyMixedChanges,
+  generateAndApplyChanges: generateAndApplyMixedChanges, // Alias
+  
+  // Change application
+  applyChanges,
+  applyBatchChanges: applyChanges, // Alias 
+  applyChangesInBatches: applyChanges, // Alias
+  
+  // Conversion
+  entityToChange,
+  convertToTableChanges: entityToChange, // Alias
+
+  // Change tracking
+  
+  // Validation
+  // Misc
+  fetchExistingIds,
+  
+  // Extra methods for compatibility
+  
+  // Database seeding
+  seedDatabase: async (count: number) => {
+    return await generateAndApplyMixedChanges(count, { mode: 'seed' });
+  }
+};
 
 /**
  * Interface defining a test scenario
@@ -159,15 +194,13 @@ export interface OperationContext {
  * ScenarioRunner - Orchestrates the execution of test scenarios
  */
 export class ScenarioRunner extends EventEmitter {
-  protected logger = createLogger('Runner');
-  protected validationService: ValidationService;
+  protected logger = createLogger('sync.runner');
   protected profileManager: ClientProfileManager;
   
   constructor() {
     super(); // Initialize EventEmitter
     
     // Initialize services with default options
-    this.validationService = new ValidationService();
     this.profileManager = new ClientProfileManager();
     
     this.logger.info('ScenarioRunner created with validation capabilities');
@@ -190,7 +223,6 @@ export class ScenarioRunner extends EventEmitter {
           clientChanges: {} // Track changes per client
         },
         logger: this.logger,
-        validationService: this.validationService,
         operations: {
           // API operations
           api: {
@@ -217,35 +249,21 @@ export class ScenarioRunner extends EventEmitter {
           
           // Changes operations (formerly DB operations)
           changes: {
-            // API operations - use api-service directly
-            initializeReplication: apiService.initializeReplication.bind(apiService),
-            getCurrentLSN: apiService.getCurrentLSN.bind(apiService),
-            
-            // Entity operations - use entity-changes directly
-            initialize: entityChanges.initialize.bind(entityChanges),
-            generateChanges: entityChanges.generateChanges.bind(entityChanges),
-            convertToTableChanges: entityChanges.convertToTableChanges.bind(entityChanges),
-            applyBatchChanges: entityChanges.applyBatchChanges.bind(entityChanges),
-            applyChangesInBatches: entityChanges.applyChangesInBatches.bind(entityChanges),
-            generateAndApplyChanges: entityChanges.generateAndApplyChanges.bind(entityChanges),
-            createChangeTracker: entityChanges.createChangeTracker.bind(entityChanges),
-            generateAndTrackChanges: entityChanges.generateAndTrackChanges.bind(entityChanges),
-            seedDatabase: entityChanges.seedDatabase.bind(entityChanges)
+            // Add functions from entityChanges here, binding 'this' if needed
+            initialize: typedEntityChanges.initialize.bind(typedEntityChanges),
+            applyChanges: typedEntityChanges.applyChanges.bind(typedEntityChanges),
+            generateAndApplyChanges: typedEntityChanges.generateAndApplyChanges.bind(typedEntityChanges), // Alias is fine
+            getCurrentLSN: typedEntityChanges.getCurrentLSN?.bind(typedEntityChanges), // Add if exists
+            fetchExistingIds: typedEntityChanges.fetchExistingIds.bind(typedEntityChanges), // Potentially useful
+            // Add other commonly used methods from typedEntityChanges as needed
           },
           
-          // Message dispatcher operations
-          messages: {
-            registerHandler: messageDispatcher.registerHandler.bind(messageDispatcher),
-            removeHandler: messageDispatcher.removeHandler.bind(messageDispatcher),
-            processTableChanges: messageDispatcher.processTableChanges.bind(messageDispatcher),
-            updateClientLSN: messageDispatcher.updateClientLSN.bind(messageDispatcher),
-            getClientLSN: messageDispatcher.getClientLSN.bind(messageDispatcher)
+          // Validation operations (can be added similarly if needed)
+          validation: {
+             validateChanges: validateChanges // Assuming validateChanges is imported directly
           }
         }
       };
-      
-      // Reset validation service for this scenario
-      this.validationService.reset();
       
       // Run before scenario hook if defined
       if (scenario.hooks?.beforeScenario) {

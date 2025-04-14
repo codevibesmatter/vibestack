@@ -1,1078 +1,802 @@
 /**
- * Change tracker for entity-changes system
- * Allows tracking changes across clients, validation, and deduplication analysis
- */
-
-import { EventEmitter } from 'events';
-import { TableChange } from '@repo/sync-types';
-import { createLogger } from '../logger.ts';
-
-/**
- * Simple tracking state for a client
- */
-interface ClientTrackingState {
-  receivedCount: number;
-  expectedCount: number;
-  changes: TableChange[];
-}
-
-/**
- * Information about deduplication for a specific entity
- */
-interface DeduplicationInfo {
-  totalChanges: number;
-  receivedChanges: number;
-  deduplicatedChanges: number;
-  isDeduplication: boolean;
-}
-
-/**
- * Options for creating a change tracker
- */
-export interface ChangeTrackerOptions {
-  tolerance?: number;
-  deduplicationEnabled?: boolean;
-  batchSize?: number;
-}
-
-/**
- * Change tracker result report
- */
-export interface ChangeTrackerReport {
-  databaseChanges: number;
-  receivedChanges: number;
-  uniqueRecordsChanged: number; 
-  uniqueRecordsReceived: number;
-  missingChanges: TableChange[];
-  deduplicatedChanges: number;
-  realMissingChanges: TableChange[];
-  possibleDedupChanges: TableChange[];
-  cascadeDeleteChanges?: TableChange[];
-  extraChangesCount: number;
-  extraChanges: TableChange[];
-  success: boolean;
-  detailedMissingReport: { id: string; table: string; operation: string; timestamp: string }[];
-}
-
-/**
- * ChangeTracker - A centralized service for tracking changes across clients
+ * Change Tracker V2
  * 
- * This provides a simple way to:
- * 1. Register clients with expected change counts
- * 2. Track received changes in batches
- * 3. Track database changes
- * 4. Compare expected vs received changes efficiently
- * 5. Check if all expected changes have been received
+ * A comprehensive tracker for changes that provides:
+ * - ID tracking and reservation
+ * - LSN and batch tracking
+ * - Duplicate detection
+ * - Applied changes history
  */
-export class ChangeTracker extends EventEmitter {
-  private logger = createLogger('EntityChanges:Tracker');
-  private clients: Map<string, ClientTrackingState> = new Map();
-  private isComplete: boolean = false;
-  private tolerance: number = 0;
-  private deduplicationEnabled: boolean = true;
-  private batchSize: number = 100;
+
+import { createLogger } from '../logger.ts';
+import { TableChangeTest } from './types.ts';
+import { EntityType, TABLE_TO_ENTITY } from './entity-adapter.ts';
+import { v4 as uuidv4 } from 'uuid';
+
+// Extended interface for tracking options
+export interface ChangeTrackerOptions {
+  logLevel?: 'debug' | 'info' | 'warn' | 'error';
+  maxHistorySize?: number; // Maximum number of changes to keep in history
+  trackLSN?: boolean; // Whether to track LSN info
+  trackUpdatedEntities?: boolean; // Whether to track which batch entities were updated in
+  idReleaseAfterBatches?: number; // Number of batches after which to release updated IDs
+}
+
+// Interface for ID reservation
+export interface IDReservation {
+  id: string;
+  entityType: EntityType;
+  reservedFor: 'create' | 'update' | 'delete';
+  expiresAt?: number; // Timestamp when reservation expires
+  batchId?: string;
+  metadata?: Record<string, any>;
+}
+
+// Interface for LSN Range tracking
+export interface LSNRange {
+  min: string;
+  max: string;
+  batchId?: string;
+  timestamp: number;
+  count: number;
+}
+
+export class ChangeTracker {
+  private logger = createLogger('entity-changes.tracker');
   
-  // Core tracking data structures
-  private databaseChanges: TableChange[] = [];
-  private missingChanges: TableChange[] = [];
+  // Core tracking - applied changes and batches
+  private appliedChanges: TableChangeTest[] = [];
+  private appliedChangesByBatch: Record<string, TableChangeTest[]> = {};
+  private maxHistorySize: number = 1000; // Default history size
   
-  // Efficient lookup structures
-  private changesByCompositeKey = new Map<string, TableChange[]>();
-  private receivedIdsByClient = new Map<string, Set<string>>();
-  private allReceivedIds = new Set<string>();
-  private dbChangeCountByKey = new Map<string, number>();
+  // Track confirmed IDs (successfully applied to DB)
+  private confirmedIds: Record<EntityType, Set<string>> = {
+    user: new Set<string>(),
+    project: new Set<string>(),
+    task: new Set<string>(),
+    comment: new Set<string>()
+  };
   
-  // Track last change time for each client
-  private lastChangeTimeByClient = new Map<string, number>();
+  // Track reserved IDs (not yet confirmed but planned to use)
+  private reservedIds: Record<EntityType, IDReservation[]> = {
+    user: [],
+    project: [],
+    task: [],
+    comment: []
+  };
   
-  // Batch tracking
-  private batchTracking = new Map<string, Map<string, TableChange[]>>();
-  // Track database changes by origin batch for missing change analysis
-  private dbChangesByOriginBatch = new Map<string, Set<string>>();
-  private needsRecalculation = true;
+  // Track intentional duplicates
+  private intentionalDuplicates: TableChangeTest[] = [];
   
-  // Deduplication tracking
-  private deduplicationInfo = new Map<string, DeduplicationInfo>();
-  private deduplicatedCount: number = 0;
+  // Track LSN information
+  private trackLSN: boolean = true;
+  private lsnRanges: LSNRange[] = [];
+  private lastLSN: string | null = null;
   
-  /**
-   * Create a new ChangeTracker
-   * @param options Tracker options
-   */
+  // Track which batch entities were updated in
+  private trackUpdatedEntities: boolean = true;
+  private updatedEntities: Record<EntityType, Map<string, number>> = {
+    user: new Map<string, number>(),
+    project: new Map<string, number>(),
+    task: new Map<string, number>(),
+    comment: new Map<string, number>()
+  };
+  
+  // Current batch number - incremented on each recordAppliedChanges call with a new batchId
+  private currentBatchNumber: number = 0;
+  private batchToNumber: Map<string, number> = new Map();
+  
+  // How many batches before releasing updated entity IDs
+  private idReleaseAfterBatches: number = 5;
+  
   constructor(options: ChangeTrackerOptions = {}) {
-    super();
-    this.tolerance = options.tolerance || 0;
-    this.deduplicationEnabled = options.deduplicationEnabled !== false;
-    this.batchSize = options.batchSize || 100;
-    this.logger.info(
-      `ChangeTracker initialized with tolerance: ${this.tolerance}, ` +
-      `deduplication: ${this.deduplicationEnabled}, ` + 
-      `batchSize: ${this.batchSize}`
-    );
-  }
-  
-  /**
-   * Register clients to track
-   * @param clientIds List of client IDs
-   * @param expectedCount Number of changes expected for each client
-   */
-  registerClients(clientIds: string[], expectedCount?: number): void {
-    clientIds.forEach(clientId => {
-      this.clients.set(clientId, {
-        receivedCount: 0,
-        expectedCount: expectedCount || 0,
-        changes: []
-      });
-      
-      // Initialize efficient lookup structures
-      this.receivedIdsByClient.set(clientId, new Set<string>());
-      this.batchTracking.set(clientId, new Map<string, TableChange[]>());
-    });
-    
-    this.logger.info(`Registered ${clientIds.length} clients${expectedCount ? `, each expecting ${expectedCount} changes` : ''}`);
-  }
-  
-  /**
-   * Track changes received by a client using batch processing
-   * @param clientId The client ID
-   * @param changes The changes received
-   * @param batchId Optional batch identifier
-   * @returns Current received count
-   */
-  trackChanges(clientId: string, changes: TableChange[], batchId?: string): number {
-    const client = this.clients.get(clientId);
-    if (!client) {
-      this.logger.warn(`Attempted to track changes for unknown client: ${clientId}`);
-      return 0;
+    // Configure options
+    if (options.maxHistorySize) {
+      this.maxHistorySize = options.maxHistorySize;
     }
     
-    // Log summary instead of all changes in detail
-    this.logger.info(`===== RECEIVED ${changes.length} CHANGES FOR CLIENT ${clientId} =====`);
-    
-    // Instead of logging every single change, just summarize by type and operation
-    const changesByTypeAndOp: Record<string, Record<string, number>> = {};
-    
-    changes.forEach(change => {
-      const table = change.table || 'unknown';
-      const op = change.operation || 'unknown';
-      
-      if (!changesByTypeAndOp[table]) {
-        changesByTypeAndOp[table] = {};
-      }
-      
-      changesByTypeAndOp[table][op] = (changesByTypeAndOp[table][op] || 0) + 1;
-    });
-    
-    // Log the summary
-    Object.entries(changesByTypeAndOp).forEach(([table, ops]) => {
-      const opsStr = Object.entries(ops)
-        .map(([op, count]) => `${op}:${count}`)
-        .join(', ');
-      this.logger.info(`  - ${table}: ${opsStr}`);
-    });
-    
-    this.logger.info(`=============== END OF CHANGES BATCH ===============`);
-    
-    // Add to client changes - deep clone to avoid mutations
-    const newCount = changes.length;
-    client.receivedCount += newCount;
-    client.changes = [...client.changes, ...changes];
-    
-    // Update last change time for this client
-    this.lastChangeTimeByClient.set(clientId, Date.now());
-    
-    // Reset recalculation flag when adding changes
-    this.needsRecalculation = true;
-    
-    // Efficiently track batch information
-    if (batchId) {
-      if (!this.batchTracking.has(clientId)) {
-        this.batchTracking.set(clientId, new Map());
-      }
-      this.batchTracking.get(clientId)!.set(batchId, changes);
+    if (options.trackLSN !== undefined) {
+      this.trackLSN = options.trackLSN;
     }
     
-    // Get the client's received IDs set
-    const clientReceivedIds = this.receivedIdsByClient.get(clientId) || new Set<string>();
-    
-    // Track changes by table for summary logging
-    const changesByTable: Record<string, { ids: string[], ops: Record<string, number> }> = {};
-    
-    changes.forEach(change => {
-      const id = change.data?.id?.toString() || 'unknown';
-      const table = change.table || 'unknown';
-      const op = change.operation || 'unknown';
-      const compositeKey = `${table}:${id}`;
-      
-      // Track in client's received set
-      clientReceivedIds.add(compositeKey);
-      
-      // Also track in global received set
-      this.allReceivedIds.add(compositeKey);
-      
-      // For logging
-      if (!changesByTable[table]) {
-        changesByTable[table] = { ids: [], ops: {} };
-      }
-      
-      changesByTable[table].ids.push(id);
-      changesByTable[table].ops[op] = (changesByTable[table].ops[op] || 0) + 1;
-    });
-    
-    // Log the changes organized by table (just counts, not IDs)
-    Object.entries(changesByTable).forEach(([table, data]) => {
-      const opsStr = Object.entries(data.ops)
-        .map(([op, count]) => `${op}:${count}`)
-        .join(', ');
-      
-      this.logger.info(`Client ${clientId} received ${data.ids.length} ${table} changes (${opsStr})`);
-      // Don't log all IDs - too verbose
-    });
-    
-    // Update deduplication analysis
-    this.updateDeduplicationAnalysis(changes);
-    
-    this.logger.info(`Client ${clientId} received ${newCount} changes (total: ${client.receivedCount}/${client.expectedCount})`);
-    
-    // Check if all clients have completed
-    this.checkCompletion();
-    
-    return client.receivedCount;
-  }
-  
-  /**
-   * Track database changes (the source of truth)
-   * @param changes Database changes to track
-   * @param originBatch Optional origin batch identifier for tracing missing changes
-   */
-  trackDatabaseChanges(changes: TableChange[], originBatch?: string): void {
-    this.databaseChanges = [...changes];
-    this.needsRecalculation = true;
-    
-    // Track origin batch if provided
-    if (originBatch) {
-      if (!this.dbChangesByOriginBatch.has(originBatch)) {
-        this.dbChangesByOriginBatch.set(originBatch, new Set<string>());
-      }
-      
-      // Register each change with this batch
-      changes.forEach(change => {
-        const id = change.data?.id?.toString();
-        if (!id) return;
-        
-        const key = `${change.table}:${id}:${change.operation}`;
-        this.dbChangesByOriginBatch.get(originBatch)?.add(key);
-      });
-      
-      this.logger.info(`Tracked ${changes.length} database changes from batch ${originBatch}`);
+    if (options.trackUpdatedEntities !== undefined) {
+      this.trackUpdatedEntities = options.trackUpdatedEntities;
     }
     
-    // Build efficient lookup structures for database changes
-    changes.forEach(change => {
-      const id = change.data?.id?.toString();
-      if (!id) return;
-      
-      const table = change.table || 'unknown';
-      const compositeKey = `${table}:${id}`;
-      
-      // Track all changes for this composite key
-      if (!this.changesByCompositeKey.has(compositeKey)) {
-        this.changesByCompositeKey.set(compositeKey, []);
-      }
-      this.changesByCompositeKey.get(compositeKey)!.push(change);
-      
-      // Count changes per key for deduplication analysis
-      this.dbChangeCountByKey.set(
-        compositeKey, 
-        (this.dbChangeCountByKey.get(compositeKey) || 0) + 1
-      );
-    });
-    
-    // Calculate potential deduplication count
-    this.calculateDeduplicationCount();
-    
-    this.logger.info(`Tracking ${changes.length} database changes as source of truth`);
-    
-    // Log summary of change types
-    const changesByType: Record<string, number> = {};
-    changes.forEach(change => {
-      const table = change.table || 'unknown';
-      changesByType[table] = (changesByType[table] || 0) + 1;
-    });
-    
-    this.logger.info(`Database changes by type: ${
-      Object.entries(changesByType)
-        .map(([type, count]) => `${type}: ${count}`)
-        .join(', ')
-    }`);
-    
-    if (this.deduplicationEnabled && this.deduplicatedCount > 0) {
-      this.logger.info(`Detected ${this.deduplicatedCount} potential deduplications across ${this.changesByCompositeKey.size} unique records`);
-    }
-  }
-  
-  /**
-   * Calculate the number of changes that might be deduplicated
-   */
-  private calculateDeduplicationCount(): void {
-    if (!this.deduplicationEnabled) {
-      this.deduplicatedCount = 0;
-      return;
+    if (options.idReleaseAfterBatches !== undefined) {
+      this.idReleaseAfterBatches = options.idReleaseAfterBatches;
     }
     
-    this.deduplicatedCount = 0;
-    
-    // Calculate deduplication count based on duplicated keys in database changes
-    this.dbChangeCountByKey.forEach((count, key) => {
-      if (count > 1) {
-        this.deduplicatedCount += (count - 1);
-      }
-    });
-  }
-  
-  /**
-   * Update deduplication analysis based on received changes
-   */
-  private updateDeduplicationAnalysis(changes: TableChange[]): void {
-    if (!this.deduplicationEnabled) return;
-    
-    changes.forEach(change => {
-      const id = change.data?.id?.toString();
-      if (!id) return;
-      
-      const compositeKey = `${change.table}:${id}`;
-      const dbCount = this.dbChangeCountByKey.get(compositeKey) || 0;
-      
-      // If this key has multiple changes in the database, it's a potential deduplication
-      if (dbCount > 1) {
-        const info = this.deduplicationInfo.get(compositeKey) || {
-          totalChanges: dbCount,
-          receivedChanges: 0,
-          deduplicatedChanges: dbCount - 1,
-          isDeduplication: true
-        };
-        
-        // Increment received count (capped at total)
-        info.receivedChanges = Math.min(info.totalChanges, info.receivedChanges + 1);
-        
-        this.deduplicationInfo.set(compositeKey, info);
-      }
-    });
-  }
-  
-  /**
-   * Get missing changes, calculating them efficiently if needed
-   */
-  getMissingChanges(): TableChange[] {
-    if (this.needsRecalculation) {
-      this.calculateMissingChanges();
-      this.needsRecalculation = false;
-    }
-    
-    return this.missingChanges;
-  }
-  
-  /**
-   * Calculate missing changes efficiently
-   */
-  private calculateMissingChanges(): void {
-    const missingChanges: TableChange[] = [];
-    
-    // We only need to loop through database changes once
-    this.databaseChanges.forEach(dbChange => {
-      const id = dbChange.data?.id?.toString();
-      if (!id) {
-        // Changes without IDs are always considered missing since we can't track them
-        missingChanges.push(dbChange);
-        return;
-      }
-      
-      const compositeKey = `${dbChange.table}:${id}`;
-      
-      // If this ID was never received by any client, it's missing
-      if (!this.allReceivedIds.has(compositeKey)) {
-        missingChanges.push(dbChange);
-      }
-    });
-    
-    this.missingChanges = missingChanges;
-    
-    if (missingChanges.length > 0) {
-      this.logger.debug(`Calculated ${missingChanges.length} missing changes`);
-    }
-  }
-  
-  /**
-   * Get the current progress for a client
-   * @param clientId The client ID
-   */
-  getClientProgress(clientId: string): { current: number, expected: number, adjustedExpected?: number } | undefined {
-    const client = this.clients.get(clientId);
-    if (!client) return undefined;
-    
-    // Calculate adjusted expected count (accounting for deduplication)
-    const adjustedExpected = this.deduplicationEnabled ? 
-      Math.max(1, client.expectedCount - this.deduplicatedCount) : 
-      client.expectedCount;
-    
-    return {
-      current: client.receivedCount,
-      expected: client.expectedCount,
-      adjustedExpected
-    };
-  }
-  
-  /**
-   * Get all changes tracked for a client
-   * @param clientId The client ID
-   */
-  getClientChanges(clientId: string): TableChange[] {
-    return this.clients.get(clientId)?.changes || [];
-  }
-  
-  /**
-   * Get all changes from all clients
-   */
-  getAllChanges(): TableChange[] {
-    const allChanges: TableChange[] = [];
-    this.clients.forEach(client => {
-      allChanges.push(...client.changes);
-    });
-    return allChanges;
-  }
-  
-  /**
-   * Get the database changes
-   */
-  getDatabaseChanges(): TableChange[] {
-    return this.databaseChanges;
-  }
-  
-  /**
-   * Check if all expected changes have been received by all clients
-   * Accounts for potential deduplication when determining completion
-   */
-  checkCompletion(): boolean {
-    // If already complete, return early
-    if (this.isComplete) {
-      return true;
-    }
-    
-    let allComplete = true;
-    let totalExpected = 0;
-    let totalReceived = 0;
-    let incompleteClients: string[] = [];
-    
-    // Check each client's progress
-    this.clients.forEach((client, clientId) => {
-      // Calculate adjusted expected count (accounting for deduplication)
-      const adjustedExpected = this.deduplicationEnabled
-        ? Math.max(1, client.expectedCount - this.deduplicatedCount)
-        : client.expectedCount;
-        
-      // A client is complete if it received at least the adjusted amount minus the tolerance
-      const clientComplete = client.receivedCount >= adjustedExpected - this.tolerance;
-      
-      // Only set all complete if every client is complete
-      allComplete = allComplete && clientComplete;
-      
-      if (!clientComplete) {
-        incompleteClients.push(clientId);
-      }
-      
-      totalExpected += client.expectedCount;
-      totalReceived += client.receivedCount;
-    });
-    
-    // Log summary of progress
-    this.logger.info(`Progress: ${totalReceived}/${totalExpected} changes received, ` + 
-      `deduplication: ${this.deduplicationEnabled ? `enabled (${this.deduplicatedCount} dups)` : 'disabled'}`);
-    
-    if (incompleteClients.length > 0) {
-      this.logger.info(`Waiting for ${incompleteClients.length} clients to complete: ${incompleteClients.map(id => id.substring(0, 8)).join(', ')}`);
-      const progressDetails = incompleteClients.map(id => {
-        const client = this.clients.get(id);
-        if (!client) return `${id.substring(0, 8)}: unknown`;
-        const adjustedExpected = this.deduplicationEnabled
-          ? Math.max(1, client.expectedCount - this.deduplicatedCount)
-          : client.expectedCount;
-        return `${id.substring(0, 8)}: ${client.receivedCount}/${adjustedExpected}`;
-      });
-      this.logger.debug(`Client progress details: ${progressDetails.join(', ')}`);
-    }
-    
-    // If all clients are now complete but weren't before
-    if (allComplete && !this.isComplete) {
-      this.isComplete = true;
-      
-      this.logger.info('All clients have received expected changes' + 
-        (this.deduplicationEnabled ? ` (accounting for ${this.deduplicatedCount} deduplications)` : ''));
-      
-      // Get validation report
-      const validationReport = this.getValidationReport();
-      
-      if (validationReport.realMissingChanges.length > 0) {
-        this.logger.warn(`${validationReport.realMissingChanges.length} database changes were never received by any client (not due to deduplication)`);
-      }
-      
-      // Emit completion event
-      this.emit('complete', validationReport);
-    }
-    
-    return allComplete;
-  }
-  
-  /**
-   * Get a summary of the current progress
-   */
-  getProgressSummary(): string {
-    const parts: string[] = [];
-    this.clients.forEach((client, clientId) => {
-      // Calculate adjusted expected count
-      const adjustedExpected = this.deduplicationEnabled ? 
-        Math.max(1, client.expectedCount - this.deduplicatedCount) : 
-        client.expectedCount;
-      parts.push(`${clientId.substring(0, 8)}: ${client.receivedCount}/${client.expectedCount} (adjusted: ${adjustedExpected})`);
-    });
-    return parts.join(', ');
-  }
-
-  /**
-   * Analyze duplications in the dataset
-   */
-  analyzeDuplication(): {
-    totalChanges: number;
-    uniqueIds: number;
-    duplicatedIds: number;
-    duplicationRate: number;
-    duplicatesByRecord: Record<string, DeduplicationInfo>;
-  } {
-    // Extract duplication stats
-    const duplicatesByRecord: Record<string, DeduplicationInfo> = {};
-    
-    this.deduplicationInfo.forEach((info, key) => {
-      if (info.isDeduplication) {
-        duplicatesByRecord[key] = info;
-      }
-    });
-    
-    const uniqueIds = this.deduplicationInfo.size;
-    const duplicatedIds = Object.keys(duplicatesByRecord).length;
-    const totalChanges = Array.from(this.deduplicationInfo.values())
-      .reduce((sum, info) => sum + info.totalChanges, 0);
-    
-    return {
-      totalChanges,
-      uniqueIds,
-      duplicatedIds,
-      duplicationRate: uniqueIds > 0 ? duplicatedIds / uniqueIds : 0,
-      duplicatesByRecord
-    };
-  }
-  
-  /**
-   * Force the tracker to consider the test successful
-   * This is useful for cases where we've received a substantial portion
-   * of changes but some are legitimately filtered by the server
-   * @param filterMessage Optional message explaining why filtering occurred
-   */
-  forceSuccess(filterMessage?: string): void {
-    this.isComplete = true;
-    
-    // Create a validation report with forced success
-    const validationReport = this.getValidationReport();
-    validationReport.success = true;
-    
-    // Log why we're forcing success
-    if (filterMessage) {
-      this.logger.info(`ChangeTracker success forced due to: ${filterMessage}`);
+    // Log initialization
+    if (options.logLevel) {
+      this.logger.info(`ChangeTracker V2 initialized with ${options.logLevel} log level`);
     } else {
-      this.logger.info('ChangeTracker success forced despite missing changes');
+      this.logger.info('ChangeTracker V2 initialized');
     }
     
-    // Log completion stats
-    const stats = this.getCompletionStats();
-    this.logger.info(`Completion forced with ${stats.receivedChanges}/${stats.expectedChanges} changes (${stats.percentComplete}%)`);
-    
-    // Emit the completion event with the modified validation report
-    this.emit('complete', validationReport);
-    
-    return;
+    this.logger.info(`History size: ${this.maxHistorySize}, LSN tracking: ${this.trackLSN}, Update tracking: ${this.trackUpdatedEntities}, ID release after: ${this.idReleaseAfterBatches} batches`);
   }
   
   /**
-   * Get completion statistics
-   * @returns Object with completion stats
+   * Record changes that were successfully applied to the database
+   * @param changes Applied changes from change-applier
+   * @param batchId Optional batch ID for tracking
+   * @returns Number of changes recorded
    */
-  getCompletionStats(): {
-    receivedChanges: number;
-    expectedChanges: number;
-    percentComplete: number;
-    missingCount: number;
-    extraCount: number;
-  } {
-    // Calculate totals
-    let totalReceived = 0;
-    let totalExpected = 0;
+  recordAppliedChanges(changes: TableChangeTest[], batchId?: string): number {
+    // Add to overall applied changes
+    this.appliedChanges.push(...changes);
     
-    // Sum up from all clients
-    this.clients.forEach(client => {
-      totalReceived += client.receivedCount;
-      totalExpected += client.expectedCount;
-    });
+    // Enforce history size limit
+    if (this.appliedChanges.length > this.maxHistorySize) {
+      const overflow = this.appliedChanges.length - this.maxHistorySize;
+      this.appliedChanges = this.appliedChanges.slice(overflow);
+      this.logger.info(`Trimmed ${overflow} old changes to maintain history size limit`);
+    }
     
-    // Calculate percentage
-    const percentComplete = totalExpected > 0 
-      ? Math.round((totalReceived / totalExpected) * 100) 
-      : 0;
-    
-    // Calculate missing changes (always positive)
-    const missingCount = totalExpected > totalReceived 
-      ? totalExpected - totalReceived 
-      : 0;
-      
-    // Calculate extra changes (always positive)
-    const extraCount = totalReceived > totalExpected 
-      ? totalReceived - totalExpected 
-      : 0;
-    
-    return {
-      receivedChanges: totalReceived,
-      expectedChanges: totalExpected,
-      percentComplete,
-      missingCount,
-      extraCount
-    };
-  }
-
-  /**
-   * Get a validation report comparing database changes with received changes
-   * With enhanced support for deduplication awareness
-   */
-  getValidationReport(): ChangeTrackerReport {
-    // Ensure missing changes are calculated
-    const missingChanges = this.getMissingChanges();
-    
-    // Identify extra changes (received but not in database changes)
-    const extraChanges: TableChange[] = this.identifyExtraChanges();
-    
-    // Categorize missing changes into those that could be due to deduplication
-    // and those that are truly missing or part of cascade deletes
-    const realMissingChanges: TableChange[] = [];
-    const possibleDedupChanges: TableChange[] = [];
-    const cascadeDeleteChanges: TableChange[] = [];
-    
-    // Group missing changes by table for cascade delete detection
-    const missingByTable: Record<string, TableChange[]> = {};
-    
-    missingChanges.forEach(change => {
-      const table = change.table || 'unknown';
-      if (!missingByTable[table]) {
-        missingByTable[table] = [];
+    // Track by batch ID if provided
+    if (batchId) {
+      if (!this.appliedChangesByBatch[batchId]) {
+        this.appliedChangesByBatch[batchId] = [];
       }
-      missingByTable[table].push(change);
-    });
-    
-    missingChanges.forEach(change => {
-      const id = change.data?.id?.toString();
-      if (!id) {
-        realMissingChanges.push(change); // No ID means can't be deduplicated
-        return;
-      }
-      
-      const compositeKey = `${change.table}:${id}`;
-      const dbCount = this.dbChangeCountByKey.get(compositeKey) || 0;
-      
-      // If this is a likely deduplication case
-      if (dbCount > 1 && this.allReceivedIds.has(compositeKey)) {
-        possibleDedupChanges.push(change);
-      } 
-      // Check if this is a cascade delete (for any delete operation on dependent entities)
-      else if (change.operation === 'delete') {
-        // Check if this is a comment, task, or project - these can be deleted in cascades
-        const table = change.table || '';
-        
-        // Treat deletes of dependent entities as cascade deletes rather than real missing changes
-        if (['comments', 'tasks', 'projects'].includes(table)) {
-          cascadeDeleteChanges.push(change);
-          this.logger.debug(`Treating ${table} delete ${id} as cascade delete`);
-        } else {
-          realMissingChanges.push(change);
-        }
-      } else {
-        // Real missing change
-        realMissingChanges.push(change);
-      }
-    });
-    
-    // Calculate success - only counting truly missing changes, not deduplication or cascade deletes
-    const success = this.deduplicationEnabled 
-      ? realMissingChanges.length === 0  // If deduplication enabled, only real missing changes matter
-      : missingChanges.length === 0;     // Otherwise, all missing changes matter
-    
-    // Log info about recognized cascade deletes
-    if (cascadeDeleteChanges.length > 0) {
-      this.logger.info(`Recognized ${cascadeDeleteChanges.length} missing changes as cascade deletes`);
-      
-      // Group by table
-      const byTable: Record<string, number> = {};
-      cascadeDeleteChanges.forEach(change => {
-        const table = change.table || 'unknown';
-        byTable[table] = (byTable[table] || 0) + 1;
-      });
-      
-      Object.entries(byTable).forEach(([table, count]) => {
-        this.logger.info(`  - ${table}: ${count} cascade deletes`);
-      });
+      this.appliedChangesByBatch[batchId].push(...changes);
     }
     
-    // Enhanced reporting for real missing changes 
-    if (realMissingChanges.length > 0) {
-      this.logger.warn(`${realMissingChanges.length} real missing changes (not due to deduplication or cascading deletes):`);
-      
-      // Group by table for better reporting
-      const missingDetailsByTable: Record<string, { 
-        count: number, 
-        operations: Record<string, number>, 
-        ids: Array<{ id: string, op: string, lsn?: string, timestamp?: string }> 
-      }> = {};
-      
-      realMissingChanges.forEach(change => {
-        const table = change.table || 'unknown';
-        const id = change.data?.id?.toString() || 'unknown';
-        const op = change.operation || 'unknown';
-        const lsn = change.lsn?.toString() || undefined;
-        const timestamp = change.updated_at || undefined;
-        
-        if (!missingDetailsByTable[table]) {
-          missingDetailsByTable[table] = { count: 0, operations: {}, ids: [] };
-        }
-        
-        missingDetailsByTable[table].count++;
-        missingDetailsByTable[table].operations[op] = (missingDetailsByTable[table].operations[op] || 0) + 1;
-        missingDetailsByTable[table].ids.push({ id, op, lsn, timestamp });
-      });
-      
-      // Log detailed missing change information by table
-      Object.entries(missingDetailsByTable).forEach(([table, details]) => {
-        const opsStr = Object.entries(details.operations)
-          .map(([op, count]) => `${op}:${count}`)
-          .join(', ');
-        
-        this.logger.warn(`  Table: ${table} - ${details.count} changes (${opsStr})`);
-        
-        // Log the first 5 IDs with their operations for each table and additional metadata
-        const idsToShow = details.ids.slice(0, 5);
-        idsToShow.forEach(({ id, op, lsn, timestamp }) => {
-          const metaInfo = [];
-          if (lsn) metaInfo.push(`lsn=${lsn}`);
-          if (timestamp) metaInfo.push(`time=${timestamp}`);
-          
-          const metaString = metaInfo.length > 0 ? ` (${metaInfo.join(', ')})` : '';
-          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})${metaString}`);
-        });
-        
-        if (details.ids.length > 5) {
-          this.logger.warn(`    - And ${details.ids.length - 5} more...`);
-        }
-      });
-      
-      // Add a detailed batch history section for the missing changes
-      this.logger.warn(`===== DETAILED BATCH HISTORY FOR MISSING CHANGES =====`);
-      const batchHistory = this.getChangesBatchHistory(realMissingChanges);
-      
-      if (Object.keys(batchHistory).length === 0) {
-        this.logger.warn(`  No batch history found for missing changes`);
-      } else {
-        Object.entries(batchHistory).forEach(([changeId, batches]) => {
-          const [table, id, op] = changeId.split(':');
-          this.logger.warn(`  ${table} ${op} ${id.substring(0, 8)}... : ${batches.join(', ')}`);
-        });
-      }
-      this.logger.warn(`===== END OF BATCH HISTORY REPORT =====`);
-    }
-    
-    // Calculate extra changes count
-    const stats = this.getCompletionStats();
-    const extraChangesCount = stats.extraCount;
-    
-    // Enhanced reporting for extra changes 
-    if (extraChanges.length > 0) {
-      this.logger.warn(`${extraChanges.length} extra changes received (not in database changes):`);
-      
-      // Group by table for better reporting
-      const extraDetailsByTable: Record<string, { 
-        count: number, 
-        operations: Record<string, number>, 
-        ids: Array<{ id: string, op: string, lsn?: string, timestamp?: string }> 
-      }> = {};
-      
-      extraChanges.forEach(change => {
-        const table = change.table || 'unknown';
-        const id = change.data?.id?.toString() || 'unknown';
-        const op = change.operation || 'unknown';
-        const lsn = change.lsn?.toString() || undefined;
-        const timestamp = change.updated_at || undefined;
-        
-        if (!extraDetailsByTable[table]) {
-          extraDetailsByTable[table] = { count: 0, operations: {}, ids: [] };
-        }
-        
-        extraDetailsByTable[table].count++;
-        extraDetailsByTable[table].operations[op] = (extraDetailsByTable[table].operations[op] || 0) + 1;
-        extraDetailsByTable[table].ids.push({ id, op, lsn, timestamp });
-      });
-      
-      // Log detailed extra change information by table
-      Object.entries(extraDetailsByTable).forEach(([table, details]) => {
-        const opsStr = Object.entries(details.operations)
-          .map(([op, count]) => `${op}:${count}`)
-          .join(', ');
-        
-        this.logger.warn(`  Table: ${table} - ${details.count} extra changes (${opsStr})`);
-        
-        // Log the first 5 IDs with their operations for each table and additional metadata
-        const idsToShow = details.ids.slice(0, 5);
-        idsToShow.forEach(({ id, op, lsn, timestamp }) => {
-          const metaInfo = [];
-          if (lsn) metaInfo.push(`lsn=${lsn}`);
-          if (timestamp) metaInfo.push(`time=${timestamp}`);
-          
-          const metaString = metaInfo.length > 0 ? ` (${metaInfo.join(', ')})` : '';
-          this.logger.warn(`    - ${id.substring(0, 8)}... (${op})${metaString}`);
-        });
-        
-        if (details.ids.length > 5) {
-          this.logger.warn(`    - And ${details.ids.length - 5} more...`);
-        }
-      });
-      
-      // Add a detailed batch history section for the extra changes
-      this.logger.warn(`===== DETAILED BATCH HISTORY FOR EXTRA CHANGES =====`);
-      const batchHistory = this.getChangesBatchHistory(extraChanges);
-      
-      if (Object.keys(batchHistory).length === 0) {
-        this.logger.warn(`  No batch history found for extra changes`);
-      } else {
-        Object.entries(batchHistory).forEach(([changeId, batches]) => {
-          const [table, id, op] = changeId.split(':');
-          this.logger.warn(`  ${table} ${op} ${id.substring(0, 8)}... : ${batches.join(', ')}`);
-        });
-      }
-      this.logger.warn(`===== END OF BATCH HISTORY REPORT =====`);
-    }
-    
-    return {
-      databaseChanges: this.databaseChanges.length,
-      receivedChanges: this.getAllChanges().length,
-      uniqueRecordsChanged: this.dbChangeCountByKey.size,
-      uniqueRecordsReceived: this.allReceivedIds.size,
-      missingChanges,
-      deduplicatedChanges: this.deduplicatedCount,
-      realMissingChanges,
-      possibleDedupChanges,
-      cascadeDeleteChanges,
-      extraChangesCount,
-      extraChanges,
-      success,
-      // Add detailed reports to help with debugging
-      detailedMissingReport: realMissingChanges.map(change => ({
-        id: change.data?.id?.toString() || 'unknown',
-        table: change.table || 'unknown',
-        operation: change.operation || 'unknown',
-        timestamp: change.updated_at || 'unknown'
-      }))
-    };
-  }
-
-  /**
-   * Identify changes that were received but not in the database changes
-   * @returns Array of extra changes
-   */
-  private identifyExtraChanges(): TableChange[] {
-    const extraChanges: TableChange[] = [];
-    
-    // Create a lookup set for all database changes
-    const dbChangeKeys = new Set<string>();
-    this.databaseChanges.forEach(dbChange => {
-      const id = dbChange.data?.id?.toString();
-      if (!id) return;
-      
-      const key = `${dbChange.table}:${id}:${dbChange.operation}`;
-      dbChangeKeys.add(key);
-    });
-    
-    // Check all received changes to see if they're in the db changes
-    this.clients.forEach(client => {
-      client.changes.forEach(change => {
-        const id = change.data?.id?.toString();
-        if (!id) return;
-        
-        const key = `${change.table}:${id}:${change.operation}`;
-        
-        // If this change wasn't in the database changes, it's extra
-        if (!dbChangeKeys.has(key)) {
-          extraChanges.push(change);
-        }
-      });
-    });
-    
-    return extraChanges;
-  }
-
-  /**
-   * Set the expected count for a specific client
-   * @param clientId The client ID
-   * @param expectedCount Number of changes expected
-   */
-  setClientExpectedCount(clientId: string, expectedCount: number): void {
-    const client = this.clients.get(clientId);
-    if (!client) {
-      this.logger.warn(`Attempted to set expected count for unknown client: ${clientId}`);
-      return;
-    }
-    
-    client.expectedCount = expectedCount;
-    this.logger.info(`Set expected count for client ${clientId} to ${expectedCount}`);
-  }
-
-  /**
-   * Reset the received count for a specific client
-   * @param clientId The client ID
-   */
-  resetClientReceivedCount(clientId: string): void {
-    const client = this.clients.get(clientId);
-    if (!client) {
-      this.logger.warn(`Attempted to reset received count for unknown client: ${clientId}`);
-      return;
-    }
-    
-    // Reset count and received changes list
-    client.receivedCount = 0;
-    client.changes = [];
-    
-    // Reset received IDs set
-    const clientReceivedIds = this.receivedIdsByClient.get(clientId);
-    if (clientReceivedIds) {
-      clientReceivedIds.clear();
-    }
-    
-    // Reset last change time
-    this.lastChangeTimeByClient.delete(clientId);
-    
-    this.logger.info(`Reset received count and change history for client ${clientId}`);
-    
-    // Reset completion status
-    this.isComplete = false;
-    
-    // Force recalculation of missing changes
-    this.needsRecalculation = true;
-  }
-
-  /**
-   * Reset the entire tracker state
-   * This is useful when we want to start fresh after a phase like catchup sync
-   */
-  resetTrackerState(): void {
-    this.logger.info('Resetting entire tracker state to start fresh');
-    
-    // Reset global tracking structures
-    this.databaseChanges = [];
-    this.missingChanges = [];
-    this.changesByCompositeKey = new Map();
-    this.allReceivedIds = new Set();
-    this.dbChangeCountByKey = new Map();
-    this.deduplicationInfo = new Map();
-    this.deduplicatedCount = 0;
-    this.isComplete = false;
-    
-    // Reset client-specific tracking
-    for (const [clientId, client] of this.clients.entries()) {
-      client.receivedCount = 0;
-      client.changes = [];
-      
-      // Clear client-specific lookups
-      this.receivedIdsByClient.get(clientId)?.clear();
-      this.batchTracking.get(clientId)?.clear();
-    }
-    
-    this.needsRecalculation = true;
-    this.logger.info('Tracker state has been completely reset');
-  }
-
-  /**
-   * Get the timestamp of when a client last received changes
-   * @param clientId The client ID
-   * @returns Timestamp in milliseconds, or undefined if no changes received
-   */
-  getClientLastChangeTime(clientId: string): number | undefined {
-    return this.lastChangeTimeByClient.get(clientId);
-  }
-
-  /**
-   * Get batch history for a set of changes
-   * @param changes The changes to get batch history for
-   * @returns An object mapping change identifiers to batch IDs
-   */
-  getChangesBatchHistory(changes: TableChange[]): Record<string, string[]> {
-    const batchHistory: Record<string, string[]> = {};
-    
-    // Generate composite keys for each change
+    // Track confirmed IDs for entity types and release reservations
     changes.forEach(change => {
       const id = change.data?.id?.toString();
       if (!id) return;
       
-      const compositeKey = `${change.table}:${id}:${change.operation}`;
+      // Determine entity type from table name
+      const entityType = this.getEntityTypeFromTable(change.table);
+      if (entityType) {
+        // Add to confirmed IDs
+        this.confirmedIds[entityType].add(id);
+        
+        // Release any reservation for this ID
+        this.releaseReservation(entityType, id);
+      }
       
-      // Check if this is a received change in any batch
-      let foundInReceivedBatches = false;
+      // Track intentional duplicates
+      if (change.data && change.data.__intentionalDuplicate) {
+        this.intentionalDuplicates.push(change);
+      }
       
-      // Check all batches for this change
-      this.batchTracking.forEach((batchMap, clientId) => {
-        batchMap.forEach((batchChanges, batchId) => {
-          // Look for this change in the batch
-          const found = batchChanges.some(batchChange => {
-            const batchChangeId = batchChange.data?.id?.toString();
-            return batchChangeId === id && 
-                   batchChange.table === change.table && 
-                   batchChange.operation === change.operation;
-          });
-          
-          if (found) {
-            foundInReceivedBatches = true;
-            if (!batchHistory[compositeKey]) {
-              batchHistory[compositeKey] = [];
-            }
-            batchHistory[compositeKey].push(`${clientId.substring(0, 8)}:${batchId}`);
-          }
-        });
-      });
-      
-      // If not found in any received batch, check origin batches for truly missing changes
-      if (!foundInReceivedBatches) {
-        // Find origin batch(es) for this change
-        this.dbChangesByOriginBatch.forEach((changeSet, batchId) => {
-          if (changeSet.has(compositeKey)) {
-            if (!batchHistory[compositeKey]) {
-              batchHistory[compositeKey] = [];
-            }
-            batchHistory[compositeKey].push(`origin:${batchId}`);
-          }
-        });
+      // Track LSN if available
+      if (this.trackLSN && change.lsn) {
+        this.trackLSNChange(change.lsn, batchId);
       }
     });
     
-    return batchHistory;
+    this.logger.info(`Recorded ${changes.length} applied changes${batchId ? ` for batch ${batchId}` : ''}`);
+    
+    // Clean expired reservations
+    this.cleanExpiredReservations();
+    
+    // Assign batch number if new batch ID
+    if (batchId && !this.batchToNumber.has(batchId)) {
+      this.currentBatchNumber++;
+      this.batchToNumber.set(batchId, this.currentBatchNumber);
+      this.logger.debug(`Assigned batch number ${this.currentBatchNumber} to batch ${batchId}`);
+    }
+    
+    // Track updated entities by batch number
+    if (this.trackUpdatedEntities) {
+      const batchNumber = batchId ? (this.batchToNumber.get(batchId) || this.currentBatchNumber) : this.currentBatchNumber;
+      this.trackEntityUpdates(changes, batchNumber);
+    }
+    
+    return changes.length;
   }
-
-  // Add a helper method to track database changes with batch info
+  
   /**
-   * Track database changes from a specific batch
-   * @param changes The changes to track
-   * @param batchId Identifier of the batch these changes were generated in
+   * Reserve an ID for a specific operation
+   * @param entityType The entity type to reserve an ID for
+   * @param operation The operation to reserve the ID for (create/update/delete)
+   * @param id Optional ID to reserve (auto-generated UUID if not provided)
+   * @param options Additional reservation options
+   * @returns The reserved ID
    */
-  trackDatabaseChangesWithBatch(changes: TableChange[], batchId: string): void {
-    // First track the changes normally
-    this.trackDatabaseChanges(changes, batchId);
+  reserveId(
+    entityType: EntityType, 
+    operation: 'create' | 'update' | 'delete',
+    id?: string,
+    options: {
+      expirySeconds?: number;
+      batchId?: string;
+      metadata?: Record<string, any>;
+    } = {}
+  ): string {
+    // For create operations, generate UUID if not provided
+    if (operation === 'create' && !id) {
+      id = uuidv4();
+    } else if (!id) {
+      throw new Error(`ID must be provided for ${operation} operations`);
+    }
+    
+    // Check if ID is already reserved
+    const existingReservation = this.reservedIds[entityType].find(r => r.id === id);
+    if (existingReservation) {
+      throw new Error(`ID ${id} is already reserved for ${existingReservation.reservedFor} operation`);
+    }
+    
+    // Create reservation
+    const reservation: IDReservation = {
+      id,
+      entityType,
+      reservedFor: operation,
+      batchId: options.batchId,
+      metadata: options.metadata
+    };
+    
+    // Set expiry if specified
+    if (options.expirySeconds) {
+      reservation.expiresAt = Date.now() + (options.expirySeconds * 1000);
+    }
+    
+    // Add to reserved IDs
+    this.reservedIds[entityType].push(reservation);
+    
+    this.logger.info(`Reserved ID ${id} for ${operation} operation on ${entityType}`);
+    return id;
   }
-} 
+  
+  /**
+   * Check if an ID is reserved
+   * @param entityType The entity type to check
+   * @param id The ID to check
+   * @returns Whether the ID is reserved
+   */
+  isReserved(entityType: EntityType, id: string): boolean {
+    return this.reservedIds[entityType].some(r => r.id === id);
+  }
+  
+  /**
+   * Get reservation details for an ID
+   * @param entityType The entity type to check
+   * @param id The ID to check
+   * @returns The reservation details or null if not reserved
+   */
+  getReservation(entityType: EntityType, id: string): IDReservation | null {
+    return this.reservedIds[entityType].find(r => r.id === id) || null;
+  }
+  
+  /**
+   * Release a reservation for an ID
+   * @param entityType The entity type to release
+   * @param id The ID to release
+   * @returns Whether the reservation was released
+   */
+  releaseReservation(entityType: EntityType, id: string): boolean {
+    const initialLength = this.reservedIds[entityType].length;
+    this.reservedIds[entityType] = this.reservedIds[entityType].filter(r => r.id !== id);
+    
+    const wasReleased = this.reservedIds[entityType].length < initialLength;
+    if (wasReleased) {
+      this.logger.info(`Released reservation for ID ${id} on ${entityType}`);
+    }
+    
+    return wasReleased;
+  }
+  
+  /**
+   * Clean up expired reservations
+   * @returns Number of expired reservations removed
+   */
+  cleanExpiredReservations(): number {
+    const now = Date.now();
+    let expiredCount = 0;
+    
+    for (const entityType of Object.keys(this.reservedIds) as EntityType[]) {
+      const initialLength = this.reservedIds[entityType].length;
+      this.reservedIds[entityType] = this.reservedIds[entityType].filter(r => {
+        if (!r.expiresAt || r.expiresAt > now) return true;
+        return false;
+      });
+      
+      expiredCount += initialLength - this.reservedIds[entityType].length;
+    }
+    
+    if (expiredCount > 0) {
+      this.logger.info(`Cleaned up ${expiredCount} expired reservations`);
+    }
+    
+    return expiredCount;
+  }
+  
+  /**
+   * Track LSN for a change
+   * @param lsn The LSN to track
+   * @param batchId Optional batch ID
+   */
+  private trackLSNChange(lsn: string, batchId?: string): void {
+    if (!this.trackLSN) return;
+    
+    // Initialize LSN range if this is the first LSN
+    if (!this.lastLSN) {
+      this.lsnRanges.push({
+        min: lsn,
+        max: lsn,
+        timestamp: Date.now(),
+        count: 1,
+        batchId
+      });
+      this.lastLSN = lsn;
+      return;
+    }
+    
+    // Check if part of current range
+    const currentRange = this.lsnRanges[this.lsnRanges.length - 1];
+    
+    // Compare LSNs (simple string comparison)
+    if (lsn > currentRange.max) {
+      currentRange.max = lsn;
+      currentRange.count = (currentRange.count || 0) + 1;
+    } else if (lsn < currentRange.min) {
+      currentRange.min = lsn;
+      currentRange.count = (currentRange.count || 0) + 1;
+    } else {
+      // Within existing range, just increment count
+      currentRange.count = (currentRange.count || 0) + 1;
+    }
+    
+    this.lastLSN = lsn;
+  }
+  
+  /**
+   * Set the last known LSN
+   * @param lsn The LSN to set
+   */
+  setLastLSN(lsn: string): void {
+    if (!this.trackLSN) return;
+    
+    this.lastLSN = lsn;
+    
+    // Create a new range if none exists
+    if (this.lsnRanges.length === 0) {
+      this.lsnRanges.push({
+        min: lsn,
+        max: lsn,
+        timestamp: Date.now(),
+        count: 0
+      });
+    }
+    
+    this.logger.debug(`Set last LSN to ${lsn}`);
+  }
+  
+  /**
+   * Get the last known LSN
+   * @returns The last known LSN
+   */
+  getLastLSN(): string | null {
+    return this.lastLSN;
+  }
+  
+  /**
+   * Get LSN ranges tracked
+   * @returns Array of LSN ranges
+   */
+  getLSNRanges(): LSNRange[] {
+    return [...this.lsnRanges];
+  }
+  
+  /**
+   * Get all confirmed IDs for a specific entity type
+   * @param entityType The entity type to get IDs for
+   * @returns Array of confirmed IDs
+   */
+  getConfirmedIds(entityType: EntityType): string[] {
+    return Array.from(this.confirmedIds[entityType]);
+  }
+  
+  /**
+   * Get all reserved IDs for a specific entity type and operation
+   * @param entityType The entity type to get IDs for
+   * @param operation Optional operation filter
+   * @returns Array of reserved IDs
+   */
+  getReservedIds(entityType: EntityType, operation?: 'create' | 'update' | 'delete'): string[] {
+    if (operation) {
+      return this.reservedIds[entityType]
+        .filter(r => r.reservedFor === operation)
+        .map(r => r.id);
+    }
+    
+    return this.reservedIds[entityType].map(r => r.id);
+  }
+  
+  /**
+   * Find duplicate changes in a set of changes
+   * @param changes The changes to check for duplicates
+   * @returns Object with duplicate information
+   */
+  findDuplicates(changes: TableChangeTest[]): {
+    duplicates: {id: string, table: string, operation: string, changes: TableChangeTest[]}[];
+    count: number;
+  } {
+    const changesByKey: Record<string, TableChangeTest[]> = {};
+    
+    // Group changes by table+id+operation
+    for (const change of changes) {
+      const id = change.data?.id;
+      if (!id) continue;
+      
+      const key = `${change.table}:${id}:${change.operation}`;
+      
+      if (!changesByKey[key]) {
+        changesByKey[key] = [];
+      }
+      
+      changesByKey[key].push(change);
+    }
+    
+    // Find groups with more than one change
+    const duplicateGroups = Object.entries(changesByKey)
+      .filter(([_, changesArray]) => changesArray.length > 1)
+      .map(([key, changesArray]) => {
+        const [table, id, operation] = key.split(':');
+        return {
+          id,
+          table,
+          operation,
+          changes: changesArray
+        };
+      });
+      
+    return {
+      duplicates: duplicateGroups,
+      count: duplicateGroups.reduce((sum, group) => sum + group.changes.length - 1, 0)
+    };
+  }
+  
+  /**
+   * Get all intentional duplicates that were applied
+   * @returns Array of intentional duplicate changes
+   */
+  getIntentionalDuplicates(): TableChangeTest[] {
+    return [...this.intentionalDuplicates];
+  }
+  
+  /**
+   * Get applied changes for a specific batch
+   * @param batchId The batch ID to get changes for
+   * @returns Array of applied changes for the batch
+   */
+  getAppliedChangesForBatch(batchId: string): TableChangeTest[] {
+    return this.appliedChangesByBatch[batchId] || [];
+  }
+  
+  /**
+   * Get all applied changes
+   * @returns Array of all applied changes
+   */
+  getAllAppliedChanges(): TableChangeTest[] {
+    return [...this.appliedChanges];
+  }
+  
+  /**
+   * Get a summary of applied changes by entity type and operation
+   * @returns Summary object with counts
+   */
+  getSummary(): {
+    totalChanges: number;
+    byEntityType: Record<EntityType, number>;
+    byOperation: Record<string, number>;
+    byBatch: Record<string, number>;
+    intentionalDuplicates: number;
+    reservations: Record<EntityType, number>;
+    lsnRanges: number;
+  } {
+    const summary = {
+      totalChanges: this.appliedChanges.length,
+      byEntityType: {
+        user: 0,
+        project: 0,
+        task: 0,
+        comment: 0
+      } as Record<EntityType, number>,
+      byOperation: {} as Record<string, number>,
+      byBatch: {} as Record<string, number>,
+      intentionalDuplicates: this.intentionalDuplicates.length,
+      reservations: {
+        user: this.reservedIds.user.length,
+        project: this.reservedIds.project.length,
+        task: this.reservedIds.task.length,
+        comment: this.reservedIds.comment.length
+      },
+      lsnRanges: this.lsnRanges.length
+    };
+    
+    this.appliedChanges.forEach(change => {
+      // Count by entity type
+      const entityType = this.getEntityTypeFromTable(change.table);
+      if (entityType) {
+        summary.byEntityType[entityType]++;
+      }
+      
+      // Count by operation
+      const operation = change.operation || 'unknown';
+      summary.byOperation[operation] = (summary.byOperation[operation] || 0) + 1;
+    });
+    
+    // Count by batch
+    Object.entries(this.appliedChangesByBatch).forEach(([batchId, changes]) => {
+      summary.byBatch[batchId] = changes.length;
+    });
+    
+    return summary;
+  }
+  
+  /**
+   * Track which entities were updated in which batch
+   * @param changes The changes to track
+   * @param batchNumber The batch number
+   */
+  private trackEntityUpdates(changes: TableChangeTest[], batchNumber: number): void {
+    for (const change of changes) {
+      if (change.operation !== 'update') continue;
+      
+      const id = change.data?.id?.toString();
+      if (!id) continue;
+      
+      const entityType = this.getEntityTypeFromTable(change.table);
+      if (!entityType) continue;
+      
+      // Record which batch this entity was updated in
+      this.updatedEntities[entityType].set(id, batchNumber);
+    }
+  }
+  
+  /**
+   * Explicitly track entity updates by type and ID
+   * @param entityType The entity type that was updated
+   * @param ids Array of entity IDs that were updated
+   * @param batchNumber Optional batch number (uses current batch if not specified)
+   */
+  trackSpecificEntityUpdates(
+    entityType: EntityType,
+    ids: string[],
+    batchNumber?: number
+  ): void {
+    if (!this.trackUpdatedEntities) return;
+    
+    const batchNum = batchNumber || this.currentBatchNumber;
+    
+    for (const id of ids) {
+      this.updatedEntities[entityType].set(id, batchNum);
+    }
+    
+    this.logger.debug(`Tracked ${ids.length} ${entityType} updates in batch ${batchNum}`);
+  }
+  
+  /**
+   * Release entity IDs that were updated more than a specified number of batches ago
+   * This allows these IDs to be used in change generation again
+   * @param currentBatch The current batch number
+   * @param releaseAfterBatches How many batches after which to release IDs (defaults to this.idReleaseAfterBatches)
+   * @returns Number of IDs released
+   */
+  releaseUpdatedIds(
+    currentBatch?: number,
+    releaseAfterBatches?: number
+  ): number {
+    if (!this.trackUpdatedEntities) return 0;
+    
+    const currentBatchNum = currentBatch || this.currentBatchNumber;
+    const batchThreshold = releaseAfterBatches || this.idReleaseAfterBatches;
+    
+    let releasedTotal = 0;
+    
+    for (const entityType of Object.keys(this.updatedEntities) as EntityType[]) {
+      const idsToRelease: string[] = [];
+      
+      this.updatedEntities[entityType].forEach((batchNum, id) => {
+        if (currentBatchNum - batchNum >= batchThreshold) {
+          idsToRelease.push(id);
+        }
+      });
+      
+      // Remove released IDs from tracking
+      for (const id of idsToRelease) {
+        this.updatedEntities[entityType].delete(id);
+      }
+      
+      releasedTotal += idsToRelease.length;
+      
+      if (idsToRelease.length > 0) {
+        this.logger.debug(`Released ${idsToRelease.length} ${entityType} IDs updated before batch ${currentBatchNum - batchThreshold}`);
+      }
+    }
+    
+    if (releasedTotal > 0) {
+      this.logger.info(`Released ${releasedTotal} entity IDs updated before batch ${currentBatchNum - batchThreshold}`);
+    }
+    
+    return releasedTotal;
+  }
+  
+  /**
+   * Get the current batch number
+   * @returns The current batch number
+   */
+  getCurrentBatchNumber(): number {
+    return this.currentBatchNumber;
+  }
+  
+  /**
+   * Get batch information for a specific batch ID
+   * @param batchId The batch ID
+   * @returns Batch information
+   */
+  getBatchInformation(batchId: string): {
+    batchNumber: number;
+    changeCount: number;
+    timestamp: string;
+  } | null {
+    if (!this.batchToNumber.has(batchId)) {
+      return null;
+    }
+    
+    const batchNumber = this.batchToNumber.get(batchId) as number;
+    const changes = this.appliedChangesByBatch[batchId] || [];
+    
+    // Get timestamp from first change
+    let timestamp = new Date().toISOString();
+    if (changes.length > 0 && changes[0].updated_at) {
+      timestamp = changes[0].updated_at;
+    }
+    
+    return {
+      batchNumber,
+      changeCount: changes.length,
+      timestamp
+    };
+  }
+  
+  /**
+   * Get statistics for all batches
+   * @returns Batch statistics
+   */
+  getBatchStatistics(): {
+    totalBatches: number;
+    totalChangesReceived: number;
+    lastBatchTime: string;
+    changesByBatch: {
+      batchId: string;
+      batchNumber: number;
+      changeCount: number;
+      timestamp: string;
+    }[];
+  } {
+    const batchIds = Object.keys(this.appliedChangesByBatch);
+    const changesByBatch = batchIds.map(batchId => {
+      const info = this.getBatchInformation(batchId);
+      return {
+        batchId,
+        batchNumber: info?.batchNumber || 0,
+        changeCount: info?.changeCount || 0,
+        timestamp: info?.timestamp || new Date().toISOString()
+      };
+    });
+    
+    // Sort by batch number
+    changesByBatch.sort((a, b) => a.batchNumber - b.batchNumber);
+    
+    // Calculate total changes
+    const totalChangesReceived = changesByBatch.reduce((sum, batch) => sum + batch.changeCount, 0);
+    
+    // Get timestamp of last batch
+    let lastBatchTime = new Date().toISOString();
+    if (changesByBatch.length > 0) {
+      lastBatchTime = changesByBatch[changesByBatch.length - 1].timestamp;
+    }
+    
+    return {
+      totalBatches: this.batchToNumber.size,
+      totalChangesReceived,
+      lastBatchTime,
+      changesByBatch
+    };
+  }
+  
+  /**
+   * Get updated entity IDs for a specific entity type
+   * @param entityType The entity type
+   * @param minBatchNumber Optional minimum batch number
+   * @param maxBatchNumber Optional maximum batch number
+   * @returns Array of updated entity IDs
+   */
+  getUpdatedEntityIds(
+    entityType: EntityType,
+    minBatchNumber?: number,
+    maxBatchNumber?: number
+  ): string[] {
+    if (!this.trackUpdatedEntities) return [];
+    
+    const ids: string[] = [];
+    
+    this.updatedEntities[entityType].forEach((batchNum, id) => {
+      if (minBatchNumber !== undefined && batchNum < minBatchNumber) return;
+      if (maxBatchNumber !== undefined && batchNum > maxBatchNumber) return;
+      ids.push(id);
+    });
+    
+    return ids;
+  }
+  
+  /**
+   * Get IDs that should be excluded from updates
+   * This includes recently created and recently updated IDs
+   * @param entityType The entity type
+   * @returns Set of IDs to exclude
+   */
+  getIdsToExcludeFromUpdates(entityType: EntityType): Set<string> {
+    const excludeIds = new Set<string>();
+    
+    // Add confirmed IDs (recently created)
+    this.confirmedIds[entityType].forEach(id => excludeIds.add(id));
+    
+    // Add updated entity IDs
+    if (this.trackUpdatedEntities) {
+      this.updatedEntities[entityType].forEach((_, id) => excludeIds.add(id));
+    }
+    
+    // Add reserved IDs
+    this.reservedIds[entityType].forEach(r => excludeIds.add(r.id));
+    
+    return excludeIds;
+  }
+  
+  /**
+   * Clear the tracker state
+   */
+  clear(): void {
+    this.appliedChanges = [];
+    this.appliedChangesByBatch = {};
+    this.intentionalDuplicates = [];
+    this.lsnRanges = [];
+    this.lastLSN = null;
+    
+    this.confirmedIds = {
+      user: new Set<string>(),
+      project: new Set<string>(),
+      task: new Set<string>(),
+      comment: new Set<string>()
+    };
+    
+    this.reservedIds = {
+      user: [],
+      project: [],
+      task: [],
+      comment: []
+    };
+    
+    this.updatedEntities = {
+      user: new Map<string, number>(),
+      project: new Map<string, number>(),
+      task: new Map<string, number>(),
+      comment: new Map<string, number>()
+    };
+    
+    this.currentBatchNumber = 0;
+    this.batchToNumber.clear();
+    
+    this.logger.info('Tracker state cleared');
+  }
+  
+  /**
+   * Convert table name to entity type
+   * @param table Table name
+   * @returns EntityType or undefined
+   */
+  private getEntityTypeFromTable(table?: string): EntityType | undefined {
+    if (!table) return undefined;
+    return TABLE_TO_ENTITY[table];
+  }
+}
+
+/**
+ * Singleton instance for global tracking
+ */
+export const globalChangeTracker = new ChangeTracker(); 

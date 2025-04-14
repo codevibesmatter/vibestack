@@ -11,7 +11,7 @@
 
 import { SyncStateManager } from './state-manager';
 import { performInitialSync } from './initial-sync';
-import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation, fetchAndProcessChanges } from './server-changes';
+import { performCatchupSync, sendLiveChanges, createLiveSyncConfirmation, processLiveUpdateNotification } from './server-changes';
 import { processClientChanges } from './client-changes';
 import type { 
   ServerMessage, 
@@ -78,7 +78,8 @@ export class SyncDO implements DurableObject, WebSocketHandler {
   private waitingResolvers: Map<string, {
     resolve: (message: any) => void,
     reject: (error: Error) => void,
-    timer: NodeJS.Timeout | null
+    timer: NodeJS.Timeout | null,
+    filter?: (message: any) => boolean
   }> = new Map();
   private isHandlerRegistered: boolean = false;
 
@@ -241,13 +242,11 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
     
-    // Store WebSocket and client ID
-    this.webSocket = server;
+    // Store client ID
     this.clientId = clientId;
 
     // Configure WebSocket with hibernation API
     this.ctx.acceptWebSocket(server);
-    this.setupWebSocketEventHandlers(server);
     
     // Register message handlers only once per clientId
     this.registerMessageHandlers();
@@ -271,11 +270,6 @@ export class SyncDO implements DurableObject, WebSocketHandler {
           lsn: finalClientLSN,
           error: error instanceof Error ? error.message : String(error)
         }, MODULE_NAME);
-        
-        // Close WebSocket on error
-        if (server.readyState === WS_READY_STATE.OPEN) {
-          server.close(1011, 'Internal Server Error');
-        }
       }
     })());
     
@@ -401,6 +395,33 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     for (const waitId of waitIds) {
       const resolver = this.waitingResolvers.get(waitId);
       if (!resolver) continue;
+      
+      // Check if this resolver has a filter function
+      if (resolver.filter) {
+        // Only resolve if the message passes the filter
+        try {
+          if (!resolver.filter(message)) {
+            // This message doesn't match the filter criteria
+            // Leave the resolver in place for a future message
+            continue;
+          }
+          
+          // Message matched the filter - proceed with resolution
+          syncLogger.debug('Message passed filter, resolving', { 
+            type,
+            waitId,
+            messageId: message.messageId
+          }, MODULE_NAME);
+        } catch (filterError) {
+          syncLogger.error('Error in message filter function', {
+            type,
+            waitId,
+            error: filterError instanceof Error ? filterError.message : String(filterError)
+          }, MODULE_NAME);
+          // Continue to next resolver on filter error
+          continue;
+        }
+      }
       
       // Clear timer if exists
       if (resolver.timer) {
@@ -529,142 +550,76 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    */
   private async handleNewChanges(request: Request): Promise<Response> {
     // Extract parameters from request
-    const clientId = getQueryParam(request, 'clientId');
-    const lsnFromUrl = getQueryParam(request, 'lsn');
+    const url = new URL(request.url);
+    const clientId = url.searchParams.get('clientId')!;
+    const lsnFromUrl = url.searchParams.get('lsn');
+
+    if (!clientId) {
+      return new Response('Client ID is required', { status: 400 });
+    }
 
     syncLogger.info('Received new changes notification', {
       clientId,
       lsnFromUrl
     }, MODULE_NAME);
 
-    // Basic validation
-    if (!clientId) {
-      return new Response('Missing clientId parameter', { 
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
+    // Set the client ID if it's not already set
+    if (!this.clientId) {
+      this.clientId = clientId;
+      await this.stateManager.registerClient(clientId);
     }
 
-    // Validate LSN if provided
-    if (lsnFromUrl && !isValidLSN(lsnFromUrl)) {
-      syncLogger.error('Invalid LSN format in request', {
-        clientId,
-        lsn: lsnFromUrl
-      }, MODULE_NAME);
-      return new Response(JSON.stringify({
-        error: 'Invalid LSN format'
-      }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // Parse the request body to get the serverLSN
-    let requestData;
-    let serverLSN;
-    try {
-      requestData = await request.json() as { 
-        lsn?: string
-      };
-      
-      // Extract server LSN from request data
-      serverLSN = requestData.lsn;
-      
-      if (!serverLSN) {
-        throw new Error('No server LSN provided');
-      }
-      
-      if (!isValidLSN(serverLSN)) {
-        throw new Error('Invalid server LSN format');
-      }
-      
-      syncLogger.info('Processing changes notification', {
-        clientId,
-        serverLSN,
-        connectionActive: this.isConnected()
-      }, MODULE_NAME);
-    } catch (error) {
-      return new Response(JSON.stringify({
-        error: 'Invalid request format',
-        details: error instanceof Error ? error.message : String(error)
-      }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // If we don't have an active WebSocket connection, can't notify
-    if (!this.isConnected()) {
-      syncLogger.warn('Cannot notify client, no active connection', {
-        clientId
-      }, MODULE_NAME);
-      
-      return new Response(JSON.stringify({
-        success: false,
-        error: 'No active WebSocket connection for client'
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    // Get client's last known LSN
-    let clientLSN: string;
-    try {
-      // Use getLSN from state manager if this SyncDO is for the requested clientId
-      if (this.clientId === clientId) {
-        clientLSN = this.stateManager.getLSN() || '0/0';
-      } else {
-        syncLogger.warn('Client ID mismatch, cannot get LSN from state manager', {
-          requestClientId: clientId,
-          currentClientId: this.clientId
-        }, MODULE_NAME);
-        // Default to 0/0 if we can't get the client's LSN
-        clientLSN = '0/0';
-      }
-    } catch (error) {
-      syncLogger.error('Failed to get client LSN', {
-        clientId,
-        error: error instanceof Error ? error.message : String(error)
-      }, MODULE_NAME);
-      clientLSN = '0/0';
-    }
-
-    syncLogger.debug('Using LSNs for sync', {
+    // Get server LSN
+    const serverLSN = await this.stateManager.getServerLSN();
+    syncLogger.info('Processing changes notification', {
       clientId,
-      clientLSN,
       serverLSN
     }, MODULE_NAME);
+
+    let clientLSN: string;
+    try {
+      // Use getLSN from state manager
+      clientLSN = await this.stateManager.getLSN() || '0/0';
+    } catch (error) {
+      syncLogger.error('Failed to get client LSN for notification', { clientId }, MODULE_NAME);
+      clientLSN = '0/0';
+    }
 
     const ctx = this.getContext();
 
     try {
-      // Use the new unified fetchAndProcessChanges function
-      const result = await fetchAndProcessChanges(
+      // Call the dedicated function in server-changes to process the notification
+      const result = await processLiveUpdateNotification(
         ctx,
         clientId,
         clientLSN,
         serverLSN,
-        this,
-        true // This is a live sync
+        this // Pass SyncDO instance as the WebSocketHandler
       );
       
       // Update client's LSN if successful and this is our client
       if (result.success && this.clientId === clientId) {
-        await this.stateManager.updateClientLSN(clientId, result.finalLSN);
+         await this.stateManager.updateClientLSN(clientId, result.finalLSN);
+         syncLogger.debug('Updated client LSN from live sync notification handler', {
+            clientId,
+            newLSN: result.finalLSN
+         }, MODULE_NAME);
       }
       
+      // Return success response based on the result
       return new Response(JSON.stringify({
         success: result.success,
-        notified: result.success,
+        notified: true, // Indicate notification was processed
         changeCount: result.changeCount,
         lsn: result.finalLSN
       }), {
-        status: 200,
+        status: result.success ? 200 : 500, // Use 500 if processing failed
         headers: { 'Content-Type': 'application/json' }
       });
     } catch (error) {
-      syncLogger.error('Failed to process changes notification', {
+      // This catch block might be redundant if processLiveUpdateNotification handles its errors
+      // but keep for safety
+      syncLogger.error('Unexpected error handling changes notification', {
         clientId,
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined
@@ -672,7 +627,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       
       return new Response(JSON.stringify({
         success: false,
-        error: 'Failed to process changes',
+        error: 'Failed to process changes notification',
         details: error instanceof Error ? error.message : String(error)
       }), {
         status: 500,
@@ -724,57 +679,53 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    */
   async send(message: ServerMessage): Promise<void> {
     try {
-      if (this.webSocket && this.webSocket.readyState === WS_READY_STATE.OPEN) {
-        // Minimal logging for acknowledgment messages
-        if (message.type === 'srv_changes_received' || message.type === 'srv_changes_applied') {
-          syncLogger.info(`Sending ${message.type}`, {
-            type: message.type,
-            messageId: message.messageId
-          }, MODULE_NAME);
-        }
-        
-        // Use try-catch specifically for the send operation
-        try {
-          this.webSocket.send(JSON.stringify(message));
-          
-          // Only log type and messageId on success
-          syncLogger.debug('Sent message', {
-            type: message.type,
-            messageId: message.messageId
-          }, MODULE_NAME);
-        } catch (sendError) {
-          // Log specific send error with minimal info
-          syncLogger.error(`Error sending message`, {
-            type: message.type,
-            messageId: message.messageId,
-            error: sendError instanceof Error ? sendError.message : String(sendError)
-          }, MODULE_NAME);
-          throw sendError; // Re-throw for caller to handle
-        }
-      } else {
-        // WebSocket not available or not open
-        syncLogger.warn('Cannot send message, WebSocket not open', {
+      // Get all active WebSocket connections
+      const webSockets = this.ctx.getWebSockets();
+      
+      if (webSockets.length === 0) {
+        syncLogger.warn('No active WebSocket connections', {
           type: message.type,
           messageId: message.messageId,
-          readyState: this.webSocket?.readyState
+          clientId: this.clientId
         }, MODULE_NAME);
-        
-        // For acknowledgments, this is a critical error
-        if (message.type === 'srv_changes_received' || message.type === 'srv_changes_applied') {
-          syncLogger.error(`Failed to send acknowledgment`, {
+        return;
+      }
+      
+      // Log the message we're about to send
+      syncLogger.debug('Sending message', {
+        type: message.type,
+        messageId: message.messageId,
+        clientId: this.clientId,
+        connectionCount: webSockets.length
+      }, MODULE_NAME);
+      
+      // Send to all active connections
+      for (const ws of webSockets) {
+        try {
+          ws.send(JSON.stringify(message));
+          syncLogger.debug('Message sent successfully', {
             type: message.type,
-            messageId: message.messageId
+            messageId: message.messageId,
+            clientId: this.clientId
           }, MODULE_NAME);
-          throw new Error(`Cannot send acknowledgment - WebSocket not open (state: ${this.webSocket?.readyState})`);
+        } catch (sendError) {
+          syncLogger.error('Error sending message to WebSocket', {
+            type: message.type,
+            messageId: message.messageId,
+            clientId: this.clientId,
+            error: sendError instanceof Error ? sendError.message : String(sendError)
+          }, MODULE_NAME);
+          throw sendError;
         }
       }
     } catch (error) {
-      // Catch-all for any other errors
-      syncLogger.error(`Unexpected error in send method: ${error instanceof Error ? error.message : String(error)}`, {
+      syncLogger.error('Unexpected error in send method', {
         type: message.type,
-        error: error instanceof Error ? error.stack : String(error)
+        messageId: message.messageId,
+        clientId: this.clientId,
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
-      throw error; // Re-throw for caller to handle
+      throw error;
     }
   }
   
@@ -861,21 +812,19 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       // Store resolver
       this.waitingResolvers.set(waitId, {
         resolve: (message: any) => {
-          // If there's a filter and the message doesn't match, continue waiting
-          if (filter && !filter(message)) {
-            return;
-          }
-          
+          // Filter is now checked in checkWaitingResolvers
           resolve(message);
         },
         reject,
-        timer
+        timer,
+        filter  // Save the filter function for use in checkWaitingResolvers
       });
       
       syncLogger.debug('Waiting for message', { 
         type,
         waitId,
-        timeout: timeoutMs
+        timeout: timeoutMs,
+        hasFilter: filter !== undefined
       }, MODULE_NAME);
     });
   }

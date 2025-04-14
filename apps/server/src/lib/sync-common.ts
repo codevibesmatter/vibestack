@@ -27,100 +27,220 @@ export function compareLSN(lsn1: string, lsn2: string): number {
 }
 
 /**
- * Deduplicate changes by keeping only the latest change for each record
- * Uses last-write-wins based on updated_at timestamp
- * Also optimizes insert+update sequences into a single insert with latest data
+ * Helper to determine if an update operation changes unique fields
+ * compared to existing updates
+ */
+function hasUniqueFieldChanges(update: TableChange, existingUpdates: TableChange[]): {
+  hasChanges: boolean;
+  fields: string[];
+} {
+  // Extract the fields being changed in this update (excluding metadata fields)
+  const changedFields = Object.keys(update.data).filter(k => 
+    k !== 'id' && k !== 'updated_at' && k !== 'client_id'
+  );
+  
+  const uniqueFields: string[] = [];
+  
+  // Check if any field in this update hasn't been changed in previous updates
+  for (const field of changedFields) {
+    const fieldAlreadyChanged = existingUpdates.some(existing => 
+      Object.keys(existing.data).includes(field)
+    );
+    
+    if (!fieldAlreadyChanged) {
+      uniqueFields.push(field);
+    }
+  }
+  
+  return {
+    hasChanges: uniqueFields.length > 0,
+    fields: uniqueFields
+  };
+}
+
+/**
+ * Parse timestamp string to number for comparison
+ */
+function parseTimestamp(ts: string): number {
+  return new Date(ts).getTime();
+}
+
+/**
+ * Deduplicate changes while preserving important update operations
+ * @param changes Array of changes to deduplicate
+ * @param clientId Optional client ID to filter out own changes
  * @returns Object containing deduplicated changes and info about skipped changes
  */
-export function deduplicateChanges(changes: TableChange[]): {
+export function deduplicateChanges(changes: TableChange[], clientId?: string): {
   changes: TableChange[];
   skipped: {
     missingId: TableChange[];
     outdated: TableChange[];
   };
+  transformations: {
+    count: number;
+    details: Array<{
+      from: string;
+      to: string;
+      entityId: string;
+      table: string;
+      reason: string;
+      timestamp?: string;
+      lsn?: string;
+      originalTs?: string;
+      newTs?: string;
+    }>;
+  };
+  changesByEntity: Record<string, string[]>;
 } {
-  // Process into a map with the latest change for each record id
-  const latestChanges = new Map<string, TableChange>();
-  
-  // Also track which tables+ids have inserts (for optimization)
-  const insertMap = new Map<string, TableChange>();
-  
-  // Track skipped changes for diagnostics
+  const result: TableChange[] = [];
   const skipped = {
     missingId: [] as TableChange[],
-    outdated: [] as TableChange[]
+    outdated: [] as TableChange[],
   };
+  const transformations = {
+    count: 0,
+    details: [] as Array<{
+      from: string;
+      to: string;
+      entityId: string;
+      table: string;
+      reason: string;
+      timestamp?: string;
+      lsn?: string;
+      originalTs?: string;
+      newTs?: string;
+    }>,
+  };
+  const changesByEntity: Record<string, string[]> = {};
 
-  // First pass - find the latest change for each record
+  // Group changes by entity
+  const changesByEntityId = new Map<string, TableChange[]>();
   for (const change of changes) {
-    // Track changes skipped due to missing id
-    if (!change.data?.id) {
+    const entityId = change.data?.id as string | undefined;
+    if (!entityId) {
       skipped.missingId.push(change);
       continue;
     }
 
-    const key = `${change.table}:${change.data.id}`;
-    const existing = latestChanges.get(key);
-    
-    // Keep track of inserts for later optimization
-    if (change.operation === 'insert') {
-      insertMap.set(key, change);
-    }
-    
-    // Keep change if no existing one, or if this one is newer
-    if (!existing || new Date(change.updated_at) >= new Date(existing.updated_at)) {
-      // If we're replacing an existing change, track it as outdated
-      if (existing) {
-        skipped.outdated.push(existing);
-      }
-      latestChanges.set(key, change);
-    } else {
-      // This change is outdated compared to what we already have
-      skipped.outdated.push(change);
-    }
-  }
-  
-  // Second pass - optimize insert+update patterns
-  const result: TableChange[] = [];
-  
-  for (const [key, change] of latestChanges.entries()) {
-    // If this is an update and we previously saw an insert for this record
-    if (change.operation === 'update' && insertMap.has(key)) {
-      const insert = insertMap.get(key)!;
-      
-      // Skip if the insert is already the latest change (no optimization needed)
-      if (insert === change) {
-        result.push(change);
-        continue;
-      }
-      
-      // Create an optimized change that merges the insert and update
-      const optimizedChange: TableChange = {
-        table: change.table,
-        operation: 'insert', // Keep as insert but will use ON CONFLICT in DB
-        data: {
-          ...insert.data, // Base data from insert
-          ...change.data, // Overridden by update data
-          id: change.data.id,
-          client_id: change.data.client_id
-        },
-        updated_at: change.updated_at,
-        lsn: change.lsn // Keep the latest LSN
-      };
-      
-      result.push(optimizedChange);
-    } else {
-      // For all other cases, use the deduplicated change as is
-      result.push(change);
-    }
+    const entityChanges = changesByEntityId.get(entityId) || [];
+    entityChanges.push(change);
+    changesByEntityId.set(entityId, entityChanges);
   }
 
-  // Sort changes by LSN for consistency
-  const orderedChanges = orderChangesByDomain(result.sort((a, b) => compareLSN(a.lsn!, b.lsn!)));
-  
+  // Process each entity's changes
+  for (const [entityId, entityChanges] of changesByEntityId.entries()) {
+    // Sort changes by timestamp (newest first)
+    entityChanges.sort((a, b) => {
+      const aTs = parseTimestamp((a.data?.updated_at || a.data?.created_at || '') as string);
+      const bTs = parseTimestamp((b.data?.updated_at || b.data?.created_at || '') as string);
+      return bTs - aTs;
+    });
+
+    // Track changes for this entity
+    changesByEntity[entityId] = entityChanges.map(c => (c.data?.id || '') as string);
+
+    // First check if there's a delete operation
+    const hasDelete = entityChanges.some(change => change.operation === 'delete');
+    const deleteTimestamp = hasDelete 
+      ? entityChanges.find(change => change.operation === 'delete')?.data?.updated_at 
+      : null;
+
+    let latestChange: TableChange;
+    let latestTimestamp: number;
+
+    // If there's a delete, only keep it and ignore all other operations
+    if (hasDelete && deleteTimestamp) {
+      latestChange = entityChanges.find(change => 
+        change.operation === 'delete' && 
+        change.data?.updated_at === deleteTimestamp
+      )!;
+      
+      // Add all other changes to skipped
+      entityChanges.forEach(change => {
+        if (change.operation !== 'delete' || change.data?.updated_at !== deleteTimestamp) {
+          skipped.outdated.push(change);
+        }
+      });
+    } else {
+      // Original merging logic for non-delete cases
+      latestChange = entityChanges[0];
+      latestTimestamp = parseTimestamp((latestChange.data?.updated_at || latestChange.data?.created_at || '') as string);
+
+      for (let i = 1; i < entityChanges.length; i++) {
+        const currentChange = entityChanges[i];
+        const currentTimestamp = parseTimestamp((currentChange.data?.updated_at || currentChange.data?.created_at || '') as string);
+
+        // Skip outdated changes
+        if (currentTimestamp < latestTimestamp) {
+          skipped.outdated.push(currentChange);
+          continue;
+        }
+
+        // Handle insert + update merge
+        if (latestChange.operation === 'insert' && currentChange.operation === 'update') {
+          latestChange = {
+            ...latestChange,
+            data: {
+              ...latestChange.data,
+              ...currentChange.data,
+            },
+          };
+          transformations.count++;
+          transformations.details.push({
+            from: 'update',
+            to: 'insert',
+            entityId,
+            table: latestChange.table,
+            reason: 'merged_update_into_insert',
+            timestamp: currentChange.data?.updated_at as string | undefined,
+            originalTs: currentChange.data?.updated_at as string | undefined,
+            newTs: latestChange.data?.updated_at as string | undefined,
+          });
+        }
+        // Handle update + update merge
+        else if (latestChange.operation === 'update' && currentChange.operation === 'update') {
+          latestChange = {
+            ...latestChange,
+            data: {
+              ...currentChange.data,
+              ...latestChange.data,
+            },
+          };
+          transformations.count++;
+          transformations.details.push({
+            from: 'update',
+            to: 'update',
+            entityId,
+            table: latestChange.table,
+            reason: 'merged_update',
+            timestamp: currentChange.data?.updated_at as string | undefined,
+            originalTs: currentChange.data?.updated_at as string | undefined,
+            newTs: latestChange.data?.updated_at as string | undefined,
+          });
+        }
+        // For any other combination, keep the latest change
+        else {
+          latestChange = currentChange;
+          latestTimestamp = currentTimestamp;
+        }
+      }
+    }
+
+    // Add the final change to results
+    result.push(latestChange);
+  }
+
+  // Apply client ID filtering - filters out changes from the same client
+  const filteredChanges = clientId
+    ? result.filter(change => change.data?.client_id !== clientId)
+    : result;
+
   return {
-    changes: orderedChanges,
-    skipped
+    changes: filteredChanges,
+    skipped,
+    transformations,
+    changesByEntity,
   };
 }
 
@@ -132,7 +252,14 @@ type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
  * - Deletes: Process children before parents
  */
 export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
-  const ordered = changes.sort((a, b) => {
+  // Log tables before sorting
+  const beforeTablesCount = changes.reduce((acc, change) => {
+    if (change.table) acc.push(change.table);
+    return acc;
+  }, [] as string[]).length;
+  
+  // Create a new copy to sort to avoid modifying the original array
+  const ordered = [...changes].sort((a, b) => {
     // Add quotes to match SERVER_TABLE_HIERARCHY keys
     const aLevel = SERVER_TABLE_HIERARCHY[`"${a.table}"` as TableName] ?? 0;
     const bLevel = SERVER_TABLE_HIERARCHY[`"${b.table}"` as TableName] ?? 0;
@@ -149,6 +276,23 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
     // For creates/updates, follow hierarchy
     return aLevel - bLevel;
   });
+
+  // Log tables after sorting
+  const afterTablesCount = ordered.reduce((acc, change) => {
+    if (change.table) acc.push(change.table);
+    return acc;
+  }, [] as string[]).length;
+  
+  // Log if there's a difference
+  if (beforeTablesCount !== afterTablesCount) {
+    console.error(`TABLE PROPERTY LOST during sort: before=${beforeTablesCount}, after=${afterTablesCount}`);
+    
+    // Examine properties
+    if (changes.length > 0 && ordered.length > 0) {
+      console.log('First change before:', Object.keys(changes[0]));
+      console.log('First change after:', Object.keys(ordered[0]));
+    }
+  }
 
   return ordered;
 } 

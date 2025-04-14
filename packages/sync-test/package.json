@@ -19,6 +19,7 @@
     "test:initial": "tsx src/v2/cli.ts test --scenario initial",
     "test:live": "tsx src/v2/cli.ts test --scenario live-sync",
     "test:catchup": "tsx src/v2/cli.ts test --scenario catchup",
+    "test:client-submit": "tsx src/v2/cli.ts test --scenario client-submit",
     "seed:v1": "tsx src/seed/seed-cli.ts",
     "seed:v1:small": "tsx src/seed/seed-cli.ts -- --size=small --clear=true",
     "seed:v1:medium": "tsx src/seed/seed-cli.ts -- --size=medium --clear=true",

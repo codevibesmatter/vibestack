@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { faker } from '@faker-js/faker';
 import { validate } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
+import { DataSource, Repository } from 'typeorm';
 
 // Import directly from dataforge
 import { 
@@ -22,7 +23,7 @@ import {
   UserRole
 } from '@repo/dataforge/server-entities';
 
-import { EntityType, DEPENDENCY_ORDER } from './entity-adapter.ts';
+import { EntityType, DEPENDENCY_ORDER, getEntityClass } from './entity-adapter.ts';
 import { createLogger } from '../../core/logger.js';
 
 const logger = createLogger('EntityFactories');
@@ -31,6 +32,20 @@ const logger = createLogger('EntityFactories');
 export interface EntityFactoryOptions {
   seed?: number;    // Random seed for deterministic generation
   now?: Date;       // Reference date to use instead of current date
+}
+
+// Options for batch entity creation
+export interface BatchEntityOptions {
+  counts: Record<EntityType, number>;   // Number of entities to create by type
+  batchId?: string;                      // Optional batch ID for tracking
+  dataSource?: DataSource;               // Database connection for finding existing entities
+  preferExistingReferences?: boolean;    // Whether to use existing entities from DB for references
+  distribution?: {                       // Distribution of relationships (0.0-1.0)
+    projectsWithOwners?: number;         // Percentage of projects that should have owners
+    tasksWithProjects?: number;          // Percentage of tasks that should have projects
+    tasksWithAssignees?: number;         // Percentage of tasks that should have assignees
+    commentsOnTasks?: number;            // Percentage of comments that should be on tasks vs projects
+  };
 }
 
 // Set up global options
@@ -150,35 +165,89 @@ export async function createUser(overrides: Partial<User> = {}): Promise<User> {
 }
 
 /**
- * Create a project entity
+ * Create a batch of user entities
+ */
+export async function createUsers(count: number, overrides: Partial<User> = {}): Promise<User[]> {
+  const users: User[] = [];
+  
+  for (let i = 0; i < count; i++) {
+    const user = await createUser(overrides);
+    users.push(user);
+  }
+  
+  return users;
+}
+
+/**
+ * Creates a new Project entity instance with optional overrides.
  */
 export async function createProject(options: { owner?: User } = {}, overrides: Partial<Project> = {}): Promise<Project> {
   const project = new Project();
-  
-  // Set core properties
+
+  // Set base properties first
   project.id = overrides.id || uuidv4();
-  
-  // Generate a unique project name with timestamp that passes validation
-  // (only letters, numbers, spaces, hyphens, underscores, apostrophes, and periods)
-  const uniqueSuffix = Date.now().toString(36).substring(3, 7);
-  const projectName = faker.company.name().replace(/[^a-zA-Z0-9\s\-_'.]/g, '');
-  project.name = overrides.name || `${projectName}-${uniqueSuffix}`;
-  
-  project.description = overrides.description || faker.company.catchPhrase();
-  project.status = overrides.status || faker.helpers.arrayElement(Object.values(ProjectStatus));
-  
-  // Set owner reference
-  project.ownerId = overrides.ownerId || options.owner?.id || uuidv4();
-  
-  // Set timestamps with proper Date objects
   const now = factoryOptions.now || new Date();
   project.createdAt = ensureValidDate(overrides.createdAt) || ensureValidDate(now);
   project.updatedAt = ensureValidDate(overrides.updatedAt) || ensureValidDate(now);
+
+  // Basic Info
+  const baseName = overrides.name || `Test Project`;
+  project.name = `${baseName}_${Date.now().toString().replace(/[^0-9]/g, '')}`.slice(0, 100);
+  project.description = overrides.description || faker.company.catchPhrase();
+  project.status = overrides.status || faker.helpers.arrayElement([
+      ProjectStatus.ACTIVE,
+      ProjectStatus.IN_PROGRESS, 
+      ProjectStatus.COMPLETED, 
+      ProjectStatus.ON_HOLD 
+  ]);
   
-  // Validate the entity before returning
-  await validateEntityOrThrow(project);
+  // Relations - require owner
+  if (!options.owner) {
+      throw new Error('Project creation requires an owner passed in options.');
+  }
+  project.ownerId = options.owner.id;
+  
+  // Other fields
+  project.clientId = overrides.clientId;
+
+  // Validate the generated entity
+  const errors = await validate(project); 
+  if (errors.length > 0) {
+    const errorMessages = errors.map(e => `${e.property}: ${Object.values(e.constraints || {}).join(', ')}`).join('; ');
+    logger.error(`Validation failed: ${errorMessages}`);
+    throw new Error(`Validation failed:\n${errorMessages}`);
+  }
   
   return project;
+}
+
+/**
+ * Create projects with proper owner relationships
+ */
+export async function createProjectsWithOwners(
+  count: number, 
+  owners: User[] | string[],
+  overrides: Partial<Project> = {}
+): Promise<Project[]> {
+  const projects: Project[] = [];
+  
+  if (!owners.length) {
+    throw new Error('Cannot create projects without owners');
+  }
+  
+  for (let i = 0; i < count; i++) {
+    // Distribute owners evenly across projects
+    const ownerIndex = i % owners.length;
+    const owner = owners[ownerIndex];
+    
+    // Get the owner ID, either from User object or directly if it's a string
+    const ownerId = typeof owner === 'string' ? owner : owner.id;
+    
+    const project = await createProject({}, { ...overrides, ownerId });
+    projects.push(project);
+  }
+  
+  return projects;
 }
 
 /**
@@ -197,25 +266,71 @@ export async function createTask(
   task.status = overrides.status || faker.helpers.arrayElement(Object.values(TaskStatus));
   task.priority = overrides.priority || faker.helpers.arrayElement(Object.values(TaskPriority));
   
-  // Set references
+  // Set projectId (required) and assigneeId (optional)
   task.projectId = overrides.projectId || options.project?.id || uuidv4();
-  task.assigneeId = overrides.assigneeId || options.assignee?.id || uuidv4();
-  
-  // Set due date (between now and 30 days from now) as proper Date object
-  const now = factoryOptions.now || new Date();
-  task.dueDate = overrides.dueDate ? ensureValidDate(overrides.dueDate) : faker.date.future({ refDate: now, years: 0.25 });
+  task.assigneeId = overrides.assigneeId || options.assignee?.id || undefined;
   
   // Set timestamps with proper Date objects
+  const now = factoryOptions.now || new Date();
   task.createdAt = ensureValidDate(overrides.createdAt) || ensureValidDate(now);
   task.updatedAt = ensureValidDate(overrides.updatedAt) || ensureValidDate(now);
+  task.dueDate = overrides.dueDate ? ensureValidDate(overrides.dueDate) : undefined;
   
-  // Set tags (optional)
+  // Set tags array (required)
   task.tags = overrides.tags || [faker.word.sample(), faker.word.sample()];
   
   // Validate the entity before returning
   await validateEntityOrThrow(task);
   
   return task;
+}
+
+/**
+ * Create tasks with proper project and assignee relationships
+ */
+export async function createTasksWithRelationships(
+  count: number,
+  options: {
+    projects?: (Project | string)[];
+    assignees?: (User | string)[];
+    assigneeRate?: number; // 0.0-1.0: probability of assigning an assignee
+    projectRate?: number;  // 0.0-1.0: probability of assigning a project
+  },
+  overrides: Partial<Task> = {}
+): Promise<Task[]> {
+  const tasks: Task[] = [];
+  const { projects = [], assignees = [], assigneeRate = 1.0, projectRate = 1.0 } = options;
+  
+  for (let i = 0; i < count; i++) {
+    // Decide whether to use a project from the list or generate a new ID
+    const useProject = projects.length > 0 && (Math.random() < projectRate);
+    
+    // Decide whether to use an assignee
+    const useAssignee = assignees.length > 0 && (Math.random() < assigneeRate);
+    
+    // Get project ID - must have a valid projectId
+    let projectId: string;
+    if (useProject) {
+      const projectIndex = i % projects.length;
+      const project = projects[projectIndex];
+      projectId = typeof project === 'string' ? project : project.id;
+    } else {
+      projectId = uuidv4(); // Generate UUID if no project is assigned
+    }
+    
+    // Get assignee ID if using
+    let assigneeId = undefined;
+    if (useAssignee) {
+      const assigneeIndex = i % assignees.length;
+      const assignee = assignees[assigneeIndex];
+      assigneeId = typeof assignee === 'string' ? assignee : assignee.id;
+    }
+    
+    const task = await createTask({}, { ...overrides, projectId, assigneeId });
+    tasks.push(task);
+  }
+  
+  return tasks;
 }
 
 /**
@@ -231,31 +346,31 @@ export async function createComment(
   comment.id = overrides.id || uuidv4();
   comment.content = overrides.content || faker.lorem.paragraph();
   
-  // Set references
+  // authorId is required
   comment.authorId = overrides.authorId || options.author?.id || uuidv4();
   
-  // Set parent reference if provided
-  if (options.parent || overrides.parentId) {
-    comment.parentId = overrides.parentId || options.parent?.id;
-  }
+  // parentId is optional
+  comment.parentId = overrides.parentId || options.parent?.id || undefined;
   
-  // Set entity reference - determine type and ID
-  if (options.entity) {
+  // Set entity references (both entityId and entityType are required)
+  if (overrides.entityId && overrides.entityType) {
+    comment.entityId = overrides.entityId;
+    comment.entityType = overrides.entityType;
+  } else if (options.entity) {
+    // Check if the entity is a Project or Task and set references accordingly
     if (options.entity instanceof Project) {
+      comment.entityId = options.entity.id;
       comment.entityType = 'project';
-      comment.entityId = options.entity.id;
     } else if (options.entity instanceof Task) {
-      comment.entityType = 'task';
       comment.entityId = options.entity.id;
+      comment.entityType = 'task';
+    } else {
+      throw new Error('Invalid entity type for comment');
     }
   } else {
-    comment.entityType = overrides.entityType || faker.helpers.arrayElement(['project', 'task']);
-    comment.entityId = overrides.entityId || uuidv4();
-  }
-  
-  // Set optional client ID
-  if (overrides.clientId || Math.random() > 0.8) {
-    comment.clientId = overrides.clientId || uuidv4();
+    // If no entity reference is provided, create a dummy one
+    comment.entityId = uuidv4();
+    comment.entityType = faker.helpers.arrayElement(['project', 'task']);
   }
   
   // Set timestamps with proper Date objects
@@ -270,7 +385,87 @@ export async function createComment(
 }
 
 /**
- * Create multiple entities of a single type
+ * Create comments with proper author and entity relationships
+ */
+export async function createCommentsWithRelationships(
+  count: number,
+  options: {
+    authors?: (User | string)[];
+    entities?: { id: string, type: 'task' | 'project' }[];
+    parentComments?: (Comment | string)[];
+    parentRate?: number; // 0.0-1.0: probability of using a parent comment
+    taskRate?: number;   // 0.0-1.0: probability of commenting on a task vs project
+  },
+  overrides: Partial<Comment> = {}
+): Promise<Comment[]> {
+  const comments: Comment[] = [];
+  const { 
+    authors = [], 
+    entities = [], 
+    parentComments = [], 
+    parentRate = 0.1, 
+    taskRate = 0.5 
+  } = options;
+  
+  if (!authors.length || !entities.length) {
+    throw new Error('Cannot create comments without authors and entities');
+  }
+  
+  // Split entities into tasks and projects
+  const tasks = entities.filter(e => e.type === 'task');
+  const projects = entities.filter(e => e.type === 'project');
+  
+  for (let i = 0; i < count; i++) {
+    // Get author
+    const authorIndex = i % authors.length;
+    const author = authors[authorIndex];
+    const authorId = typeof author === 'string' ? author : author.id;
+    
+    // Decide whether to use a parent comment
+    const useParent = parentComments.length > 0 && (Math.random() < parentRate);
+    
+    // Get parent ID if using
+    let parentId = undefined;
+    if (useParent) {
+      const parentIndex = i % parentComments.length;
+      const parent = parentComments[parentIndex];
+      parentId = typeof parent === 'string' ? parent : parent.id;
+    }
+    
+    // Decide whether to comment on a task or project
+    let entityId, entityType;
+    const useTask = (tasks.length > 0) && 
+                   (projects.length === 0 || Math.random() < taskRate);
+    
+    if (useTask && tasks.length > 0) {
+      const taskIndex = i % tasks.length;
+      entityId = tasks[taskIndex].id;
+      entityType = 'task';
+    } else if (projects.length > 0) {
+      const projectIndex = i % projects.length;
+      entityId = projects[projectIndex].id;
+      entityType = 'project';
+    } else {
+      // Skip if no valid entity
+      continue;
+    }
+    
+    const comment = await createComment({}, { 
+      ...overrides, 
+      authorId, 
+      parentId,
+      entityId,
+      entityType
+    });
+    
+    comments.push(comment);
+  }
+  
+  return comments;
+}
+
+/**
+ * Create a batch of entities of the specified type
  */
 export async function createEntities<T extends EntityType>(
   entityType: T,
@@ -278,100 +473,197 @@ export async function createEntities<T extends EntityType>(
   options: Record<string, any> = {},
   overrides: Partial<any> = {}
 ): Promise<any[]> {
-  const factories = {
-    user: createUser,
-    project: createProject,
-    task: createTask,
-    comment: createComment
-  };
-  
-  const factory = factories[entityType];
-  const entities = [];
-  
-  for (let i = 0; i < count; i++) {
-    entities.push(await factory(options, overrides));
+  if (count <= 0) {
+    return [];
   }
   
-  return entities;
+  // Use the appropriate factory function based on entity type
+  switch (entityType) {
+    case 'user':
+      return createUsers(count, overrides);
+    case 'project':
+      return options.owners 
+        ? createProjectsWithOwners(count, options.owners, overrides)
+        : Promise.all(Array(count).fill(0).map(() => createProject(options, overrides)));
+    case 'task':
+      return options.projects || options.assignees
+        ? createTasksWithRelationships(count, options, overrides)
+        : Promise.all(Array(count).fill(0).map(() => createTask(options, overrides)));
+    case 'comment':
+      return options.authors && (options.entities || (options.tasks && options.projects))
+        ? createCommentsWithRelationships(count, options, overrides)
+        : Promise.all(Array(count).fill(0).map(() => createComment(options, overrides)));
+    default:
+      throw new Error(`Unsupported entity type: ${entityType}`);
+  }
 }
 
 /**
- * Create a complete entity graph with dependencies
+ * Fetch existing entities from database to use as references
  */
-export async function createEntityGraph(entityCounts: Partial<Record<EntityType, number>> = {}): Promise<Record<EntityType, any[]>> {
-  const entities: Record<EntityType, any[]> = {
+export async function fetchEntityReferences(
+  dataSource: DataSource,
+  options: {
+    userCount?: number;
+    projectCount?: number;
+    taskCount?: number;
+    commentCount?: number;
+  } = {}
+): Promise<Record<EntityType, any[]>> {
+  const {
+    userCount = 100,
+    projectCount = 100,
+    taskCount = 100,
+    commentCount = 50
+  } = options;
+  
+  const result: Record<EntityType, any[]> = {
     user: [],
     project: [],
     task: [],
     comment: []
   };
   
-  // Create entities in dependency order
-  for (const entityType of DEPENDENCY_ORDER) {
-    const count = entityCounts[entityType] || 0;
-    if (count <= 0) continue;
+  try {
+    // Fetch users
+    const userRepo = dataSource.getRepository(getEntityClass('user'));
+    result.user = await userRepo.find({ 
+      select: ['id'],
+      take: userCount,
+      order: { createdAt: 'DESC' }
+    });
     
-    if (entityType === 'user') {
-      entities.user = await createEntities('user', count);
-    } 
-    else if (entityType === 'project') {
-      // Create projects with random user owners
-      for (let i = 0; i < count; i++) {
-        const randomUser = entities.user.length > 0 
-          ? faker.helpers.arrayElement(entities.user) 
-          : undefined;
-        
-        const project = await createProject({ owner: randomUser });
-        entities.project.push(project);
-      }
+    // Fetch projects
+    const projectRepo = dataSource.getRepository(getEntityClass('project'));
+    result.project = await projectRepo.find({ 
+      select: ['id'],
+      take: projectCount,
+      order: { createdAt: 'DESC' }
+    });
+    
+    // Fetch tasks
+    const taskRepo = dataSource.getRepository(getEntityClass('task'));
+    result.task = await taskRepo.find({ 
+      select: ['id'],
+      take: taskCount,
+      order: { createdAt: 'DESC' }
+    });
+    
+    // Fetch comments
+    const commentRepo = dataSource.getRepository(getEntityClass('comment'));
+    result.comment = await commentRepo.find({ 
+      select: ['id'],
+      take: commentCount,
+      order: { createdAt: 'DESC' }
+    });
+    
+    return result;
+  } catch (error) {
+    logger.error(`Error fetching entity references: ${error}`);
+    return result;
+  }
+}
+
+/**
+ * Create entities with proper relationships in a single batch operation
+ * This is the main entry point for batch entity creation
+ */
+export async function createEntitiesWithRelationships(
+  options: BatchEntityOptions
+): Promise<Record<EntityType, any[]>> {
+  const result: Record<EntityType, any[]> = {
+    user: [],
+    project: [],
+    task: [],
+    comment: []
+  };
+  
+  const { 
+    counts, 
+    dataSource, 
+    preferExistingReferences = false,
+    distribution = {
+      projectsWithOwners: 1.0,
+      tasksWithProjects: 0.8,
+      tasksWithAssignees: 0.7,
+      commentsOnTasks: 0.6
     }
-    else if (entityType === 'task') {
-      // Create tasks with random projects and assignees
-      for (let i = 0; i < count; i++) {
-        const randomProject = entities.project.length > 0 
-          ? faker.helpers.arrayElement(entities.project) 
-          : undefined;
-          
-        const randomUser = entities.user.length > 0 
-          ? faker.helpers.arrayElement(entities.user) 
-          : undefined;
-        
-        const task = await createTask({ project: randomProject, assignee: randomUser });
-        entities.task.push(task);
-      }
-    }
-    else if (entityType === 'comment') {
-      // Create comments with random authors and entities
-      for (let i = 0; i < count; i++) {
-        const randomUser = entities.user.length > 0 
-          ? faker.helpers.arrayElement(entities.user) 
-          : undefined;
-          
-        // Choose between task and project for entity
-        const entityChoice = faker.helpers.arrayElement(['task', 'project']) as 'task' | 'project';
-        
-        // Get a random entity of the chosen type
-        let randomEntity: Project | Task | undefined;
-        if (entityChoice === 'project' && entities.project.length > 0) {
-          randomEntity = faker.helpers.arrayElement(entities.project) as Project;
-        } else if (entityChoice === 'task' && entities.task.length > 0) {
-          randomEntity = faker.helpers.arrayElement(entities.task) as Task;
-        }
-          
-        // 20% chance of having a parent comment
-        const randomParent = entities.comment.length > 0 && Math.random() > 0.8
-          ? faker.helpers.arrayElement(entities.comment)
-          : undefined;
-        
-        const comment = await createComment({ 
-          author: randomUser, 
-          entity: randomEntity, 
-          parent: randomParent 
-        });
-        entities.comment.push(comment);
-      }
+  } = options;
+  
+  // Step 1: Fetch existing entities if requested and dataSource provided
+  let existingEntities: Record<EntityType, any[]> = {
+    user: [],
+    project: [],
+    task: [],
+    comment: []
+  };
+  
+  if (preferExistingReferences && dataSource) {
+    existingEntities = await fetchEntityReferences(dataSource);
+    logger.info(`Found ${existingEntities.user.length} users, ${existingEntities.project.length} projects, ${existingEntities.task.length} tasks, and ${existingEntities.comment.length} comments for entity references`);
+  }
+  
+  // Step 2: Create entities in dependency order to establish proper relationships
+  
+  // Create users first (no dependencies)
+  if (counts.user > 0) {
+    logger.info(`Creating ${counts.user} users`);
+    result.user = await createUsers(counts.user);
+  }
+  
+  // Create projects with owners
+  if (counts.project > 0) {
+    const allUsers = [...result.user, ...existingEntities.user];
+    if (allUsers.length > 0) {
+      logger.info(`Creating ${counts.project} projects with owners`);
+      result.project = await createProjectsWithOwners(counts.project, allUsers);
+    } else {
+      logger.warn(`Skipping ${counts.project} project creations - no users available`);
     }
   }
   
-  return entities;
+  // Create tasks with projects and assignees
+  if (counts.task > 0) {
+    const allProjects = [...result.project, ...existingEntities.project];
+    const allUsers = [...result.user, ...existingEntities.user];
+    
+    if (allProjects.length > 0 || allUsers.length > 0) {
+      logger.info(`Creating ${counts.task} tasks with relationships`);
+      result.task = await createTasksWithRelationships(counts.task, {
+        projects: allProjects,
+        assignees: allUsers,
+        projectRate: distribution.tasksWithProjects || 0.8,
+        assigneeRate: distribution.tasksWithAssignees || 0.7
+      });
+    } else {
+      logger.warn(`Skipping ${counts.task} task creations - no projects or users available`);
+    }
+  }
+  
+  // Create comments with authors and entities
+  if (counts.comment > 0) {
+    const allUsers = [...result.user, ...existingEntities.user];
+    
+    // Prepare entities for comments
+    const commentEntities = [
+      ...result.task.map(t => ({ id: t.id, type: 'task' as const })),
+      ...result.project.map(p => ({ id: p.id, type: 'project' as const })),
+      ...existingEntities.task.map(t => ({ id: t.id, type: 'task' as const })),
+      ...existingEntities.project.map(p => ({ id: p.id, type: 'project' as const }))
+    ];
+    
+    if (allUsers.length > 0 && commentEntities.length > 0) {
+      logger.info(`Creating ${counts.comment} comments with relationships`);
+      result.comment = await createCommentsWithRelationships(counts.comment, {
+        authors: allUsers,
+        entities: commentEntities,
+        taskRate: distribution.commentsOnTasks || 0.6
+      });
+    } else {
+      logger.warn(`Skipping ${counts.comment} comment creations - no authors or entities available`);
+    }
+  }
+  
+  // Return all created entities
+  return result;
 } 

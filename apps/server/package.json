@@ -13,7 +13,9 @@
   },
   "scripts": {
     "build": "tsc --noEmit && wrangler deploy --outdir=dist",
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --var LOG_LEVEL:info",
+    "dev:debug": "wrangler dev --var LOG_LEVEL:debug",
+    "dev:info": "wrangler dev --var LOG_LEVEL:info",
     "deploy": "wrangler deploy",
     "lint": "eslint",
     "format": "prettier --write .",
