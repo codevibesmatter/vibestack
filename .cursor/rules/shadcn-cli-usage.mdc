@@ -1,0 +1,22 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Shadcn UI CLI Usage
+
+This project uses Shadcn UI. To add new components:
+
+1.  **Navigate to the correct directory:** The CLI must be run from the specific app directory, e.g., `apps/shadadmin`.
+    ```bash
+    cd apps/shadadmin
+    ```
+2.  **Run the CLI command:** Use the `npx shadcn@latest add` command followed by the component name(s).
+    ```bash
+    npx shadcn@latest add [component-name]
+    ```
+    (Replace `[component-name]` with the actual component, e.g., `accordion`, `dialog`, etc.)
+
+3.  **Component Location:** The command will add the component source file directly into the `[src/components/ui](mdc:apps/shadadmin/src/components/ui)` directory within the app.
+
+4.  **Configuration:** The CLI relies on a `components.json` file within the app's directory (e.g., `[apps/shadadmin/components.json](mdc:apps/shadadmin/components.json)`). If it doesn't exist, the CLI might prompt to create it.

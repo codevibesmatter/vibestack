@@ -32,9 +32,9 @@ export class ClientMigration {
   migrationName!: string;
 
   @Column({ type: 'text', name: 'schema_version' })
-  @Matches(/^\d+\.\d+\.\d+$/)
+  @Matches(/^\d+$/)
   @Index()
-  schemaVersion!: string;  // Semver of schema after this migration
+  schemaVersion!: string;  // Sequential integer version
 
   @Column({ type: 'text', array: true, default: [] })
   @IsString({ each: true })

@@ -1,0 +1,54 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Adding New Features and Pages (apps/shadadmin)
+
+This document outlines the conventions for adding new features and pages to the `shadadmin` application, primarily using TanStack Router's file-based routing.
+
+## 1. Feature Implementation
+
+*   **Location:** All logic, components (specific to the feature), data fetching, etc., for a new feature should reside within the `[features](mdc:apps/shadadmin/src/features)` directory.
+*   **Structure:** Create a dedicated subdirectory for your feature, e.g., `[features/my-new-feature](mdc:apps/shadadmin/src/features/)`.
+*   **Page Components:** The main React component(s) that render the UI for a specific page or view within the feature should live directly inside the feature directory. Examples:
+    *   `[features/dashboard/index.tsx](mdc:apps/shadadmin/src/features/dashboard/index.tsx)` (for the main dashboard page)
+    *   `[features/debug/DatabasePage.tsx](mdc:apps/shadadmin/src/features/debug/DatabasePage.tsx)`
+    *   `[features/debug/SyncPage.tsx](mdc:apps/shadadmin/src/features/debug/SyncPage.tsx)`
+*   **Feature-Specific Components:** Sub-components used only within this feature can be placed in a `components` subdirectory, e.g., `[features/my-new-feature/components/](mdc:apps/shadadmin/src/features/)`.
+*   **Reusable UI Components:** Truly reusable UI elements (Buttons, Cards, etc.) belong in `[components/ui](mdc:apps/shadadmin/src/components/ui)`. Use the Shadcn CLI to add standard components (see `[shadcn-cli-usage.mdc](mdc:.cursor/rules/shadcn-cli-usage.mdc)`).
+
+## 2. Routing Setup
+
+The application uses file-based routing via TanStack Router, configured in the `[routes](mdc:apps/shadadmin/src/routes)` directory.
+
+*   **Root Layout:** The absolute root layout (providers, devtools, base Outlet) is defined in `[routes/__root.tsx](mdc:apps/shadadmin/src/routes/__root.tsx)`.
+
+*   **Authenticated Layout:** Most application pages require authentication and the standard sidebar layout. These routes should be placed inside the `[routes/_authenticated/](mdc:apps/shadadmin/src/routes/_authenticated/)` directory.
+    *   The layout itself (including `AppSidebar`, `SidebarProvider`) is defined in `[routes/_authenticated/route.tsx](mdc:apps/shadadmin/src/routes/_authenticated/route.tsx)`. This file uses `createFileRoute('/_authenticated')`.
+    *   The `_authenticated` directory acts as a **layout route**, adding `/` to the path and applying the layout to all nested routes.
+
+*   **Feature Root/Segment Routes:** If a feature has multiple sub-pages (like Settings or Debug), create a subdirectory within `_authenticated` (e.g., `[routes/_authenticated/debug/](mdc:apps/shadadmin/src/routes/_authenticated/debug/)`).
+    *   Inside this directory, create a `[route.tsx](mdc:apps/shadadmin/src/routes/_authenticated/debug/route.tsx)` file.
+    *   This `route.tsx` defines the feature's path segment (e.g., `createFileRoute('/_authenticated/debug')`) and typically renders an `<Outlet />` for child routes. It can also render a shared layout component for the feature if needed (see `[routes/_authenticated/settings/route.tsx](mdc:apps/shadadmin/src/routes/_authenticated/settings/route.tsx)` which renders the main `Settings` component).
+
+*   **Individual Page Routes:** Define specific page routes as `.tsx` files within their respective parent directory (e.g., `[routes/_authenticated/index.tsx](mdc:apps/shadadmin/src/routes/_authenticated/index.tsx)` for the dashboard, `[routes/_authenticated/debug/database.tsx](mdc:apps/shadadmin/src/routes/_authenticated/debug/database.tsx)` for the database debug page).
+    *   These files use `createFileRoute` with the **full path ID** (e.g., `createFileRoute('/_authenticated/debug/database')`).
+    *   They import and render the corresponding **page component** from the `features` directory (e.g., `component: DatabasePage`).
+
+*   **Other Route Groups (`()`):** Parenthesized directories like `[(auth)](mdc:apps/shadadmin/src/routes/(auth)/)` group routes without adding path segments and handle layout differently (they don't contain a `route.tsx` layout file).
+
+## 3. Adding Navigation
+
+*   To add a link to a new page in the main sidebar, edit the `navGroups` array in `[components/layout/data/sidebar-data.ts](mdc:apps/shadadmin/src/components/layout/data/sidebar-data.ts)`.
+*   Ensure the `url` property matches the **full path** defined in the route file.
+
+## Summary Workflow (New Feature Page under Auth Layout)
+
+1.  Implement feature logic/components in `src/features/my-feature/`.
+2.  Create the page component, e.g., `src/features/my-feature/MyPage.tsx`.
+3.  If it's a new top-level feature area, create `src/routes/_authenticated/my-feature/`.
+4.  Add `src/routes/_authenticated/my-feature/route.tsx` defining the layout/outlet via `createFileRoute('/_authenticated/my-feature')`.
+5.  Add the specific page route file, e.g., `src/routes/_authenticated/my-feature/my-page.tsx`, defining the route `createFileRoute('/_authenticated/my-feature/my-page')` and linking to the component from step 2.
+6.  Add a link to `sidebar-data.ts` pointing to `/my-feature/my-page`.
+7.  Run `npm run dev` (or similar) to regenerate the route tree (`[routeTree.gen.ts](mdc:apps/shadadmin/src/routeTree.gen.ts)`) and verify.

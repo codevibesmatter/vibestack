@@ -61,6 +61,7 @@ export interface WebSocketHandler {
     filter?: (msg: any) => boolean, 
     timeoutMs?: number
   ): Promise<any>;
+  notifyClientChangesComplete?(messageId: string): Promise<void>;
 }
 
 /**

@@ -1,327 +1,258 @@
-import { PGlite } from '@electric-sql/pglite';
-import { PGliteWorker } from '@electric-sql/pglite/worker';
-import { db, getDatabase } from './core';
-import { ensureDB } from './types';
-import { config } from '../config';
+/**
+ * Database Storage Utilities
+ * 
+ * This file provides utility functions for database operations.
+ */
+
+import { getDatabase, clearDatabaseStorage, Results } from './db';
 
 /**
- * Clear all data from tables
- * @param database The database instance to clear
- * @private Internal function used by loadServerData
+ * Reset the database by clearing all data
  */
-export const clearAllData = async (database?: PGlite | PGliteWorker): Promise<void> => {
-  // Use ensureDB to handle null case and provide proper typing
-  const dbInstance = database || ensureDB(db);
-  
+export async function resetDatabase(): Promise<boolean> {
   try {
-    console.log('🔄 Clearing all data from tables...');
-    
-    // Get all table names
-    const result = await dbInstance.query<{ tablename: string }>(`
-      SELECT tablename 
-      FROM pg_tables 
-      WHERE schemaname = 'public'
-      ORDER BY tablename;
-    `);
-
-    if (result.rows.length === 0) {
-      console.log('ℹ️ No tables found to clear');
-      return;
-    }
-
-    // Start a transaction
-    await dbInstance.exec('BEGIN');
-
-    try {
-      // Disable foreign key checks temporarily
-      await dbInstance.exec('SET CONSTRAINTS ALL DEFERRED;');
-
-      // First attempt: Try to truncate all tables with CASCADE
-      for (const { tablename } of result.rows) {
-        try {
-          await dbInstance.exec(`TRUNCATE TABLE "${tablename}" CASCADE;`);
-          console.log(`✅ Truncated table: ${tablename}`);
-        } catch (err) {
-          console.warn(`⚠️ Could not truncate ${tablename}, will try DELETE: ${err}`);
-        }
-      }
-
-      // Second attempt: For any tables that couldn't be truncated, use DELETE
-      for (const { tablename } of result.rows) {
-        try {
-          // Check if table still has data
-          const countResult = await dbInstance.query<{ count: number }>(`
-            SELECT COUNT(*) as count FROM "${tablename}";
-          `);
-          
-          if (countResult.rows[0]?.count > 0) {
-            console.log(`🔄 Table ${tablename} still has ${countResult.rows[0].count} rows, using DELETE`);
-            await dbInstance.exec(`DELETE FROM "${tablename}";`);
-            console.log(`✅ Deleted all rows from table: ${tablename}`);
-          }
-        } catch (err) {
-          console.error(`❌ Failed to clear table ${tablename}: ${err}`);
-        }
-      }
-
-      // Re-enable foreign key checks
-      await dbInstance.exec('SET CONSTRAINTS ALL IMMEDIATE;');
-
-      // Commit the transaction
-      await dbInstance.exec('COMMIT');
-      console.log('✅ All data cleared successfully');
-    } catch (error) {
-      // Rollback on error
-      console.error('❌ Error during data clearing, rolling back:', error);
-      await dbInstance.exec('ROLLBACK');
-      throw error;
-    }
+    console.log('Resetting database...');
+    const result = await clearDatabaseStorage();
+    console.log('Database reset result:', result);
+    return result;
   } catch (error) {
-    console.error('❌ Error clearing data:', error);
-    throw error;
+    console.error('Error resetting database:', error);
+    return false;
   }
-};
+}
 
 /**
- * Reset the database by loading data from the server
- * @returns The database instance
+ * Alternative name for resetDatabase
  */
-export const resetDatabase = async (): Promise<PGliteWorker> => {
-  // Get the database instance, initializing it if necessary
-  const database = await getDatabase(true);
-  
-  // Load data from server (which includes clearing existing data)
-  await loadServerData(database);
-  
-  return database;
-};
+export const resetDB = resetDatabase;
 
 /**
  * Get database statistics
- * @returns Database statistics
  */
-export const getDatabaseStats = async (): Promise<{
-  tableCount: number;
-  totalRows: number;
-  tableStats: Array<{ table: string; rowCount: number }>;
-}> => {
-  const database = await getDatabase();
-  
+export async function getDatabaseStats(): Promise<Record<string, number>> {
   try {
-    // Get table names
-    const tablesResult = await database.query<{ tablename: string }>(`
-      SELECT tablename 
-      FROM pg_tables 
-      WHERE schemaname = 'public'
-      ORDER BY tablename;
-    `);
+    const db = await getDatabase();
     
-    const tableStats = [];
-    let totalRows = 0;
-    
-    // Get row count for each table
-    for (const { tablename } of tablesResult.rows) {
-      const countResult = await database.query<{ count: number }>(`
-        SELECT COUNT(*) as count FROM "${tablename}";
-      `);
-      
-      const rowCount = countResult.rows[0]?.count || 0;
-      totalRows += rowCount;
-      
-      tableStats.push({
-        table: tablename,
-        rowCount
-      });
-    }
+    // Get table counts
+    const userCount = await getTableCount(db, 'users');
+    const projectCount = await getTableCount(db, 'projects');
+    const taskCount = await getTableCount(db, 'tasks');
+    const commentCount = await getTableCount(db, 'comments');
     
     return {
-      tableCount: tablesResult.rows.length,
-      totalRows,
-      tableStats
+      users: userCount,
+      projects: projectCount,
+      tasks: taskCount,
+      comments: commentCount,
+      total: userCount + projectCount + taskCount + commentCount
     };
   } catch (error) {
-    console.error('❌ Error getting database stats:', error);
-    throw error;
+    console.error('Error getting database stats:', error);
+    return {
+      users: 0,
+      projects: 0,
+      tasks: 0,
+      comments: 0,
+      total: 0
+    };
   }
-};
+}
 
 /**
- * Load data from the server API and insert it into the local database
- * @param database The database instance to load data into
- * @returns Result of the operation
+ * Helper to get count of records in a table
  */
-export const loadServerData = async (database?: PGlite | PGliteWorker): Promise<{ 
-  success: boolean; 
-  error?: string;
-}> => {
-  // Use ensureDB to handle null case and provide proper typing
-  const dbInstance = database || ensureDB(db);
-  
+async function getTableCount(db: any, tableName: string): Promise<number> {
   try {
-    console.log('🔄 Loading data from server...');
-    
-    // Fetch data from server API
-    const response = await fetch(`${config.apiUrl}/api/db/data`, {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json',
-      },
-      mode: 'cors',
-      credentials: 'same-origin',
-    });
+    const result = await db.query(`SELECT COUNT(*) as count FROM ${tableName}`);
+    // Handle PGlite results type properly
+    const resultArray = result as unknown as Array<{count: number}>;
+    return resultArray[0]?.count || 0;
+  } catch (error) {
+    console.error(`Error getting count for ${tableName}:`, error);
+    return 0;
+  }
+}
+
+/**
+ * Load data from server
+ */
+export async function loadServerData(endpoint: string): Promise<any> {
+  try {
+    console.log(`Loading data from server: ${endpoint}`);
+    const response = await fetch(`/api/${endpoint}`);
     
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Server returned ${response.status}: ${errorText}`);
+      throw new Error(`Server returned ${response.status}: ${response.statusText}`);
     }
     
     const data = await response.json();
-    
-    if (!data.success) {
-      throw new Error(data.error?.message || 'Failed to fetch data from server');
-    }
-    
-    // Begin transaction
-    await dbInstance.exec('BEGIN');
-    
-    try {
-      // Clear existing data first
-      await clearAllData(dbInstance);
-      
-      // Insert data for each table
-      for (const tableData of data.data) {
-        const { tableName, rows } = tableData;
-        
-        if (!rows || rows.length === 0) {
-          console.log(`ℹ️ No data to insert for table ${tableName}`);
-          continue;
-        }
-        
-        console.log(`🔄 Inserting ${rows.length} rows into ${tableName}...`);
-        
-        // Get column names from the first row
-        const columns = Object.keys(rows[0]);
-        
-        // Insert each row
-        for (const row of rows) {
-          const columnList = columns.join('", "');
-          const placeholders = columns.map((_, i) => `$${i + 1}`).join(', ');
-          const values = columns.map(col => row[col]);
-          
-          await dbInstance.query(
-            `INSERT INTO "${tableName}" ("${columnList}") VALUES (${placeholders})`,
-            values
-          );
-        }
-      }
-      
-      // Commit transaction
-      await dbInstance.exec('COMMIT');
-      console.log('✅ Server data loaded successfully');
-      
-      return { success: true };
-    } catch (error) {
-      // Rollback transaction on error
-      await dbInstance.exec('ROLLBACK');
-      throw error;
-    }
+    return data;
   } catch (error) {
-    console.error('❌ Error loading server data:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error loading server data'
-    };
-  }
-};
-
-/**
- * Drop all tables and enum types in the database
- * @param database The database instance
- * @returns Promise that resolves when all tables and enums are dropped
- */
-export const dropAllTables = async (database?: PGlite | PGliteWorker): Promise<void> => {
-  // Use ensureDB to handle null case and provide proper typing
-  const dbInstance = database || ensureDB(db);
-  
-  try {
-    console.log('🔄 Dropping all tables and enum types from database...');
-    
-    // Get all table names
-    const tableResult = await dbInstance.query<{ tablename: string }>(`
-      SELECT tablename 
-      FROM pg_tables 
-      WHERE schemaname = 'public'
-      ORDER BY tablename;
-    `);
-
-    // Get all enum types
-    const enumResult = await dbInstance.query<{ typname: string }>(`
-      SELECT t.typname
-      FROM pg_type t 
-      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-      WHERE t.typtype = 'e' AND n.nspname = 'public';
-    `);
-
-    if (tableResult.rows.length === 0 && enumResult.rows.length === 0) {
-      console.log('ℹ️ No tables or enum types found to drop');
-      return;
-    }
-
-    // Start a transaction
-    await dbInstance.exec('BEGIN');
-
-    try {
-      // Disable foreign key checks temporarily
-      await dbInstance.exec('SET CONSTRAINTS ALL DEFERRED;');
-
-      // Drop all tables with CASCADE
-      for (const { tablename } of tableResult.rows) {
-        try {
-          await dbInstance.exec(`DROP TABLE IF EXISTS "${tablename}" CASCADE;`);
-          console.log(`✅ Dropped table: ${tablename}`);
-        } catch (err) {
-          console.error(`❌ Failed to drop table ${tablename}: ${err}`);
-          // Continue with other tables instead of throwing
-          console.log(`⚠️ Continuing with other tables...`);
-        }
-      }
-
-      // Drop all enum types
-      // We need to do this after tables because tables might use these enum types
-      if (enumResult.rows.length > 0) {
-        console.log('🔄 Dropping enum types...');
-        for (const { typname } of enumResult.rows) {
-          try {
-            // Drop the enum type
-            await dbInstance.exec(`DROP TYPE IF EXISTS "${typname}" CASCADE;`);
-            console.log(`✅ Dropped enum type: ${typname}`);
-          } catch (err) {
-            console.error(`❌ Failed to drop enum type ${typname}: ${err}`);
-            // Continue with other enums instead of throwing
-            console.log(`⚠️ Continuing with other enum types...`);
-          }
-        }
-      } else {
-        console.log('ℹ️ No enum types found to drop');
-      }
-
-      // Commit the transaction
-      await dbInstance.exec('COMMIT');
-      console.log('✅ All tables and enum types dropped successfully');
-    } catch (error) {
-      // Rollback on error
-      console.error('❌ Error during database cleanup, rolling back:', error);
-      await dbInstance.exec('ROLLBACK');
-      throw error;
-    }
-  } catch (error) {
-    console.error('❌ Error dropping database objects:', error);
+    console.error('Error loading server data:', error);
     throw error;
   }
-};
+}
 
 /**
- * Alias for resetDatabase to maintain backward compatibility
- * @returns The database instance
+ * Clear all data from the database
  */
-export const resetDB = resetDatabase; 
+export async function clearAllData(): Promise<boolean> {
+  try {
+    console.log('Clearing all data...');
+    const db = await getDatabase();
+    
+    // Delete all data from tables in reverse order of relationships
+    await db.query('DELETE FROM comments');
+    await db.query('DELETE FROM tasks');
+    await db.query('DELETE FROM projects');
+    await db.query('DELETE FROM users');
+    await db.query('DELETE FROM sync_metadata');
+    
+    console.log('All data cleared successfully');
+    return true;
+  } catch (error) {
+    console.error('Error clearing data:', error);
+    return false;
+  }
+}
+
+/**
+ * Drop all tables and types for a clean database state
+ */
+export async function dropAllTables(): Promise<boolean> {
+  try {
+    console.log('Dropping all tables and types with CASCADE...');
+    const db = await getDatabase();
+
+    // First, try to get all tables from the database
+    try {
+      console.log('Fetching all existing tables...');
+      const tableResult = await db.query<{tablename: string}>(`
+        SELECT tablename FROM pg_tables 
+        WHERE schemaname = 'public'
+      `);
+      
+      if (tableResult.rows.length > 0) {
+        console.log(`Found ${tableResult.rows.length} tables to drop`);
+        
+        // Drop all tables found in the database
+        for (const row of tableResult.rows) {
+          try {
+            await db.query(`DROP TABLE IF EXISTS "${row.tablename}" CASCADE`);
+            console.log(`Dropped table: ${row.tablename}`);
+          } catch (dropError) {
+            console.warn(`Warning: Could not drop table ${row.tablename}:`, dropError);
+          }
+        }
+      }
+    } catch (tableError) {
+      console.warn('Error fetching tables:', tableError);
+    }
+
+    // Then, try to get all custom types from the database
+    try {
+      console.log('Fetching all existing enum types...');
+      const typeResult = await db.query<{typname: string}>(`
+        SELECT typname FROM pg_type 
+        JOIN pg_catalog.pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+        WHERE typtype = 'e' AND nspname = 'public'
+      `);
+      
+      if (typeResult.rows.length > 0) {
+        console.log(`Found ${typeResult.rows.length} enum types to drop`);
+        
+        // Drop all types found in the database
+        for (const row of typeResult.rows) {
+          try {
+            await db.query(`DROP TYPE IF EXISTS "public"."${row.typname}" CASCADE`);
+            console.log(`Dropped enum type: ${row.typname}`);
+          } catch (dropError) {
+            console.warn(`Warning: Could not drop type ${row.typname}:`, dropError);
+          }
+        }
+      }
+    } catch (typeError) {
+      console.warn('Error fetching enum types:', typeError);
+    }
+
+    // As a fallback, manually drop known tables in reverse order of dependencies
+    const knownTables = [
+      'comments',
+      'task_dependencies',
+      'tasks',
+      'project_members',  // Added project_members table that was missing before
+      'projects',
+      'users',
+      'sync_metadata',
+      'schema_version',
+      'client_migration_status',
+      'local_changes',
+      'items'
+    ];
+
+    console.log('Dropping known tables as fallback...');
+    for (const table of knownTables) {
+      try {
+        await db.query(`DROP TABLE IF EXISTS "${table}" CASCADE`);
+      } catch (error) {
+        console.warn(`Warning: Could not drop table ${table}:`, error);
+      }
+    }
+
+    // As a fallback, manually drop known types
+    const knownTypes = [
+      'client_migration_status_status_enum',
+      'tasks_status_enum',
+      'tasks_priority_enum',
+      'users_role_enum',
+      'projects_status_enum'
+    ];
+
+    console.log('Dropping known enum types as fallback...');
+    for (const type of knownTypes) {
+      try {
+        await db.query(`DROP TYPE IF EXISTS "public"."${type}" CASCADE`);
+      } catch (error) {
+        console.warn(`Warning: Could not drop type ${type}:`, error);
+      }
+    }
+
+    console.log('All tables and custom types dropped successfully');
+    return true;
+  } catch (error) {
+    console.error('Error in dropAllTables():', error);
+    return false;
+  }
+}
+
+/**
+ * Reset the entire database schema and data
+ * This is a more complete reset than just dropping tables
+ */
+export async function resetEntireDatabase(): Promise<boolean> {
+  try {
+    console.log('Performing complete database reset...');
+    const db = await getDatabase();
+    
+    // First drop all tables and types
+    const dropResult = await dropAllTables();
+    if (!dropResult) {
+      console.error('Failed to drop tables, continuing with reset attempt...');
+    }
+    
+    // For a truly clean slate, also truncate migration tracking tables
+    try {
+      // Ensure these tables don't exist or are empty
+      await db.query('DROP TABLE IF EXISTS schema_version CASCADE');
+      await db.query('DROP TABLE IF EXISTS client_migration_status CASCADE');
+    } catch (truncateError) {
+      console.warn('Error clearing migration tables:', truncateError);
+    }
+    
+    console.log('Database schema completely reset, migrations will run from scratch');
+    return true;
+  } catch (error) {
+    console.error('Error resetting entire database:', error);
+    return false;
+  }
+} 

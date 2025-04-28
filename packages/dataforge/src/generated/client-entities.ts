@@ -4,15 +4,19 @@ export * from '../entities/ClientMigrationStatus.js';
 export * from '../entities/Comment.js';
 export * from '../entities/LocalChanges.js';
 export * from '../entities/Project.js';
+export * from '../entities/SyncMetadata.js';
 export * from '../entities/Task.js';
 export * from '../entities/User.js';
+export * from '../entities/UserIdentity.js';
 
 import { ClientMigrationStatus } from '../entities/ClientMigrationStatus.js';
 import { Comment } from '../entities/Comment.js';
 import { LocalChanges } from '../entities/LocalChanges.js';
 import { Project } from '../entities/Project.js';
+import { SyncMetadata } from '../entities/SyncMetadata.js';
 import { Task } from '../entities/Task.js';
 import { User } from '../entities/User.js';
+import { UserIdentity } from '../entities/UserIdentity.js';
 
 // Export entity array for TypeORM
 export const clientEntities = [
@@ -20,8 +24,10 @@ export const clientEntities = [
   Comment,
   LocalChanges,
   Project,
+  SyncMetadata,
   Task,
   User,
+  UserIdentity,
 ];
 
 // Table hierarchy levels for client domain tables
@@ -46,5 +52,7 @@ export const CLIENT_DOMAIN_TABLES = [
 export const CLIENT_SYSTEM_TABLES = [
   '"client_migration_status"',
   '"local_changes"',
+  '"sync_metadata"',
+  '"user_identities"',
 ] as const;
 

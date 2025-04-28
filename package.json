@@ -1,19 +1,15 @@
 {
-  "name": "tinyhbasetry2",
+  "name": "vibestack",
   "private": true,
   "scripts": {
     "build": "turbo build",
-    "dev": "turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/web-dex",
-    "dev:web-dex": "turbo run dev --filter=./apps/web-dex",
-    "dev:local-db": "bash local-neon/setup-local-neon.sh start && turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/web-dex",
-    "db:start": "bash local-neon/setup-local-neon.sh start",
-    "db:stop": "bash local-neon/setup-local-neon.sh stop",
-    "db:down": "bash local-neon/setup-local-neon.sh down",
-    "db:status": "bash local-neon/setup-local-neon.sh status",
-    "db:logs": "bash local-neon/setup-local-neon.sh logs",
-    "db:psql": "bash local-neon/setup-local-neon.sh psql",
-    "db:hosts-check": "bash local-neon/setup-local-neon.sh hosts-check",
-    "db:hosts-add": "bash local-neon/setup-local-neon.sh hosts-add",
+    "dev": "turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
+    "dev:debug": "turbo run dev:debug --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
+    "dev:info": "turbo run dev:info --filter=./apps/web --filter=./apps/server",
+    "dev:web": "turbo run dev --filter=./apps/web",
+    "dev:web:debug": "turbo run dev:debug --filter=./apps/web",
+    "dev:local-db": "bash local-neon/setup-local-neon.sh start && turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
+    "dev:local-db:debug": "bash local-neon/setup-local-neon.sh start && turbo run dev:debug --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
     "lint": "eslint . --ext .ts,.tsx",
     "lint:fix": "eslint . --ext .ts,.tsx --fix",
     "quality": "pnpm --filter @repo/code-quality build && pnpm --filter @repo/code-quality quality",
@@ -38,5 +34,12 @@
   "engines": {
     "node": ">=18",
     "pnpm": ">=8"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@electric-sql/pglite-react": "^0.2.17",
+    "@electric-sql/pglite-repl": "^0.2.17",
+    "hono": "^4.7.7",
+    "tailwindcss": "^3.4.1"
   }
 }

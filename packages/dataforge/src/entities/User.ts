@@ -14,6 +14,7 @@ import { ServerOnly } from '../utils/context.js';
 import { Task } from './Task.js';
 import { Project } from './Project.js';
 import { BaseDomainEntity } from './BaseDomainEntity.js';
+import { UserIdentity } from './UserIdentity.js';
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -50,13 +51,6 @@ export class User extends BaseDomainEntity {
   @IsEnum(UserRole)
   role!: UserRole;
   
-  @ServerOnly()
-  @Column({ type: "varchar", length: 255, select: false, nullable: true, name: "password_hash" })
-  @IsOptional()
-  @IsString()
-  @MinLength(8, { message: "Password hash must be at least 8 characters long" })
-  passwordHash?: string;
-  
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @OneToMany(() => Task, (task) => task.assignee)
   tasks!: Relation<Task[]>;
@@ -66,4 +60,7 @@ export class User extends BaseDomainEntity {
   
   @ManyToMany(() => Project, (project) => project.members)
   memberProjects!: Relation<Project[]>;
+
+  @OneToMany(() => UserIdentity, (identity) => identity.user)
+  identities!: Relation<UserIdentity[]>;
 } 

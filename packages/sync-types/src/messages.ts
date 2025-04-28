@@ -15,6 +15,7 @@ export type SrvMessageType =
   | 'srv_changes_applied'  // Server signals changes were applied
   | 'srv_sync_completed'   // Generic sync completion (for live sync)
   | 'srv_catchup_completed'
+  | 'srv_live_start'      // Renamed: For confirming client is up-to-date and live sync starts
   | 'srv_sync_stats';      // Server sends sync statistics
 
 export type CltMessageType =
@@ -108,6 +109,18 @@ export interface ServerSyncCompletedMessage extends ServerMessage {
   changeCount: number;    // Total number of changes sent
   success: boolean;       // Whether sync completed successfully
   error?: string;         // Error message if any
+}
+
+/**
+ * Message sent when a client connects and is already up-to-date,
+ * confirming the transition to live sync.
+ */
+export interface ServerLiveStartMessage extends ServerMessage {
+  type: 'srv_live_start';
+  startLSN: string;       // Current LSN (same as finalLSN)
+  finalLSN: string;       // Current LSN (same as startLSN)
+  changeCount: number;    // Should be 0
+  success: boolean;       // Should be true
 }
 
 export interface ServerCatchupCompletedMessage extends ServerMessage {
@@ -234,6 +247,8 @@ export interface ClientCatchupReceivedMessage extends ClientMessage {
 export type Message = 
   | ServerMessage 
   | ServerCatchupCompletedMessage
+  | ServerLiveStartMessage
+  | ServerSyncStatsMessage
   | ClientMessage;
 
 // No need for named exports since these are already exported at declaration

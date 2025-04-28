@@ -39,6 +39,7 @@
     "prebuild": "pnpm run generate:entities",
     "build": "tsc",
     "generate:entities": "node --loader ts-node/esm src/build/generate-entities.ts",
+    "test": "vitest",
     "typeorm": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/server.ts",
     "typeorm:client": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/client.ts",
     "migration:generate:server": "node --loader ts-node/esm ./node_modules/typeorm/cli.js -d src/datasources/server.ts migration:generate",
@@ -53,6 +54,7 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.2.17",
+    "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "dotenv": "^16.4.7",
     "pg": "^8.13.2",
@@ -64,7 +66,8 @@
     "@faker-js/faker": "^9.6.0",
     "@types/node": "^18.19.75",
     "ts-node": "^10.9.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^1.6.1"
   },
   "peerDependencies": {
     "typescript": "^5.0.0"

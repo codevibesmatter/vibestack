@@ -123,7 +123,32 @@ vibestack/
    pnpm dev
    ```
 
-> **TODO:** Add proper steps for entity generation (`pnpm run generate:entities`) and initial migrations (`pnpm run migration:generate:server` and `pnpm run migration:generate:client`), followed by migration execution (`pnpm run deploy`).
+## Debug Features (OpenAuth)
+
+**⚠️ WARNING: These features are intended for development and debugging ONLY. They provide direct access to manipulate authentication data and should NEVER be exposed in production.**
+
+The OpenAuth worker (`apps/openauth`) includes a set of internal debug routes accessible under the `/internal` path prefix. These routes provide a simple web interface for inspecting and managing user authentication data stored in the Cloudflare KV namespace (`AUTH_STORE`).
+
+### Accessing the Debug UI
+
+1.  Navigate to `/internal/list-auth-users` in your browser when the worker is running.
+2.  **Challenge Required:** For security, access is protected by a simple challenge-response mechanism.
+    *   On the first visit, the UI will prompt you for a challenge code.
+    *   Check the **worker console logs**. A message like `[OpenAuth] DEBUG CHALLENGE: To access admin UI, use challenge code: <CODE>` will be printed.
+    *   Copy the `<code>`.
+    *   Append `?challenge=<code>` to the URL (e.g., `/internal/list-auth-users?challenge=ABCDEF`) and refresh the page.
+
+### Features
+
+*   **List Users:** Displays a list of users based on the presence of `email\u001f<email>\u001fsubject` keys found in the KV store.
+*   **Delete User Data:** Provides a button next to each listed user to delete all associated authentication data (password hash, email-subject mapping, and any associated refresh tokens). **This action is irreversible.**
+*   **Clear All Auth Data:** Provides a button to delete **ALL** authentication data stored in the KV namespace managed by OpenAuth (keys starting with `email\u001f` and `oauth:refresh\u001f`). **This action is extremely destructive and irreversible.** Use with extreme caution.
+
+### Implementation Details
+
+*   All debug route handlers are defined in `apps/openauth/src/debug.ts`.
+*   The main worker entry point (`apps/openauth/src/index.ts`) mounts these routes under the `/internal` path.
+*   The challenge code is generated randomly per worker instance and reset after successful validation.
 
 ## Development
 

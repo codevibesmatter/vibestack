@@ -3,28 +3,28 @@
 export * from '../entities/ChangeHistory.js';
 export * from '../entities/ClientMigration.js';
 export * from '../entities/Comment.js';
-export * from '../entities/HealthCheckState.js';
 export * from '../entities/Project.js';
 export * from '../entities/Task.js';
 export * from '../entities/User.js';
+export * from '../entities/UserIdentity.js';
 
 import { ChangeHistory } from '../entities/ChangeHistory.js';
 import { ClientMigration } from '../entities/ClientMigration.js';
 import { Comment } from '../entities/Comment.js';
-import { HealthCheckState } from '../entities/HealthCheckState.js';
 import { Project } from '../entities/Project.js';
 import { Task } from '../entities/Task.js';
 import { User } from '../entities/User.js';
+import { UserIdentity } from '../entities/UserIdentity.js';
 
 // Export entity array for TypeORM
 export const serverEntities = [
   ChangeHistory,
   ClientMigration,
   Comment,
-  HealthCheckState,
   Project,
   Task,
   User,
+  UserIdentity,
 ];
 
 // Table hierarchy levels for server domain tables
@@ -49,6 +49,6 @@ export const SERVER_DOMAIN_TABLES = [
 export const SERVER_SYSTEM_TABLES = [
   '"change_history"',
   '"client_migration"',
-  '"health_check_state"',
+  '"user_identities"',
 ] as const;
 

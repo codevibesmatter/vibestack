@@ -1,5 +1,11 @@
 import type { TableChange } from '@repo/sync-types';
 import { SERVER_TABLE_HIERARCHY } from '@repo/dataforge/server-entities';
+import { getDBClient, sql } from './db'; // Import necessary DB helpers
+import type { MinimalContext } from '../types/hono'; // Import context type
+import { syncLogger } from '../middleware/logger'; // Import logger
+import type { QueryResult } from '@neondatabase/serverless'; // Import QueryResult type
+
+const MODULE_NAME = 'sync-common';
 
 /**
  * Compare two LSNs
@@ -295,4 +301,28 @@ export function orderChangesByDomain(changes: TableChange[]): TableChange[] {
   }
 
   return ordered;
+}
+
+/**
+ * Get the latest LSN recorded in the change_history table.
+ * Returns '0/0' if the table is empty or an error occurs.
+ */
+export async function getLatestChangeHistoryLSN(context: MinimalContext): Promise<string> {
+  try {
+    // Use the sql helper function from db.ts to handle connection and query
+    const result = await sql<{ latest_lsn: string | null }>(context,
+      'SELECT MAX(lsn::pg_lsn)::text as latest_lsn FROM change_history;'
+    );
+    
+    const latestLSN = result[0]?.latest_lsn;
+    
+    if (latestLSN) {
+      return latestLSN;
+    }
+    // No need for manual connection closing here, sql() handles it
+    return '0/0'; // Return default on error
+  } catch (error) {
+    console.error('Error getting latest change history LSN:', error);
+    return '0/0'; // Return default on error
+  }
 } 

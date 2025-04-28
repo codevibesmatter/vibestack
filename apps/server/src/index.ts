@@ -13,18 +13,30 @@ import type { AppBindings } from './types/hono';
 import type { Env, ExecutionContext } from './types/env';
 import { SyncDO } from './sync/SyncDO';
 import { ReplicationDO } from './replication/ReplicationDO';
+import internalAuthApp from './auth/internal';
 
 /**
- * Main API router for the application
+ * Main API router for PUBLIC endpoints
  * Handles all HTTP routes under the /api path
  */
-const app = new Hono<AppBindings>().basePath('/api');
+const apiApp = new Hono<AppBindings>().basePath('/api');
 
 // Use our structured logger middleware
-app.use('*', createStructuredLogger());
+apiApp.use('*', createStructuredLogger());
 
-// Mount API routes
-app.route('/', api);
+// Mount public API routes
+apiApp.route('/', api);
+
+/**
+ * Router for INTERNAL service-to-service communication
+ */
+const internalApp = new Hono<AppBindings>().basePath('/internal');
+
+// Use logger for internal routes too
+internalApp.use('*', createStructuredLogger());
+
+// Mount internal auth routes
+internalApp.route('/auth', internalAuthApp);
 
 /**
  * Main worker export
@@ -74,6 +86,8 @@ const worker = {
       }
       
       // Create unique SyncDO instance for this client
+      // Use a consistent identifier based on clientId to ensure all messages
+      // from the same client go to the same DO instance
       const id = env.SYNC.idFromName(`client:${clientId}`);
       const obj = env.SYNC.get(id);
       
@@ -81,10 +95,11 @@ const worker = {
       return obj.fetch(request);
     }
 
-    // Handle regular HTTP API routes through the Hono router
+    // --- Route to PUBLIC API router ---
     if (url.pathname.startsWith('/api/')) {
+      serverLogger.debug(`Routing to public API app for path: ${url.pathname}`);
       try {
-        return await app.fetch(request, env, ctx);
+        return await apiApp.fetch(request, env, ctx);
       } catch (error) {
         serverLogger.error('Error handling request', error);
         return new Response(JSON.stringify({
@@ -99,6 +114,17 @@ const worker = {
             'Content-Type': 'application/json'
           }
         });
+      }
+    }
+    
+    // --- Route to INTERNAL router ---
+    if (url.pathname.startsWith('/internal/')) {
+      serverLogger.debug(`Routing to internal app for path: ${url.pathname}`);
+      try {
+        return await internalApp.fetch(request, env, ctx);
+      } catch (error) {
+        serverLogger.error('Error handling internal request', error);
+        return new Response(JSON.stringify({ ok: false, error: { type: 'InternalServerError', message: 'Internal communication error' }}), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
 

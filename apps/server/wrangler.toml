@@ -3,6 +3,14 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# Development server configuration
+[dev]
+ip = "localhost"
+port = 8787
+local_protocol = "http"
+upstream_protocol = "http"
+host = "localhost"
+
 # Environment variables
 [vars]
 ENVIRONMENT = "development"
@@ -10,6 +18,7 @@ ENVIRONMENT = "development"
 # Module aliases (correct syntax)
 [alias]
 "debug" = "./src/shims/debug.ts"
+"app-root-path" = "./src/lib/app-root-path-shim.ts"
 
 # Specify ESM format
 [build]

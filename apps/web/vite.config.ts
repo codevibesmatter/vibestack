@@ -1,27 +1,47 @@
+import path from 'path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react-swc'
-import tailwindcss from 'tailwindcss'
-import autoprefixer from 'autoprefixer'
-import { resolve } from 'path'
-import { TanStackRouterVite } from '@tanstack/router-vite-plugin'
+import tailwindcss from '@tailwindcss/vite'
+import { TanStackRouterVite } from '@tanstack/router-plugin/vite'
+import { cloudflare } from '@cloudflare/vite-plugin'
+import { VitePWA } from 'vite-plugin-pwa'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [
-    TanStackRouterVite({ autoCodeSplitting: true }),
-    react({
-      jsxImportSource: 'react',
-      tsDecorators: true
-    })
+    // VitePWA({
+    //   registerType: 'autoUpdate', // Automatically update the service worker when new content is available
+    //   includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'mask-icon.svg'], // Cache these static assets
+    //   manifest: { // Basic PWA manifest generation
+    //     name: 'ShadAdmin',
+    //     short_name: 'ShadAdmin',
+    //     description: 'Admin Dashboard',
+    //     theme_color: '#ffffff',
+    //     icons: [
+    //       {
+    //         src: 'pwa-192x192.png',
+    //         sizes: '192x192',
+    //         type: 'image/png'
+    //       },
+    //       {
+    //         src: 'pwa-512x512.png',
+    //         sizes: '512x512',
+    //         type: 'image/png'
+    //       }
+    //     ]
+    //   },
+    //   workbox: {
+    //     globPatterns: ['**/*.{js,css,html,ico,png,svg}'] // Cache JS, CSS, HTML, and image assets
+    //   }
+    // }),
+    // cloudflare(),
+    TanStackRouterVite({
+      target: 'react',
+      autoCodeSplitting: true,
+    }),
+    react(),
+    tailwindcss(),
   ],
-  css: {
-    postcss: {
-      plugins: [
-        tailwindcss,
-        autoprefixer,
-      ],
-    },
-  },
   optimizeDeps: {
     include: ['reflect-metadata'],
     exclude: ['@electric-sql/pglite']
@@ -29,29 +49,24 @@ export default defineConfig({
   worker: {
     format: 'es'
   },
-  build: {
-    target: 'esnext',
-    modulePreload: {
-      polyfill: false
-    },
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          vendor: ['reflect-metadata']
-        }
-      }
-    }
-  },
   resolve: {
     alias: {
-      '@': resolve(__dirname, './src'),
-      '@repo/db': resolve(__dirname, '../../packages/db/dist/client.js'),
-      '@repo/db-migrations': resolve(__dirname, '../../packages/db/src/migrations'),
-      '@repo/db-migrations-client': resolve(__dirname, '../../packages/db/src/migrations/client'),
-      '@repo/dataforge': resolve(__dirname, '../../packages/typeorm/dist'),
-      '@repo/dataforge/client-entities': resolve(__dirname, '../../packages/typeorm/dist/client-entities.js'),
-      '@repo/dataforge/dist/entities/Task': resolve(__dirname, '../../packages/typeorm/dist/entities/Task.js'),
-      '@repo/dataforge/dist/entities/Project': resolve(__dirname, '../../packages/typeorm/dist/entities/Project.js')
+      // Ensure TypeORM uses its browser bundle
+      typeorm: 'typeorm/browser',
+      // Restore alias, pointing to JS file for Vite runtime
+      '@repo/dataforge/client-entities': path.resolve(__dirname, '../../packages/dataforge/dist/client-entities.js'), 
+      '@repo/sync-types': path.resolve(__dirname, '../../packages/sync-types/dist/index.js'),
+      '@': path.resolve(__dirname, './src'),
+
+      // fix loading all icon chunks in dev mode
+      // https://github.com/tabler/tabler-icons/issues/1233
+      '@tabler/icons-react': '@tabler/icons-react/dist/esm/icons/index.mjs',
+    },
+  },
+  // Add build options to externalize typeorm
+  build: {
+    rollupOptions: {
+      external: ["typeorm"]
     }
   },
   server: {

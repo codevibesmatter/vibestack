@@ -579,14 +579,13 @@ export class ChangeProcessor {
     };
 
     try {
-      // Send the message directly without retry logic
+      // SyncDO.ts will handle detailed logging of this message
       await this.messageHandler.send(message);
     } catch (error) {
       syncLogger.error(`Failed to send 'received' acknowledgment to client ${clientId}`, {
         clientId,
         messageType: message.type,
-        error: error instanceof Error ? error.message : String(error),
-        timestamp: new Date().toISOString()
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       throw error; // Re-throw to handle in the calling method
     }
@@ -606,20 +605,19 @@ export class ChangeProcessor {
       messageId: `srv_${Date.now()}`,
       timestamp: Date.now(),
       clientId,
-      appliedChanges: changeIds,
+      appliedChanges: changeIds, // Correct field according to type definition
       success,
       error: error?.message
     };
 
     try {
-      // Send the message directly without retry logic
+      // SyncDO.ts will handle detailed logging of this message
       await this.messageHandler.send(message);
     } catch (error) {
       syncLogger.error(`Failed to send 'applied' acknowledgment to client ${clientId}`, {
         clientId,
         messageType: message.type,
-        error: error instanceof Error ? error.message : String(error),
-        timestamp: new Date().toISOString()
+        error: error instanceof Error ? error.message : String(error)
       }, MODULE_NAME);
       throw error; // Re-throw to handle in the calling method
     }
@@ -802,14 +800,61 @@ export async function processClientChanges(
     await dbClient.connect();
     
     const processor = new ChangeProcessor(dbClient, messageHandler, config);
+    
     await processor.processChanges(message);
+    
+    // Small delay to ensure acknowledgments are fully processed by client
+    // before we start sending any live updates
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Check if WebSocketHandler is a SyncDO with lock handling 
+    if ('notifyClientChangesComplete' in messageHandler) {
+      // Notify that processing is complete (only after all acknowledgments are sent)
+      syncLogger.info('Notifying client changes complete', {
+        clientId: message.clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      await (messageHandler as any).notifyClientChangesComplete(message.messageId);
+    }
   } catch (error) {
-    syncLogger.error(`Failed to process client changes: ${error instanceof Error ? error.message : String(error)}`, {
-      clientId: message.clientId,
-      messageId: message.messageId,
-      timestamp: new Date().toISOString()
-    }, MODULE_NAME);
-    throw error;
+    // Check if this is a WebSocket unavailability error
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                 errorMessage.includes('No active WebSocket connections');
+    
+    if (isWebSocketUnavailable) {
+      // Log with more specific error about client disconnection
+      syncLogger.warn(`Client appears to be disconnected, cannot acknowledge changes: ${errorMessage}`, {
+        clientId: message.clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      
+      // Re-throw with consistent error format to ensure proper cleanup
+      throw new Error(`WebSocketUnavailable: Client ${message.clientId} appears to be disconnected`);
+    } else {
+      // Log regular processing errors
+      syncLogger.error(`Failed to process client changes: ${errorMessage}`, {
+        clientId: message.clientId,
+        messageId: message.messageId
+      }, MODULE_NAME);
+      
+      // Make sure we still release the lock in case of error
+      if ('notifyClientChangesComplete' in messageHandler) {
+        try {
+          await (messageHandler as any).notifyClientChangesComplete(message.messageId);
+        } catch (notifyError) {
+          // Just log, don't throw
+          syncLogger.error(`Failed to notify client changes completion: ${
+            notifyError instanceof Error ? notifyError.message : String(notifyError)
+          }`, {
+            clientId: message.clientId,
+            messageId: message.messageId
+          }, MODULE_NAME);
+        }
+      }
+      
+      throw error;
+    }
   } finally {
     // Ensure we always close the connection
     try {

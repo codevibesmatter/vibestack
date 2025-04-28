@@ -3,34 +3,35 @@ import type { Context } from 'hono';
 import type { Env } from '../types/env';
 import type { AppContext, MinimalContext } from '../types/hono';
 
-// Add connect_timeout to URL if not present
-function addConnectTimeout(url: string): string {
-  const dbUrl = new URL(url);
-  if (!dbUrl.searchParams.has('connect_timeout')) {
-    dbUrl.searchParams.set('connect_timeout', '10');
+/**
+ * Add connect_timeout to URL if not present
+ * @param url The database URL to process
+ * @returns The processed URL with connect_timeout parameter
+ */
+export function addConnectTimeout(url: string): string {
+  if (url.includes('connect_timeout=')) {
+    return url;
   }
-  if (!dbUrl.searchParams.has('sslmode')) {
-    dbUrl.searchParams.set('sslmode', 'require');
-  }
-  return dbUrl.toString();
-}
-
-// Get database URL from context
-function getDatabaseURL(c: Context<{ Bindings: Env }> | MinimalContext): string {
-  const url = c.env.DATABASE_URL;
-  if (!url) {
-    throw new Error('DATABASE_URL environment variable is not set');
-  }
-  return url;
+  return url + (url.includes('?') ? '&' : '?') + 'connect_timeout=10';
 }
 
 // Initialize database client
-export const getDBClient = (c: Context<{ Bindings: Env }> | MinimalContext) => {
-  const urlWithTimeout = addConnectTimeout(getDatabaseURL(c));
-  return new Client({
-    connectionString: urlWithTimeout,
-    ssl: true
-  });
+export const getDBClient = (c: Context<{ Bindings: Env }> | MinimalContext | { env: { DATABASE_URL: string } }) => {
+  try {
+    const url = 'env' in c && typeof c.env === 'object' && c.env !== null ? c.env.DATABASE_URL : undefined;
+    if (!url) {
+      throw new Error('DATABASE_URL environment variable is not set');
+    }
+    
+    const urlWithTimeout = addConnectTimeout(url);
+    return new Client({
+      connectionString: urlWithTimeout,
+      ssl: true
+    });
+  } catch (error) {
+    console.error('Error creating database client:', error);
+    throw error;
+  }
 };
 
 // Direct query execution with proper connection management

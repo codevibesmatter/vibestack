@@ -5,6 +5,7 @@ import type {
   ServerStateChangeMessage,
   ServerLSNUpdateMessage,
   ServerSyncCompletedMessage,
+  ServerLiveStartMessage,
   ServerCatchupCompletedMessage,
   ServerSyncStatsMessage
 } from '@repo/sync-types';
@@ -579,7 +580,11 @@ export async function sendLiveChanges(
   
   // Start tracking time for performance monitoring
   const startTime = Date.now();
-  
+
+  // Bypass the entire try/catch for WebSocket unavailability errors
+  // because we want these to propagate to the caller for special handling
+  let webSocketUnavailableError: Error | null = null;
+
   try {
     syncLogger.debug('Sending live changes', { 
       clientId, 
@@ -742,6 +747,26 @@ export async function sendLiveChanges(
         }, MODULE_TAG);
       } catch (err) {
         chunkSuccess.push(false);
+        
+        // Check if this is a WebSocket unavailability error
+        // This should be propagated immediately since we can't continue
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                      errorMessage.includes('No active WebSocket connections');
+        
+        if (isWebSocketUnavailable) {
+          syncLogger.warn('WebSocket unavailable, cannot send live changes', {
+            clientId,
+            error: errorMessage
+          }, MODULE_TAG);
+          
+          // Save the error to throw after we exit the try-catch block
+          webSocketUnavailableError = err instanceof Error ? err : new Error(errorMessage);
+          
+          // Exit the loop immediately
+          break;
+        }
+        
         syncLogger.error('Live chunk send failed', {
           clientId,
           chunk: i + 1,
@@ -749,6 +774,11 @@ export async function sendLiveChanges(
           error: err instanceof Error ? err.message : String(err)
         }, MODULE_TAG);
       }
+    }
+    
+    // If we have a WebSocket unavailability error, throw it now to bypass the catch block
+    if (webSocketUnavailableError) {
+      throw webSocketUnavailableError;
     }
     
     const sendSuccess = chunkSuccess.every(s => s);
@@ -771,11 +801,27 @@ export async function sendLiveChanges(
     // Return the LSN of the last change actually sent, not the providedLSN
     return { success: true, lsn: lastSentLSN };
   } catch (error) {
+    // If this is a WebSocket unavailability error, we want to propagate it rather than catching it
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                 errorMessage.includes('No active WebSocket connections');
+    
+    if (isWebSocketUnavailable) {
+      // Rethrow WebSocketUnavailable errors to ensure they're handled properly
+      syncLogger.warn('Propagating WebSocketUnavailable error', {
+        clientId,
+        error: errorMessage
+      }, MODULE_TAG);
+      throw error;
+    }
+    
+    // Only log non-WebSocket errors
     syncLogger.error('Live changes send failed', {
       clientId,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
       stack: error instanceof Error ? error.stack : undefined
     }, MODULE_TAG);
+    
     return { success: false, lsn: '0/0' };
   }
 }
@@ -787,10 +833,10 @@ export async function sendLiveChanges(
 export function createLiveSyncConfirmation(
   clientId: string,
   lsn: string
-): ServerSyncCompletedMessage {
+): ServerLiveStartMessage {
   return {
-    type: 'srv_sync_completed',
-    messageId: `srv_${Date.now()}_completion`,
+    type: 'srv_live_start',
+    messageId: `srv_${Date.now()}_live_start`,
     timestamp: Date.now(),
     clientId,
     startLSN: lsn,  // Current LSN as both start and final
@@ -880,6 +926,9 @@ export async function processLiveUpdateNotification(
   let processedChangeCount = 0;
   let success = true;
 
+  // Track WebSocket unavailability to bypass the main catch block if needed
+  let webSocketUnavailableError: Error | null = null;
+
   try {
     // 1. Fetch raw delta changes
     let rawDeltaChanges: TableChange[] = [];
@@ -922,15 +971,49 @@ export async function processLiveUpdateNotification(
         finalLSN = processedChanges[processedChanges.length - 1].lsn || serverLSN;
 
         // 4. Send processed changes via sendLiveChanges
-        // Assuming sendLiveChanges exists and is appropriate here
+        // This may throw a WebSocketUnavailableError which we want to propagate to the caller
         syncLogger.debug(`Sending ${processedChangeCount} processed live changes`, { clientId, finalLSN });
-        await sendLiveChanges(
-          context, // Pass context if needed by sendLiveChanges
-          clientId,
-          processedChanges,
-          messageHandler,
-          finalLSN
-        );
+        try {
+          const result = await sendLiveChanges(
+            context,
+            clientId,
+            processedChanges,
+            messageHandler,
+            finalLSN
+          );
+          
+          if (!result.success) {
+            success = false;
+            syncLogger.error('Failed to send live changes - reported failure', {
+              clientId,
+              changeCount: processedChangeCount
+            }, MODULE_NAME);
+          }
+        } catch (sendError) {
+          // Check if this is a WebSocket unavailability error
+          const errorMessage = sendError instanceof Error ? sendError.message : String(sendError);
+          const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                         errorMessage.includes('No active WebSocket connections');
+          
+          if (isWebSocketUnavailable) {
+            // Save the error to propagate outside the try-catch
+            webSocketUnavailableError = sendError instanceof Error ? 
+              sendError : new Error(errorMessage);
+            
+            // Log as warning since this will be handled by caller
+            syncLogger.warn('Client has no active connection for live changes', {
+              clientId,
+              error: errorMessage
+            }, MODULE_NAME);
+          } else {
+            // Handle other send errors
+            syncLogger.error('Failed to send live changes to client', {
+              clientId,
+              error: errorMessage
+            }, MODULE_NAME);
+            success = false;
+          }
+        }
       } else {
         // If all changes were filtered/deduped, client is up to date with the last RAW change fetched
         finalLSN = rawDeltaChanges[rawDeltaChanges.length - 1].lsn || serverLSN;
@@ -938,14 +1021,45 @@ export async function processLiveUpdateNotification(
     }
 
   } catch (error) {
-    syncLogger.error('Failed to process live update notification', {
-      clientId,
-      clientLSN,
-      serverLSN,
-      error: error instanceof Error ? error.message : String(error)
-    }, MODULE_NAME);
+    // Propagate WebSocket unavailability errors from inner blocks
+    if (webSocketUnavailableError) {
+      throw webSocketUnavailableError;
+    }
+    
+    // Check if this is a new WebSocket unavailability error
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                  errorMessage.includes('No active WebSocket connections');
+                                  
+    if (isWebSocketUnavailable) {
+      // Add explicit log for tracing cleanup flow
+      syncLogger.warn('Propagating WebSocket unavailability for cleanup', {
+        clientId,
+        error: errorMessage
+      }, MODULE_NAME);
+      
+      // Rethrow WebSocket errors to caller
+      throw error;
+    } else {
+      // Log other errors
+      syncLogger.error('Failed to process live update notification', {
+        clientId,
+        clientLSN,
+        serverLSN,
+        error: errorMessage
+      }, MODULE_NAME);
+    }
+    
     success = false;
     finalLSN = clientLSN; // Revert to original LSN on error
+    
+    // Re-throw the error to allow caller to handle it
+    throw error;
+  }
+  
+  // If we have a WebSocket unavailability error saved, throw it now
+  if (webSocketUnavailableError) {
+    throw webSocketUnavailableError;
   }
 
   return {

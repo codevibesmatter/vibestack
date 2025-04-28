@@ -17,13 +17,14 @@ import type {
   ServerMessage, 
   ClientMessage,
   ClientChangesMessage,
-  ServerSyncStatsMessage
+  ServerSyncStatsMessage,
+  ServerCatchupCompletedMessage
 } from '@repo/sync-types';
 import type { MinimalContext } from '../types/hono';
 import type { Env } from '../types/env';
 import { syncLogger } from '../middleware/logger';
 import type { WebSocketHandler } from './types';
-import { compareLSN, deduplicateChanges } from '../lib/sync-common';
+import { compareLSN, deduplicateChanges, getLatestChangeHistoryLSN } from '../lib/sync-common';
 import { getDBClient } from '../lib/db';
 import type { TableChange } from '@repo/sync-types';
 
@@ -82,6 +83,10 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     filter?: (message: any) => boolean
   }> = new Map();
   private isHandlerRegistered: boolean = false;
+  
+  // Add processing lock to prevent race conditions
+  private isProcessingClientChanges: boolean = false;
+  private pendingLiveUpdates: Array<() => Promise<void>> = [];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -103,6 +108,50 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     
     // We no longer register handlers in the constructor
     // to prevent duplicate registrations when DO wakes from hibernation
+    
+    // Initialize replication when SyncDO starts up
+    this.state.waitUntil(this.initializeReplication());
+    
+    // Schedule cleanup alarm if not already set
+    this.checkAndSetCleanupAlarm();
+  }
+
+  /**
+   * Initialize replication by calling the replication init endpoint
+   * This ensures the replication system is ready before handling client connections
+   */
+  private async initializeReplication(): Promise<void> {
+    try {
+      syncLogger.info('Initializing replication from SyncDO startup', {
+        syncId: this.syncId
+      }, MODULE_NAME);
+      
+      // Get the ReplicationDO using the proper Durable Object pattern
+      const replicationId = this.env.REPLICATION.idFromName('replication');
+      const replicationStub = this.env.REPLICATION.get(replicationId);
+      
+      // Call the init endpoint directly on the ReplicationDO - using proper URL format
+      const response = await replicationStub.fetch('https://internal/api/replication/init');
+      
+      if (!response.ok) {
+        syncLogger.error('Failed to initialize replication', {
+          status: response.status,
+          statusText: response.statusText
+        }, MODULE_NAME);
+        return;
+      }
+      
+      const result = await response.json();
+      syncLogger.info('Replication initialization successful', {
+        result,
+        syncId: this.syncId
+      }, MODULE_NAME);
+    } catch (error) {
+      syncLogger.error('Error initializing replication', {
+        error: error instanceof Error ? error.message : String(error),
+        syncId: this.syncId
+      }, MODULE_NAME);
+    }
   }
 
   /**
@@ -295,6 +344,14 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    * WebSocket message handler for hibernation API
    */
   async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
+    // Register handlers if they aren't registered (DO just woke up from hibernation)
+    if (!this.isHandlerRegistered) {
+      syncLogger.info('DO woke from hibernation, registering message handlers', {
+        clientId: this.clientId,
+      }, MODULE_NAME);
+      this.registerMessageHandlers();
+    }
+    
     try {
       // Convert data to string if it's ArrayBuffer
       const messageStr = typeof data === 'string' ? data : new TextDecoder().decode(data);
@@ -309,6 +366,15 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       // Check if someone is waiting for this message type
       this.checkWaitingResolvers(message.type, message);
       
+      // Check if this is a client changes message, if so, set the processing lock
+      if (message.type === 'clt_send_changes') {
+        this.isProcessingClientChanges = true;
+        syncLogger.info('Client changes processing started - setting processing lock', {
+          clientId: this.clientId,
+          messageId: message.messageId
+        }, MODULE_NAME);
+      }
+      
       // Process handlers for this message type
       const handlers = this.messageHandlers.get(message.type) || [];
       for (const handler of handlers) {
@@ -319,8 +385,27 @@ export class SyncDO implements DurableObject, WebSocketHandler {
             type: message.type,
             error: handlerError instanceof Error ? handlerError.message : String(handlerError)
           }, MODULE_NAME);
+          
+          // If this was a client changes message and it failed, release the lock
+          // Note: We're not releasing the lock here anymore - lock will be released
+          // after acknowledgments are sent via notifyClientChangesComplete
+          if (message.type === 'clt_send_changes' && 
+              (handlerError instanceof Error && !handlerError.message.includes('WebSocketUnavailable'))) {
+            // For non-WebSocket errors, release lock immediately
+            this.isProcessingClientChanges = false;
+            syncLogger.info('Client changes processing failed - releasing processing lock', {
+              clientId: this.clientId,
+              messageId: message.messageId
+            }, MODULE_NAME);
+            
+            // Process any pending updates
+            this.processPendingLiveUpdates();
+          }
         }
       }
+      
+      // Note: We no longer automatically release the lock here after processing client changes
+      // It will be released via notifyClientChangesComplete after acks are sent
     } catch (error) {
       syncLogger.error('Message parse error', {
         error: error instanceof Error ? error.message : String(error)
@@ -332,42 +417,22 @@ export class SyncDO implements DurableObject, WebSocketHandler {
    * WebSocket close handler for hibernation API
    */
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
-    // Save clientId before it's potentially cleared during cleanup
-    const savedClientId = this.clientId;
-    
+    // Log websocket closure
     syncLogger.info('WebSocket closed', {
-      clientId: savedClientId,
+      clientId: this.clientId || 'no-client-id',
       code,
-      reason,
+      reason: reason || 'No reason specified',
       wasClean
     }, MODULE_NAME);
     
-    // Mark client as inactive when connection closes
-    this.state.waitUntil(
-      (async () => {
-        try {
-          // If it's not a clean closure, handle more carefully
-          if (!wasClean) {
-            syncLogger.warn('Unclean WebSocket closure', {
-              clientId: savedClientId,
-              code,
-              reason: reason || 'No reason provided'
-            }, MODULE_NAME);
-          }
-          
-          await this.stateManager.cleanupConnection();
-        } catch (error) {
-          syncLogger.error('Connection cleanup failed', {
-            clientId: savedClientId, // Use saved clientId
-            code,
-            wasClean,
-            error: error instanceof Error ? error.message : String(error)
-          }, MODULE_NAME);
-        }
-      })()
-    );
-    
+    // Clear WebSocket reference
     this.webSocket = null;
+    
+    // Mark client as inactive in KV - don't wait for completion
+    this.state.waitUntil(this.stateManager.cleanupConnection());
+    
+    // We don't clear the clientId since it's properly persisted
+    // and may be needed for additional operations
   }
   
   /**
@@ -460,8 +525,9 @@ export class SyncDO implements DurableObject, WebSocketHandler {
     
     // Message handler for client changes is already registered in the constructor
     
-    // Get the current server LSN
-    const serverLSN = await this.stateManager.getServerLSN();
+    // Get the current server LSN from change_history, default to '0/0'
+    const context = this.getContext(); // Get context for DB query
+    const serverLSN = (await getLatestChangeHistoryLSN(context)) || '0/0';
     
     // If client has no LSN (0/0), it needs initial sync
     if (clientLSN === '0/0') {
@@ -511,6 +577,53 @@ export class SyncDO implements DurableObject, WebSocketHandler {
           this.stateManager,
           clientId
         );
+        
+        // After initial sync completes, get the current client and server LSNs
+        // to determine if catchup sync is needed
+        const updatedClientLSN = await this.stateManager.getLSN() || '0/0';
+        const currentServerLSN = await this.stateManager.getServerLSN();
+        
+        syncLogger.info('Initial sync completed, checking if catchup sync is needed', {
+          clientId,
+          updatedClientLSN,
+          currentServerLSN
+        }, MODULE_NAME);
+        
+        // If client LSN is still behind server LSN, perform catchup sync
+        if (compareLSN(updatedClientLSN, currentServerLSN) < 0) {
+          syncLogger.info('Starting automatic catchup sync after initial sync', {
+            clientId,
+            clientLSN: updatedClientLSN,
+            serverLSN: currentServerLSN
+          }, MODULE_NAME);
+          
+          // Update client's sync state in storage
+          await this.stateManager.updateClientSyncState(clientId, 'catchup');
+          
+          // Perform catchup sync with both LSNs
+          await performCatchupSync(
+            context,
+            clientId,
+            updatedClientLSN,   // Use updated client LSN after initial sync
+            currentServerLSN,   // Use current server LSN
+            this,
+            this.stateManager
+          );
+        } else {
+          // Client is up to date after initial sync, proceed to live sync
+          syncLogger.info('Client is up to date after initial sync, transitioning to live', {
+            clientId,
+            lsn: updatedClientLSN
+          }, MODULE_NAME);
+          
+          // Update sync state (server-side)
+          await this.stateManager.updateClientSyncState(clientId, 'live');
+          
+          // Send a live start message as the client is now up-to-date
+          syncLogger.info('Sending live start message as catchup was skipped', { clientId, lsn: updatedClientLSN }, MODULE_NAME);
+          const liveStartMsg = createLiveSyncConfirmation(clientId, updatedClientLSN);
+          await this.send(liveStartMsg);
+        }
         break;
         
       case SyncStrategy.CATCHUP:
@@ -569,8 +682,9 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       await this.stateManager.registerClient(clientId);
     }
 
-    // Get server LSN
-    const serverLSN = await this.stateManager.getServerLSN();
+    // Get server LSN from change_history, default to '0/0'
+    const ctx = this.getContext(); // Get context for DB query
+    const serverLSN = (await getLatestChangeHistoryLSN(ctx)) || '0/0';
     syncLogger.info('Processing changes notification', {
       clientId,
       serverLSN
@@ -585,9 +699,109 @@ export class SyncDO implements DurableObject, WebSocketHandler {
       clientLSN = '0/0';
     }
 
-    const ctx = this.getContext();
+    // Check if client changes are being processed
+    if (this.isProcessingClientChanges) {
+      syncLogger.info('Client is currently processing changes, queuing live update', {
+        clientId,
+        serverLSN
+      }, MODULE_NAME);
+      
+      // Create a promise for the response
+      const responsePromise = new Promise<Response>((resolve) => {
+        // Add to pending updates queue
+        this.pendingLiveUpdates.push(async () => {
+          try {
+            // Process live update
+            const result = await processLiveUpdateNotification(
+              ctx,
+              clientId,
+              clientLSN,
+              serverLSN,
+              this
+            );
+            
+            // Update client's LSN if successful
+            if (result.success && this.clientId === clientId) {
+               await this.stateManager.updateClientLSN(clientId, result.finalLSN);
+            }
+            
+            // Resolve with success response
+            resolve(new Response(JSON.stringify({
+              success: result.success,
+              notified: true,
+              changeCount: result.changeCount,
+              lsn: result.finalLSN,
+              queued: true
+            }), {
+              status: result.success ? 200 : 500,
+              headers: { 'Content-Type': 'application/json' }
+            }));
+          } catch (error) {
+            // Check if this is a WebSocket unavailability error
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                        errorMessage.includes('No active WebSocket connections');
+            
+            if (isWebSocketUnavailable) {
+              // Clean up client
+              await this.stateManager.cleanupConnection();
+              
+              // Resolve with WebSocket unavailable response
+              resolve(new Response(JSON.stringify({
+                success: false,
+                notified: false,
+                error: 'Client has no active WebSocket connection',
+                cleaned: true,
+                queued: true
+              }), {
+                status: 410,
+                headers: { 'Content-Type': 'application/json' }
+              }));
+            } else {
+              // Resolve with error response
+              resolve(new Response(JSON.stringify({
+                success: false,
+                error: 'Failed to process queued live update notification',
+                details: errorMessage,
+                queued: true
+              }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+              }));
+            }
+          }
+        });
+      });
+      
+      return responsePromise;
+    }
 
+    // Normal (non-queued) processing path
     try {
+      // Get all active WebSocket connections
+      const webSockets = this.ctx.getWebSockets();
+      
+      // If there are no active WebSockets, this client is disconnected
+      // Handle cleanup here instead of in webSocketClose to avoid errors
+      if (webSockets.length === 0) {
+        syncLogger.info('Client has no active WebSocket connection, cleaning up', {
+          clientId
+        }, MODULE_NAME);
+        
+        // Clean up client registration
+        await this.stateManager.cleanupConnection();
+        
+        return new Response(JSON.stringify({
+          success: false,
+          notified: false,
+          error: 'Client has no active WebSocket connection',
+          cleaned: true
+        }), {
+          status: 410,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
       // Call the dedicated function in server-changes to process the notification
       const result = await processLiveUpdateNotification(
         ctx,
@@ -617,18 +831,68 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         headers: { 'Content-Type': 'application/json' }
       });
     } catch (error) {
-      // This catch block might be redundant if processLiveUpdateNotification handles its errors
-      // but keep for safety
+      // Check if this is a WebSocket unavailability error
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isWebSocketUnavailable = errorMessage.includes('WebSocketUnavailable') || 
+                                   errorMessage.includes('No active WebSocket connections');
+      
+      // If WebSocket is unavailable, clean up the client registration
+      if (isWebSocketUnavailable) {
+        syncLogger.warn('Client has no active WebSocket connection, cleaning up registration', {
+          clientId,
+          errorMessage
+        }, MODULE_NAME);
+        
+        try {
+          // Clean up this client's registration - be explicit about which client
+          await this.stateManager.cleanupConnection();
+          
+          // Log cleanup success
+          syncLogger.info('Successfully cleaned up disconnected client registration', {
+            clientId,
+            timestamp: Date.now()
+          }, MODULE_NAME);
+          
+          return new Response(JSON.stringify({
+            success: false,
+            notified: false,
+            error: 'Client has no active WebSocket connection',
+            cleaned: true
+          }), {
+            status: 410, // Gone - indicates the resource is no longer available
+            headers: { 'Content-Type': 'application/json' }
+          });
+        } catch (cleanupError) {
+          // Log cleanup failure but still return 410
+          syncLogger.error('Failed to clean up disconnected client registration', {
+            clientId,
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }, MODULE_NAME);
+          
+          return new Response(JSON.stringify({
+            success: false,
+            notified: false,
+            error: 'Client has no active WebSocket connection',
+            cleaned: false,
+            cleanupError: cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }), {
+            status: 410, // Still use Gone status
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+      }
+      
+      // Handle other errors
       syncLogger.error('Unexpected error handling changes notification', {
         clientId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
         stack: error instanceof Error ? error.stack : undefined
       }, MODULE_NAME);
       
       return new Response(JSON.stringify({
         success: false,
         error: 'Failed to process changes notification',
-        details: error instanceof Error ? error.message : String(error)
+        details: errorMessage
       }), {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
@@ -688,26 +952,51 @@ export class SyncDO implements DurableObject, WebSocketHandler {
           messageId: message.messageId,
           clientId: this.clientId
         }, MODULE_NAME);
-        return;
+        // Throw an error with a consistent message format that's easy to detect
+        throw new Error('WebSocketUnavailable: No active WebSocket connections for client ' + this.clientId);
       }
       
-      // Log the message we're about to send
-      syncLogger.debug('Sending message', {
-        type: message.type,
-        messageId: message.messageId,
-        clientId: this.clientId,
-        connectionCount: webSockets.length
-      }, MODULE_NAME);
+      // Enhanced logging for acknowledgment messages (at INFO level)
+      const isAcknowledgment = message.type === 'srv_changes_received' || 
+                             message.type === 'srv_changes_applied';
+      
+      if (isAcknowledgment) {
+        syncLogger.info('Sending acknowledgment message', {
+          type: message.type,
+          messageId: message.messageId,
+          clientId: this.clientId,
+          connectionCount: webSockets.length,
+          isProcessingLocked: this.isProcessingClientChanges
+        }, MODULE_NAME);
+      } else {
+        // Regular debug log for other messages
+        syncLogger.debug('Sending message', {
+          type: message.type,
+          messageId: message.messageId,
+          clientId: this.clientId,
+          connectionCount: webSockets.length
+        }, MODULE_NAME);
+      }
       
       // Send to all active connections
       for (const ws of webSockets) {
         try {
           ws.send(JSON.stringify(message));
-          syncLogger.debug('Message sent successfully', {
-            type: message.type,
-            messageId: message.messageId,
-            clientId: this.clientId
-          }, MODULE_NAME);
+          
+          // Log success at different levels based on message type
+          if (isAcknowledgment) {
+            syncLogger.info('Acknowledgment message sent successfully', {
+              type: message.type,
+              messageId: message.messageId,
+              clientId: this.clientId
+            }, MODULE_NAME);
+          } else {
+            syncLogger.debug('Message sent successfully', {
+              type: message.type,
+              messageId: message.messageId,
+              clientId: this.clientId
+            }, MODULE_NAME);
+          }
         } catch (sendError) {
           syncLogger.error('Error sending message to WebSocket', {
             type: message.type,
@@ -777,7 +1066,7 @@ export class SyncDO implements DurableObject, WebSocketHandler {
   async waitForMessage(
     type: ClientMessage['type'], 
     filter?: ((msg: any) => boolean) | undefined, 
-    timeoutMs: number = 30000
+    timeoutMs: number = 300000  // Increased timeout to 5 minutes to accommodate larger data processing on client
   ): Promise<any> {
     // Check if we already have a message of this type in the queue
     const existingMessages = this.messageQueue.get(type) || [];
@@ -891,6 +1180,111 @@ export class SyncDO implements DurableObject, WebSocketHandler {
         status: 500,
         headers: { 'Content-Type': 'application/json' }
       });
+    }
+  }
+
+  /**
+   * Process any pending live update functions in the queue
+   */
+  private async processPendingLiveUpdates(): Promise<void> {
+    if (this.pendingLiveUpdates.length === 0) {
+      return;
+    }
+    
+    syncLogger.info(`Processing ${this.pendingLiveUpdates.length} pending live updates`, {
+      clientId: this.clientId
+    }, MODULE_NAME);
+    
+    // Copy and clear the queue 
+    const updates = [...this.pendingLiveUpdates];
+    this.pendingLiveUpdates = [];
+    
+    // Process each pending update
+    for (const updateFn of updates) {
+      try {
+        await updateFn();
+      } catch (updateError) {
+        syncLogger.error('Error processing queued live update', {
+          error: updateError instanceof Error ? updateError.message : String(updateError),
+          clientId: this.clientId
+        }, MODULE_NAME);
+      }
+    }
+  }
+
+  /**
+   * Notify that client changes processing is complete (including sending acknowledgments)
+   * This is called by processClientChanges after sending the final acknowledgment
+   */
+  async notifyClientChangesComplete(messageId: string): Promise<void> {
+    if (!this.isProcessingClientChanges) {
+      // Lock is already released, nothing to do
+      syncLogger.info('Lock already released when notifyClientChangesComplete called', {
+        clientId: this.clientId,
+        messageId
+      }, MODULE_NAME);
+      return;
+    }
+    
+    // Get WebSockets count to indicate client connection status
+    const webSockets = this.ctx.getWebSockets();
+    
+    // Release the lock
+    this.isProcessingClientChanges = false;
+    syncLogger.info('Client changes processing fully completed - releasing processing lock', {
+      clientId: this.clientId,
+      messageId,
+      activeConnections: webSockets.length,
+      pendingUpdates: this.pendingLiveUpdates.length
+    }, MODULE_NAME);
+    
+    // Process any pending updates now that client changes are fully completed
+    await this.processPendingLiveUpdates();
+  }
+
+  /**
+   * Set up a periodic cleanup alarm if one doesn't exist
+   */
+  private async checkAndSetCleanupAlarm(): Promise<void> {
+    try {
+      const hasAlarm = await this.state.storage.getAlarm();
+      if (!hasAlarm) {
+        // Schedule cleanup in 1 hour
+        const ONE_HOUR = 60 * 60 * 1000;
+        this.state.storage.setAlarm(Date.now() + ONE_HOUR);
+        syncLogger.info('Scheduled cleanup alarm', {}, MODULE_NAME);
+      }
+    } catch (error) {
+      syncLogger.error('Failed to set cleanup alarm', {
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+    }
+  }
+  
+  /**
+   * Alarm handler - called by Cloudflare runtime when an alarm fires
+   * Used for regular cleanup of expired clients
+   */
+  async alarm(): Promise<void> {
+    syncLogger.info('Cleanup alarm fired', {}, MODULE_NAME);
+    
+    try {
+      // Perform cleanup of inactive clients
+      await this.stateManager.cleanupConnection();
+      
+      // Reschedule the next cleanup
+      const ONE_HOUR = 60 * 60 * 1000;
+      this.state.storage.setAlarm(Date.now() + ONE_HOUR);
+      
+      syncLogger.info('Cleanup completed and rescheduled', {}, MODULE_NAME);
+    } catch (error) {
+      syncLogger.error('Error during scheduled cleanup', {
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+      
+      // Even if cleanup fails, reschedule the alarm
+      const ONE_HOUR = 60 * 60 * 1000;
+      this.state.storage.setAlarm(Date.now() + ONE_HOUR);
     }
   }
 } 

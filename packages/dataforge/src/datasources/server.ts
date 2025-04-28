@@ -31,7 +31,6 @@ const serverDataSource = new DataSource({
   // Use the pre-filtered server entities
   entities: serverEntities,
   migrations: ["src/migrations/server/*.ts"],
-  migrationsTableName: "migrations_server",
   // Set default schema for all entities
   schema: "public",
   logging: true,

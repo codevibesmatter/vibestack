@@ -414,6 +414,7 @@ export async function processChanges(
         }, MODULE_NAME);
       }
       
+      // If no valid changes after filtering, still update LSN to avoid reprocessing
       await stateManager.setLSN(lastLSN);
       return { 
         success: true, 
@@ -432,9 +433,10 @@ export async function processChanges(
         lastLSN
       }, MODULE_NAME);
       
+      // Even if storage failed, update LSN to prevent reprocessing this batch
       await stateManager.setLSN(lastLSN);
       return { 
-        success: true, 
+        success: true, // Still success from polling perspective, but storage failed
         storedChanges: false, 
         changeCount: tableChanges.length,
         filteredCount,
@@ -518,12 +520,19 @@ export async function processChanges(
               // Ignore parse errors
             }
             
+            // Consider 410 Gone (WebSocket unavailable/client cleaned up) as a special case
+            // We need to mark these as failures, but track when cleanup was successful
+            const isCleanedUp = response.status === 410;
+            const cleanedUp = isCleanedUp && (responseDetails as any)?.cleaned === true;
+            
             return { 
               clientId, 
               processingId,
+              // Only status 200 is a success, everything else is a failure
               success: response.status === 200,
-              error: response.status !== 200 ? `Status ${response.status}` : undefined,
-              details: responseDetails
+              error: response.status !== 200 ? `Status ${response.status}${isCleanedUp ? ' (No active WebSocket)' : ''}` : undefined,
+              details: responseDetails,
+              cleanedUp
             };
           } catch (error) {
             return { 
@@ -540,12 +549,23 @@ export async function processChanges(
       const failureCount = results.length - successCount;
       const failedClients = results.filter(r => !r.success).map(r => r.clientId);
       
+      // Count cleaned up clients as a special case
+      const cleanedClientCount = results.filter(r => r.cleanedUp).length;
+      
       // Log any failures individually
       results.filter(r => !r.success).forEach(result => {
-        replicationLogger.warn('Client notify failed', {
-          clientId: result.clientId,
-          error: result.error
-        }, MODULE_NAME);
+        // Use different log level for cleaned-up clients vs other failures
+        if (result.cleanedUp) {
+          replicationLogger.info('Client cleaned up during notification', {
+            clientId: result.clientId,
+            status: result.error
+          }, MODULE_NAME);
+        } else {
+          replicationLogger.warn('Client notify failed', {
+            clientId: result.clientId,
+            error: result.error
+          }, MODULE_NAME);
+        }
       });
       
       // Extract details about changes processed
@@ -599,6 +619,7 @@ export async function processChanges(
       replicationLogger.info('Client notifications completed', {
         success: successCount,
         failed: failureCount,
+        cleanedUp: cleanedClientCount,
         failedClients: failedClients.length > 0 ? failedClients : undefined,
         processingTime: Date.now() - startTime
       }, MODULE_NAME);

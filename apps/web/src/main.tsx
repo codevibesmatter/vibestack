@@ -1,19 +1,89 @@
-import 'reflect-metadata'
-import React, { Suspense, useEffect, useState } from 'react'
-import ReactDOM from 'react-dom/client'
-import { RouterProvider, createRouter } from '@tanstack/react-router'
-import { LoadingScreen } from './components/LoadingScreen'
-import './index.css'
-import { initializeDatabase, terminateDatabase } from './db/core'
-import { initSync, cleanupSyncService } from './sync/service'
-import { dbMessageBus } from './db/message-bus'
-import { checkAndApplyMigrations } from './db/migration-manager'
+// MUST be first - Apply TypeORM patches before any TypeORM code runs
+import './db/newtypeorm/applyPatches';
 
-// Import the generated route tree
+import "reflect-metadata"; // Required for TypeORM decorators
+import { StrictMode } from 'react'
+import ReactDOM from 'react-dom/client'
+import { AxiosError } from 'axios'
+import {
+  QueryCache,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query'
+import { RouterProvider, createRouter } from '@tanstack/react-router'
+import { toast } from 'sonner'
+import { useAuthStore } from '@/stores/authStore'
+import { handleServerError } from '@/utils/handle-server-error'
+import { FontProvider } from './context/font-context'
+import { ThemeProvider } from './context/theme-context'
+import { SyncProvider } from './sync/SyncContext'
+import { VibestackPGliteProvider } from './db/pglite-provider'
+import './index.css'
+// Generated Routes
 import { routeTree } from './routeTree.gen'
+// Import the Mini Sync Visualizer
+import { MiniSyncVisualizer } from './features/sync/components/MiniSyncVisualizer';
+
+// Import the database functions\
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, error) => {
+        // eslint-disable-next-line no-console
+        if (import.meta.env.DEV) console.log({ failureCount, error })
+
+        if (failureCount >= 0 && import.meta.env.DEV) return false
+        if (failureCount > 3 && import.meta.env.PROD) return false
+
+        return !(
+          error instanceof AxiosError &&
+          [401, 403].includes(error.response?.status ?? 0)
+        )
+      },
+      refetchOnWindowFocus: import.meta.env.PROD,
+      staleTime: 10 * 1000, // 10s
+    },
+    mutations: {
+      onError: (error) => {
+        handleServerError(error)
+
+        if (error instanceof AxiosError) {
+          if (error.response?.status === 304) {
+            toast.error('Content not modified!')
+          }
+        }
+      },
+    },
+  },
+  queryCache: new QueryCache({
+    onError: (error) => {
+      if (error instanceof AxiosError) {
+        if (error.response?.status === 401) {
+          toast.error('Session expired!')
+          useAuthStore.getState().auth.reset()
+          const redirect = `${router.history.location.href}`
+          router.navigate({ to: '/sign-in', search: { redirect } })
+        }
+        if (error.response?.status === 500) {
+          toast.error('Internal Server Error!')
+          router.navigate({ to: '/500' })
+        }
+        if (error.response?.status === 403) {
+          // router.navigate("/forbidden", { replace: true });
+        }
+      }
+    },
+  }),
+})
 
 // Create a new router instance
-const router = createRouter({ routeTree })
+const router = createRouter({
+  routeTree,
+  context: { queryClient },
+  defaultPreload: 'intent',
+  defaultPreloadStaleTime: 0,
+})
 
 // Register the router instance for type safety
 declare module '@tanstack/react-router' {
@@ -22,120 +92,22 @@ declare module '@tanstack/react-router' {
   }
 }
 
-// App component with database and sync initialization
-function App() {
-  const [isDbInitialized, setIsDbInitialized] = useState(false);
-  const [dbError, setDbError] = useState<string | null>(null);
-  
-  // Initialize database and sync when the app starts
-  useEffect(() => {
-    let mounted = true;
-    
-    const initialize = async () => {
-      try {
-        console.log('Initializing database...');
-        
-        // Initialize database
-        const dbInstance = await initializeDatabase();
-        
-        if (!mounted) return;
-        
-        if (dbInstance) {
-          console.log('Database initialized successfully');
-          
-          // Check and apply migrations before initializing sync service
-          console.log('Checking for database migrations...');
-          const migrationsApplied = await checkAndApplyMigrations(dbInstance);
-          
-          if (migrationsApplied) {
-            console.log('Database migrations check completed successfully');
-          } else {
-            console.warn('Database migrations check completed with warnings');
-            // Continue anyway to support offline mode
-          }
-          
-          setIsDbInitialized(true);
-          
-          // Initialize sync service
-          console.log('Initializing sync service...');
-          const syncInitialized = initSync();
-          
-          if (syncInitialized) {
-            console.log('Sync service initialized successfully');
-          } else {
-            console.error('Failed to initialize sync service');
-          }
-        } else {
-          setDbError('Failed to initialize database');
-        }
-      } catch (error) {
-        if (!mounted) return;
-        console.error('Error initializing:', error);
-        setDbError(error instanceof Error ? error.message : 'Unknown error');
-      }
-    };
-    
-    initialize();
-    
-    // Subscribe to database events
-    const unsubscribeInit = dbMessageBus.subscribe('initialized', () => {
-      setIsDbInitialized(true);
-      setDbError(null);
-    });
-    
-    const unsubscribeError = dbMessageBus.subscribe('error', (data) => {
-      setDbError(data.error);
-    });
-    
-    // Clean up resources when the app unmounts
-    return () => {
-      mounted = false;
-      unsubscribeInit();
-      unsubscribeError();
-      
-      // Skip cleanup during HMR to prevent unnecessary service restarts
-      if (!import.meta.hot) {
-        cleanupSyncService();
-        terminateDatabase();
-      }
-    };
-  }, []);
-  
-  // Show loading screen while database is initializing
-  if (!isDbInitialized) {
-    return <LoadingScreen message={dbError ? `Error: ${dbError}` : 'Initializing database...'} />;
-  }
-  
-  return <RouterProvider router={router} />;
-}
-
-// Create root element
+// Render the app
 const rootElement = document.getElementById('root')!
-
-// For HMR in development, we need to handle the root differently
-if (import.meta.env.DEV) {
-  // In development, unmount any existing React tree before creating a new root
-  // This prevents the "container has already been passed to createRoot()" warning
-  let root = ReactDOM.createRoot(rootElement)
+if (!rootElement.innerHTML) {
+  const root = ReactDOM.createRoot(rootElement)
   root.render(
-    // Removed StrictMode for more accurate performance measurements
-    <Suspense fallback={<LoadingScreen />}>
-      <App />
-    </Suspense>
-  )
-
-  // Handle HMR
-  if (import.meta.hot) {
-    import.meta.hot.dispose(() => {
-      root.unmount()
-    })
-  }
-} else {
-  // In production, just create the root once
-  ReactDOM.createRoot(rootElement).render(
-    // Removed StrictMode for more accurate performance measurements
-    <Suspense fallback={<LoadingScreen />}>
-      <App />
-    </Suspense>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider defaultTheme='light' storageKey='vite-ui-theme'>
+        <FontProvider>
+          <VibestackPGliteProvider>
+            <SyncProvider autoConnect={true}>
+              <RouterProvider router={router} />
+              <MiniSyncVisualizer />
+            </SyncProvider>
+          </VibestackPGliteProvider>
+        </FontProvider>
+      </ThemeProvider>
+    </QueryClientProvider>
   )
 }

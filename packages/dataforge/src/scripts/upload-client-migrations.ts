@@ -43,21 +43,27 @@ async function getMigrationQueries(migration: any): Promise<{ up: string[], down
   return { up, down };
 }
 
-async function getNextSchemaVersion(dataSource: DataSource): Promise<string> {
-  // Get the latest schema version from existing migrations
-  const result = await dataSource.manager
+async function getNextSchemaVersion(dataSource: DataSource): Promise<number> {
+  // Get all schema versions from existing migrations
+  const results = await dataSource.manager
     .createQueryBuilder(ClientMigration, "migration")
-    .select("migration.schemaVersion")
-    .orderBy("migration.schemaVersion", "DESC")
-    .getOne();
+    .select("migration.schemaVersion", "schemaVersion") // Select the column
+    .getRawMany<{ schemaVersion: string }>(); // Get raw results
 
-  if (!result) {
-    return "0.1.0"; // Initial version if no migrations exist
+  let maxVersion = 0;
+  if (results && results.length > 0) {
+    // Parse all versions as integers and find the max
+    const versions = results
+      .map(r => parseInt(r.schemaVersion, 10)) // Parse as base-10 integer
+      .filter(v => !isNaN(v)); // Filter out any NaN results (e.g., from old X.Y.Z format)
+    
+    if (versions.length > 0) {
+      maxVersion = Math.max(...versions);
+    }
   }
-
-  // Parse version and increment minor version
-  const [major, minor, patch] = result.schemaVersion.split('.').map(Number);
-  return `${major}.${minor + 1}.${patch}`;
+  
+  // Return the next integer version number
+  return maxVersion + 1;
 }
 
 async function uploadClientMigrations() {
@@ -97,8 +103,8 @@ async function uploadClientMigrations() {
       return;
     }
 
-    // Get the next schema version only if we have migrations to upload
-    const schemaVersion = await getNextSchemaVersion(serverDataSource);
+    // Get the starting integer schema version number
+    let nextVersionNumber = await getNextSchemaVersion(serverDataSource);
     
     for (const { file, instance } of migrationsToUpload) {
       // Extract timestamp from filename
@@ -110,7 +116,7 @@ async function uploadClientMigrations() {
       // Create migration record
       const clientMigration = new ClientMigration();
       clientMigration.migrationName = instance.name;
-      clientMigration.schemaVersion = schemaVersion;
+      clientMigration.schemaVersion = nextVersionNumber.toString();
       clientMigration.dependencies = [];
       clientMigration.migrationType = MigrationType.SCHEMA;
       clientMigration.state = MigrationState.PENDING;
@@ -124,7 +130,7 @@ async function uploadClientMigrations() {
         await serverDataSource.manager.createQueryBuilder()
           .update(ClientMigration)
           .set({
-            schemaVersion: schemaVersion,
+            schemaVersion: nextVersionNumber.toString(),
             upQueries: up,
             downQueries: down,
             state: MigrationState.PENDING // Reset state for re-application
@@ -132,7 +138,7 @@ async function uploadClientMigrations() {
           .where("migration_name = :name", { name: instance.name })
           .execute();
         
-        console.log(`Updated existing migration: ${instance.name} with schema version ${schemaVersion}`);
+        console.log(`Updated existing migration: ${instance.name} with schema version ${nextVersionNumber}`);
       } else {
         // Insert new migration
         await serverDataSource.manager.createQueryBuilder()
@@ -141,8 +147,11 @@ async function uploadClientMigrations() {
           .values(clientMigration)
           .execute();
         
-        console.log(`Uploaded new client migration: ${instance.name} with schema version ${schemaVersion}`);
+        console.log(`Uploaded new client migration: ${instance.name} with schema version ${nextVersionNumber}`);
       }
+      
+      // Increment the version number for the next migration in the batch
+      nextVersionNumber++;
     }
 
     console.log('All client migrations processed successfully');

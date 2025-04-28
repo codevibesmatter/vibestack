@@ -18,8 +18,10 @@ import type { InitialSyncState, WebSocketHandler } from './types';
 import { SERVER_DOMAIN_TABLES } from '@repo/dataforge/server-entities';
 
 const MODULE_NAME = 'initial-sync';
-const WS_CHUNK_SIZE = 2000;  // Even larger chunks for WebSocket since we batch all changes together
-const DEFAULT_CHUNK_SIZE = 1000;  // Default chunk size for table queries
+// Smaller chunk sizes help avoid overwhelming the client-side IndexedDB
+// and improve the reliability of the sync process
+const WS_CHUNK_SIZE = 500;  // Reduced from 2000 to 500 for better client performance
+const DEFAULT_CHUNK_SIZE = 500;  // Also reduced default chunk size for better performance
 
 type TableName = keyof typeof SERVER_TABLE_HIERARCHY;
 
@@ -56,7 +58,7 @@ function cleanTableName(table: string): string {
 function recordsToChanges(table: string, records: QueryResultRow[]): TableChange[] {
   return records.map(record => ({
     table: cleanTableName(table),
-    operation: 'update' as const,
+    operation: 'insert' as const,
     data: record,
     updated_at: (record as any).updated_at?.toISOString() || new Date().toISOString()
   }));
@@ -176,7 +178,8 @@ async function processTable(
       // Wait for client to acknowledge receipt
       await messageHandler.waitForMessage(
         'clt_init_received',
-        (msg) => msg.table === table && msg.chunk === chunkNum
+        (msg) => msg.table === table && msg.chunk === chunkNum,
+        300000  // 5 minute timeout for large table chunks
       );
     },
     { chunkSize: WS_CHUNK_SIZE }
@@ -204,7 +207,7 @@ async function sendInitialSyncComplete(
   await messageHandler.send(initCompleteMsg);
   
   // Wait for client to acknowledge processing
-  await messageHandler.waitForMessage('clt_init_processed');
+  await messageHandler.waitForMessage('clt_init_processed', undefined, 300000);  // 5 minute timeout for final acknowledgment
 }
 
 /**

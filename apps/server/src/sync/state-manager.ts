@@ -50,6 +50,9 @@ export class SyncStateManager implements StateManager {
   ) {
     // Track wake-up time
     this.trackWakeTime();
+    
+    // Restore client ID from storage when DO wakes up
+    this.restoreClientId();
   }
 
   /**
@@ -69,6 +72,26 @@ export class SyncStateManager implements StateManager {
     
     await this.durableObjectState.storage.put('lastWakeTime', now);
     this.metrics.lastWakeTime = now;
+  }
+
+  /**
+   * Restore client ID from storage when DO wakes from hibernation
+   */
+  private async restoreClientId(): Promise<void> {
+    try {
+      const storedClientId = await this.durableObjectState.storage.get<string>('current_client_id');
+      
+      if (storedClientId) {
+        this.clientId = storedClientId;
+        syncLogger.info('Restored client ID from storage', {
+          clientId: storedClientId
+        }, MODULE_NAME);
+      }
+    } catch (error) {
+      syncLogger.error('Failed to restore client ID from storage', {
+        error: error instanceof Error ? error.message : String(error)
+      }, MODULE_NAME);
+    }
   }
 
   /**
@@ -141,59 +164,57 @@ export class SyncStateManager implements StateManager {
    */
   async cleanupConnection(): Promise<void> {
     if (!this.clientId) {
-      return;
+      return; // No client ID available, can't cleanup
     }
     
-    const clientIdToRemove = this.clientId; // Capture client ID before clearing
-    this.clientId = null; // Clear the client ID reference
-
-    if (clientIdToRemove) {
-      const key = `client:${clientIdToRemove}`;
-      syncLogger.debug('Deactivating client', { 
-        clientId: clientIdToRemove
-      }, MODULE_NAME);
-      
-      try {
-        // Get current state
-        const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
-        if (existingData) {
-          // Parse carefully to handle potential JSON issues
-          let data;
-          try {
-            data = JSON.parse(existingData);
-          } catch (jsonError) {
-            // Handle JSON parse error by creating a new data object
-            syncLogger.warn('Client data parse error, creating new record', {
-              clientId: clientIdToRemove,
-              error: jsonError instanceof Error ? jsonError.message : String(jsonError)
-            }, MODULE_NAME);
-            
-            data = {
-              lastSeen: Date.now()
-            };
-          }
-          
-          // Just mark as inactive - ClientManager will handle cleanup
-          await this.context.env.CLIENT_REGISTRY.put(
-            key,
-            JSON.stringify({
-              ...data,
-              active: false,
-              lastSeen: Date.now(),
-              disconnectedAt: Date.now()
-            })
-          );
-          
-          syncLogger.debug('Client marked inactive', { 
-            clientId: clientIdToRemove
+    const clientId = this.clientId;
+    
+    // Mark client as inactive in KV, but keep the in-memory reference
+    const key = `client:${clientId}`;
+    syncLogger.debug('Deactivating client', { 
+      clientId
+    }, MODULE_NAME);
+    
+    try {
+      // Get current state
+      const existingData = await this.context.env.CLIENT_REGISTRY.get(key);
+      if (existingData) {
+        // Parse carefully to handle potential JSON issues
+        let data;
+        try {
+          data = JSON.parse(existingData);
+        } catch (jsonError) {
+          // Handle JSON parse error by creating a new data object
+          syncLogger.warn('Client data parse error, creating new record', {
+            clientId,
+            error: jsonError instanceof Error ? jsonError.message : String(jsonError)
           }, MODULE_NAME);
+          
+          data = {
+            lastSeen: Date.now()
+          };
         }
-      } catch (err) {
-        syncLogger.error('Failed to deactivate client', {
-          clientId: clientIdToRemove,
-          error: err instanceof Error ? err.message : String(err)
+        
+        // Just mark as inactive - ClientManager will handle cleanup
+        await this.context.env.CLIENT_REGISTRY.put(
+          key,
+          JSON.stringify({
+            ...data,
+            active: false,
+            lastSeen: Date.now(),
+            disconnectedAt: Date.now()
+          })
+        );
+        
+        syncLogger.debug('Client marked inactive', { 
+          clientId
         }, MODULE_NAME);
       }
+    } catch (err) {
+      syncLogger.error('Failed to deactivate client', {
+        clientId,
+        error: err instanceof Error ? err.message : String(err)
+      }, MODULE_NAME);
     }
   }
 
@@ -205,6 +226,10 @@ export class SyncStateManager implements StateManager {
     
     try {
       this.clientId = clientId;
+      
+      // Store the client ID in the Durable Object's storage for persistence
+      // This helps validate that the right client is connecting to the right DO
+      await this.durableObjectState.storage.put('current_client_id', clientId);
       
       // Register client in KV registry
       const clientData = { 

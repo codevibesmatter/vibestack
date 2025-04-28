@@ -1,226 +1,248 @@
 /**
- * Database Hooks
+ * React Hooks for PGlite
  * 
- * This module provides React hooks for interacting with the database
- * through the message bus.
+ * This file provides React hooks for interacting with the PGlite database.
  */
 
-import { useState, useEffect, useCallback } from 'react';
-import { dbMessageBus, DbEventType } from './message-bus';
-
-/**
- * Hook for executing a database query
- * @returns An object with query functions and state
- */
-export function useDbQuery() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
-  
-  /**
-   * Execute a SQL query
-   * @param sql The SQL query
-   * @param params The query parameters
-   * @returns A promise that resolves with the query result
-   */
-  const executeQuery = useCallback(async <T = any>(sql: string, params?: any[]): Promise<T> => {
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const result = await dbMessageBus.sendCommand<T>('query', { sql, params });
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error executing query');
-      setError(error);
-      throw error;
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-  
-  return {
-    executeQuery,
-    isLoading,
-    error
-  };
-}
+import { useState, useEffect } from 'react';
+import { getDatabase, PGliteWithLive, QueryState, Results } from './db';
 
 /**
- * Hook for subscribing to database events
- * @param eventType The event type to subscribe to
- * @param callback The callback function
+ * React hook for executing a SQL query
  */
-export function useDbEvent(eventType: DbEventType, callback: (data: any) => void) {
-  useEffect(() => {
-    // Subscribe to event
-    const unsubscribe = dbMessageBus.subscribe(eventType, callback);
-    
-    // Unsubscribe on cleanup
-    return unsubscribe;
-  }, [eventType, callback]);
-}
-
-/**
- * Hook for managing entities
- * @returns An object with entity management functions and state
- */
-export function useDbEntity() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
+export function useQuery<T = any>(
+  sql: string, 
+  params: any[] = [], 
+  options?: { enabled?: boolean }
+): QueryState<T[]> {
+  const [state, setState] = useState<QueryState<T[]>>({
+    data: null,
+    loading: true,
+    error: null
+  });
   
-  /**
-   * Upsert an entity
-   * @param entityType The entity type
-   * @param entityId The entity ID
-   * @param data The entity data
-   * @param timestamp The timestamp
-   * @returns A promise that resolves with the upsert result
-   */
-  const upsertEntity = useCallback(async <T = any>(
-    entityType: string,
-    entityId: string,
-    data: any,
-    timestamp?: number
-  ): Promise<T> => {
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const result = await dbMessageBus.sendCommand<T>('upsert', {
-        entityType,
-        entityId,
-        data,
-        timestamp: timestamp || Date.now()
-      });
-      
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error upserting entity');
-      setError(error);
-      throw error;
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-  
-  /**
-   * Delete an entity
-   * @param entityType The entity type
-   * @param entityId The entity ID
-   * @param timestamp The timestamp
-   * @returns A promise that resolves with the delete result
-   */
-  const deleteEntity = useCallback(async <T = any>(
-    entityType: string,
-    entityId: string,
-    timestamp?: number
-  ): Promise<T> => {
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const result = await dbMessageBus.sendCommand<T>('delete', {
-        entityType,
-        entityId,
-        timestamp: timestamp || Date.now()
-      });
-      
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error deleting entity');
-      setError(error);
-      throw error;
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-  
-  return {
-    upsertEntity,
-    deleteEntity,
-    isLoading,
-    error
-  };
-}
-
-/**
- * Hook for executing database transactions
- * @returns An object with transaction functions and state
- */
-export function useDbTransaction() {
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
-  
-  /**
-   * Execute a transaction
-   * @param operations The operations to execute
-   * @returns A promise that resolves with the transaction result
-   */
-  const executeTransaction = useCallback(async <T = any>(operations: any[]): Promise<T> => {
-    setIsLoading(true);
-    setError(null);
-    
-    try {
-      const result = await dbMessageBus.sendCommand<T>('transaction', { operations });
-      return result;
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error('Unknown error executing transaction');
-      setError(error);
-      throw error;
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-  
-  return {
-    executeTransaction,
-    isLoading,
-    error
-  };
-}
-
-/**
- * Hook for tracking database initialization status
- * @returns The database initialization status
- */
-export function useDbStatus() {
-  const [isInitialized, setIsInitialized] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const enabled = options?.enabled !== false;
   
   useEffect(() => {
-    // Check if already initialized
-    const checkInitialized = async () => {
+    if (!sql || !enabled) {
+      setState({ data: null, loading: false, error: null });
+      return;
+    }
+    
+    let mounted = true;
+    
+    async function executeQuery() {
       try {
-        // Try to execute a simple query to check if initialized
-        await dbMessageBus.sendCommand('query', { sql: 'SELECT 1' });
-        setIsInitialized(true);
-      } catch (err) {
-        // Ignore error - we'll wait for initialization event
+        setState(prev => ({ ...prev, loading: true }));
+        
+        const db = await getDatabase();
+        const results = await db.query(sql, params);
+        
+        if (mounted) {
+          // Handle PGlite results type correctly
+          const formattedResults = Array.isArray(results) 
+            ? results as unknown as T[] 
+            : ([] as T[]);
+          
+          setState({
+            data: formattedResults,
+            loading: false,
+            error: null
+          });
+        }
+      } catch (error) {
+        console.error('Error executing query:', error);
+        
+        if (mounted) {
+          setState({
+            data: null,
+            loading: false,
+            error: error instanceof Error ? error : new Error(String(error))
+          });
+        }
       }
-    };
+    }
     
-    checkInitialized();
+    executeQuery();
     
-    // Subscribe to initialization event
-    const unsubscribeInit = dbMessageBus.subscribe('initialized', () => {
-      setIsInitialized(true);
-      setError(null);
-    });
-    
-    // Subscribe to error event
-    const unsubscribeError = dbMessageBus.subscribe('error', (data) => {
-      setError(data.error);
-    });
-    
-    // Unsubscribe on cleanup
     return () => {
-      unsubscribeInit();
-      unsubscribeError();
+      mounted = false;
     };
-  }, []);
+  }, [sql, JSON.stringify(params), enabled]);
   
-  return {
-    isInitialized,
-    error
+  return state;
+}
+
+/**
+ * React hook for executing a mutation query (INSERT, UPDATE, DELETE)
+ */
+export function useMutation<T = any>(
+  sql?: string
+): [
+  (params?: any[]) => Promise<T[]>,
+  { loading: boolean; error: Error | null; data: T[] | null }
+] {
+  const [state, setState] = useState<{
+    loading: boolean;
+    error: Error | null;
+    data: T[] | null;
+  }>({
+    loading: false,
+    error: null,
+    data: null
+  });
+  
+  const executeMutation = async (params: any[] = []) => {
+    try {
+      setState(prev => ({ ...prev, loading: true }));
+      
+      const db = await getDatabase();
+      const result = await db.query(sql || '', params);
+      
+      // Handle PGlite results type correctly
+      const formattedResults = Array.isArray(result) 
+        ? result as unknown as T[] 
+        : ([] as T[]);
+      
+      setState({
+        loading: false,
+        error: null,
+        data: formattedResults
+      });
+      
+      return formattedResults;
+    } catch (error) {
+      console.error('Error executing mutation:', error);
+      
+      const errorObj = error instanceof Error 
+        ? error 
+        : new Error(String(error));
+      
+      setState({
+        loading: false,
+        error: errorObj,
+        data: null
+      });
+      
+      throw errorObj;
+    }
   };
+  
+  return [executeMutation, state];
+}
+
+/**
+ * Simplistic live query implementation
+ * Note: This is a basic implementation that doesn't actually
+ * use server-sent events or websockets. It polls for changes.
+ */
+export function useLive<T = any>(
+  sql: string,
+  params: any[] = [],
+  options?: { pollingInterval?: number; enabled?: boolean }
+): QueryState<T[]> {
+  const [state, setState] = useState<QueryState<T[]>>({
+    data: null,
+    loading: true,
+    error: null
+  });
+  
+  const pollingInterval = options?.pollingInterval || 2000;
+  const enabled = options?.enabled !== false;
+  
+  useEffect(() => {
+    if (!sql || !enabled) {
+      setState({ data: null, loading: false, error: null });
+      return;
+    }
+    
+    let mounted = true;
+    let intervalId: NodeJS.Timeout;
+    
+    async function executeLiveQuery() {
+      try {
+        if (!mounted) return;
+        
+        setState(prev => ({ ...prev, loading: true }));
+        
+        const db = await getDatabase();
+        
+        // If db.live exists and has a query method, use it
+        if (db.live?.query) {
+          try {
+            const { results } = await db.live.query(sql, params);
+            
+            if (mounted) {
+              // Handle PGlite results type correctly
+              const formattedResults = Array.isArray(results) 
+                ? results as unknown as T[] 
+                : ([] as T[]);
+              
+              setState({
+                data: formattedResults,
+                loading: false,
+                error: null
+              });
+            }
+          } catch (error) {
+            console.error('Error executing live query:', error);
+            // Fallback to regular query if live query fails
+            const results = await db.query(sql, params);
+            
+            if (mounted) {
+              // Handle PGlite results type correctly
+              const formattedResults = Array.isArray(results) 
+                ? results as unknown as T[] 
+                : ([] as T[]);
+              
+              setState({
+                data: formattedResults,
+                loading: false,
+                error: null
+              });
+            }
+          }
+        } else {
+          // Fallback to regular query
+          const results = await db.query(sql, params);
+          
+          if (mounted) {
+            // Handle PGlite results type correctly
+            const formattedResults = Array.isArray(results) 
+              ? results as unknown as T[] 
+              : ([] as T[]);
+            
+            setState({
+              data: formattedResults,
+              loading: false,
+              error: null
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error in live query:', error);
+        
+        if (mounted) {
+          setState({
+            data: null,
+            loading: false,
+            error: error instanceof Error ? error : new Error(String(error))
+          });
+        }
+      }
+    }
+    
+    // Execute immediately
+    executeLiveQuery();
+    
+    // Set up polling interval
+    intervalId = setInterval(executeLiveQuery, pollingInterval);
+    
+    return () => {
+      mounted = false;
+      clearInterval(intervalId);
+    };
+  }, [sql, JSON.stringify(params), pollingInterval, enabled]);
+  
+  return state;
 } 

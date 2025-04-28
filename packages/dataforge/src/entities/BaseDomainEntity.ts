@@ -1,6 +1,7 @@
 import { 
   PrimaryGeneratedColumn, 
   CreateDateColumn, 
+  UpdateDateColumn,
   Column 
 } from 'typeorm';
 import { 
@@ -37,11 +38,9 @@ export abstract class BaseDomainEntity {
   @IsDate({ message: "Created date must be a valid date" })
   createdAt!: Date;
   
-  @Column({ 
+  @UpdateDateColumn({ 
     type: "timestamptz", 
-    name: "updated_at", 
-    nullable: false,
-    default: () => "CURRENT_TIMESTAMP" 
+    name: "updated_at" 
   })
   @IsDate({ message: "Updated date must be a valid date" })
   updatedAt!: Date;

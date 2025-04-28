@@ -1,3 +1,9 @@
+/**
+ * PGlite Worker Implementation
+ * 
+ * This file provides the worker implementation for PGlite.
+ */
+
 import { PGlite } from '@electric-sql/pglite';
 import { worker } from '@electric-sql/pglite/worker';
 import { uuid_ossp } from '@electric-sql/pglite/contrib/uuid_ossp';
@@ -5,7 +11,7 @@ import { live } from '@electric-sql/pglite/live';
 import { IdbFs } from '@electric-sql/pglite';
 
 // Database name for storage
-const DB_NAME = 'vibestack-db';
+const DB_NAME = 'vibestack-admin-db';
 
 // Configure the database with IndexedDB filesystem
 // We're using IndexedDB for persistence across sessions
@@ -13,9 +19,8 @@ const config = {
   fs: new IdbFs(DB_NAME),
   extensions: { 
     uuid_ossp,
-    // The live extension is registered but not enabled via SQL
-    // It will be set up in the main thread
-    live 
+    // Register the live extension
+    live
   },
   // Use relaxed durability for better performance
   // This returns query results immediately and flushes to IndexedDB asynchronously
@@ -24,7 +29,7 @@ const config = {
   cacheSize: 5000
 };
 
-// Initialize the worker
+// Worker initialization
 worker({
   async init() {
     console.log('🔄 Initializing PGlite worker with IndexedDB storage...');
@@ -37,6 +42,14 @@ worker({
       // Create the uuid-ossp extension if needed
       console.log('🔄 Creating uuid-ossp extension...')
       await db.exec('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";');
+      
+      // Initialize live extension
+      console.log('🔄 Initializing live extension...');
+      if (db.live) {
+        console.log('✅ Live extension initialized successfully');
+      } else {
+        console.warn('⚠️ Live extension not available');
+      }
       
       console.log('✅ Database initialized successfully');
       return db;

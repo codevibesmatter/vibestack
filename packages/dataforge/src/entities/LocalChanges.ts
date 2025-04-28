@@ -1,5 +1,5 @@
 import { Entity, Column, Index } from 'typeorm';
-import { IsString, IsJSON, IsBoolean } from 'class-validator';
+import { IsString, IsJSON, IsNumber } from 'class-validator';
 import { ClientOnly } from '../utils/context.js';
 import { BaseSystemEntity } from './BaseSystemEntity.js';
 
@@ -31,7 +31,7 @@ export class LocalChanges extends BaseSystemEntity {
   @Column({ type: 'timestamptz', name: 'updated_at' })
   updatedAt!: Date;
 
-  @Column({ type: 'boolean', default: false, name: 'processed_sync' })
-  @IsBoolean()
-  processedSync!: boolean;
+  @Column({ type: 'integer', default: 0, name: 'processed_sync' })
+  @IsNumber()
+  processedSync!: number;
 } 

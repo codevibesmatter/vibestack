@@ -9,7 +9,7 @@ interface TableChange$1 {
     updated_at: string;
 }
 
-type SrvMessageType = 'srv_send_changes' | 'srv_catchup_changes' | 'srv_live_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_lsn_update' | 'srv_changes_received' | 'srv_changes_applied' | 'srv_sync_completed' | 'srv_catchup_completed' | 'srv_sync_stats';
+type SrvMessageType = 'srv_send_changes' | 'srv_catchup_changes' | 'srv_live_changes' | 'srv_init_start' | 'srv_init_changes' | 'srv_init_complete' | 'srv_heartbeat' | 'srv_error' | 'srv_state_change' | 'srv_lsn_update' | 'srv_changes_received' | 'srv_changes_applied' | 'srv_sync_completed' | 'srv_catchup_completed' | 'srv_live_start' | 'srv_sync_stats';
 type CltMessageType = 'clt_sync_request' | 'clt_send_changes' | 'clt_heartbeat' | 'clt_error' | 'clt_changes_received' | 'clt_changes_applied' | 'clt_init_received' | 'clt_init_processed' | 'clt_catchup_received';
 interface BaseMessage {
     messageId: string;
@@ -71,6 +71,17 @@ interface ServerSyncCompletedMessage extends ServerMessage {
     changeCount: number;
     success: boolean;
     error?: string;
+}
+/**
+ * Message sent when a client connects and is already up-to-date,
+ * confirming the transition to live sync.
+ */
+interface ServerLiveStartMessage extends ServerMessage {
+    type: 'srv_live_start';
+    startLSN: string;
+    finalLSN: string;
+    changeCount: number;
+    success: boolean;
 }
 interface ServerCatchupCompletedMessage extends ServerMessage {
     type: 'srv_catchup_completed';
@@ -153,7 +164,7 @@ interface ClientInitReceivedMessage extends ClientMessage {
 interface ClientInitProcessedMessage extends ClientMessage {
     type: 'clt_init_processed';
 }
-type Message = ServerMessage | ServerCatchupCompletedMessage | ClientMessage;
+type Message = ServerMessage | ServerCatchupCompletedMessage | ServerLiveStartMessage | ServerSyncStatsMessage | ClientMessage;
 
 /**
  * Core change type for replication

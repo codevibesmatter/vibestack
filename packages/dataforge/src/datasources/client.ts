@@ -30,7 +30,6 @@ const clientDataSource = new DataSource({
   
   // Migration settings
   migrations: ["src/migrations/client/*.ts"],
-  migrationsTableName: "migrations",
   
   // Use migrations instead of synchronize
   synchronize: false,

@@ -9,6 +9,11 @@ import { sync } from './sync'
 import replication from './replication'
 import { migrations } from './migrations'
 import { db } from './db'
+import { HTTPException } from 'hono/http-exception'
+import { serverLogger as log } from '../middleware/logger'
+import type { AppBindings } from '../types/hono'
+import authRoutes from './routes/auth'
+import internalAuthRoutes from './routes/internalAuth'
 
 // Create API router
 const api = new Hono<ApiEnv>()
@@ -25,6 +30,13 @@ api.route('/sync', sync)
 api.route('/replication', replication)
 api.route('/migrations', migrations)
 api.route('/db', db)
+api.route('/auth', authRoutes)
+api.route('/internal/auth', internalAuthRoutes)
+
+// Basic health check endpoint
+api.get('/health', (c) => {
+  return c.text('Server OK')
+})
 
 export default api
 export type ApiType = typeof api  // For client type generation 

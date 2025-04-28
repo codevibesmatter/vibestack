@@ -8,30 +8,27 @@
     "skipLibCheck": true,
 
     /* Bundler mode */
-    "moduleResolution": "bundler",
+    "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "react-jsx",
 
-    /* Decorators */
-    "experimentalDecorators": true,
-    "emitDecoratorMetadata": true,
+    /* Alias */
+    "baseUrl": ".",
+    "paths": {
+      "@repo/dataforge/client-entities": ["../../packages/dataforge/dist/generated/client-entities.d.ts"],
+      "@repo/sync-types": ["../../packages/sync-types/dist/index.d.ts"],
+      "@/*": ["./src/*"]
+    },
 
     /* Linting */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true,
-
-    /* Workspace Packages */
-    "baseUrl": ".",
-    "paths": {
-      "@repo/*": ["../../packages/*/src"]
-    }
+    "noUncheckedSideEffectImports": true
   },
-  "include": ["src"],
-  "references": []
+  "include": ["src"]
 }
