@@ -8,8 +8,6 @@
     "dev:info": "turbo run dev:info --filter=./apps/web --filter=./apps/server",
     "dev:web": "turbo run dev --filter=./apps/web",
     "dev:web:debug": "turbo run dev:debug --filter=./apps/web",
-    "dev:local-db": "bash local-neon/setup-local-neon.sh start && turbo run dev --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
-    "dev:local-db:debug": "bash local-neon/setup-local-neon.sh start && turbo run dev:debug --filter=./apps/web --filter=./apps/server --filter=./apps/openauth",
     "lint": "eslint . --ext .ts,.tsx",
     "lint:fix": "eslint . --ext .ts,.tsx --fix",
     "quality": "pnpm --filter @repo/code-quality build && pnpm --filter @repo/code-quality quality",
@@ -36,7 +34,7 @@
     "pnpm": ">=8"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.3.0",
+    "@electric-sql/pglite": "^0.2.17",
     "@electric-sql/pglite-react": "^0.2.17",
     "@electric-sql/pglite-repl": "^0.2.17",
     "hono": "^4.7.7",
