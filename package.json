@@ -18,10 +18,10 @@
   "devDependencies": {
     "@repo/code-quality": "workspace:*",
     "@repo/eslint-config": "workspace:*",
-    "eslint": "^8.56.0",
-    "prettier": "^3.1.0",
-    "turbo": "latest",
-    "typescript": "~5.5.0"
+    "eslint": "^9.25.1",
+    "prettier": "^3.5.3",
+    "turbo": "^2.5.2",
+    "typescript": "~5.8.3"
   },
   "packageManager": "pnpm@8.9.0",
   "workspaces": [
@@ -34,10 +34,10 @@
     "pnpm": ">=8"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.2.17",
-    "@electric-sql/pglite-react": "^0.2.17",
-    "@electric-sql/pglite-repl": "^0.2.17",
-    "hono": "^4.7.7",
-    "tailwindcss": "^3.4.1"
+    "@electric-sql/pglite": "^0.3.0",
+    "@electric-sql/pglite-react": "^0.2.18",
+    "@electric-sql/pglite-repl": "^0.2.18",
+    "hono": "^4.7.8",
+    "tailwindcss": "^4.1.4"
   }
 }

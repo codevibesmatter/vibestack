@@ -81,7 +81,7 @@ export default defineConfig({
     proxy: {
       // Proxy requests starting with /api to your backend server
       '/api': {
-        target: 'http://localhost:8787', // Your backend server URL
+        target: 'http://127.0.0.1:8787', // Updated target to use IP address
         changeOrigin: true, // Recommended for virtual hosted sites
         // secure: false, // Uncomment if backend uses self-signed SSL cert
         // rewrite: (path) => path.replace(/^\/api/, ''), // Uncomment if backend doesn't expect /api prefix

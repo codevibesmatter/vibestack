@@ -21,8 +21,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { SelectDropdown } from '@/components/select-dropdown'
-import { Task } from '@dataforge/generated/client-entities'
-import { TaskStatus, TaskPriority } from '@dataforge/entities/Task'
+import { Task, TaskStatus, TaskPriority } from '@repo/dataforge/client-entities'
 import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource'
 import { useState } from 'react'
 import { zodResolver } from "@hookform/resolvers/zod"
@@ -146,8 +145,8 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
                     defaultValue={field.value}
                     onValueChange={field.onChange}
                     placeholder='Select status'
-                    items={Object.values(TaskStatus).map(status => ({
-                      label: status.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase()),
+                    items={Object.values(TaskStatus).map((status: TaskStatus) => ({
+                      label: status.replace('_', ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
                       value: status,
                     }))}
                   />
@@ -167,7 +166,7 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
                       defaultValue={field.value}
                       className='flex flex-col space-y-1'
                     >
-                      {Object.values(TaskPriority).map(priority => (
+                      {Object.values(TaskPriority).map((priority: TaskPriority) => (
                         <FormItem key={priority} className='flex items-center space-y-0 space-x-3'>
                           <FormControl>
                             <RadioGroupItem value={priority} />

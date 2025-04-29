@@ -1,11 +1,14 @@
 import type { Context as HonoContext } from 'hono';
 import type { Env, ExecutionContext } from './env';
+import type { AuthType } from '../lib/auth';
 
 /**
  * Type for Hono bindings that includes our environment
+ * Also include the Variables expected by AuthType for consistency
  */
 export type AppBindings = {
   Bindings: Env;
+  Variables: AuthType['Variables'];
 };
 
 /**

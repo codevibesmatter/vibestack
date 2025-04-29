@@ -1,4 +1,4 @@
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
 import {
   BadgeCheck,
   Bell,
@@ -24,6 +24,8 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar'
+import { useAuthStore } from '@/stores/authStore'
+import axios from 'axios'
 
 export function NavUser({
   user,
@@ -35,6 +37,21 @@ export function NavUser({
   }
 }) {
   const { isMobile } = useSidebar()
+  const { setUnauthenticated } = useAuthStore()
+  const navigate = useNavigate()
+
+  const handleSignOut = async () => {
+    try {
+      console.log('[AUTH] Attempting to sign out via /api/auth/logout...');
+      await axios.post('/api/auth/logout', {}, { withCredentials: true });
+      console.log('[AUTH] Logout API call successful.');
+    } catch (error) {
+      console.error('[AUTH] Logout API call failed:', error);
+    }
+    console.log('[AUTH] Clearing frontend auth state and redirecting to sign-in.');
+    setUnauthenticated();
+    navigate({ to: '/sign-in', replace: true });
+  };
 
   return (
     <SidebarMenu>
@@ -107,7 +124,7 @@ export function NavUser({
               </DropdownMenuItem>
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
-            <DropdownMenuItem>
+            <DropdownMenuItem onSelect={handleSignOut}>
               <LogOut />
               Log out
             </DropdownMenuItem>

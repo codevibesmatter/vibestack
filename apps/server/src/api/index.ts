@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { logger } from 'hono/logger'
-import { cors } from 'hono/cors'
+// Remove cors import again
+// import { cors } from 'hono/cors' 
 import type { ApiEnv } from '../types/api'
 import { projects } from './projects'
 import { tasks } from './tasks'
@@ -9,18 +10,19 @@ import { sync } from './sync'
 import replication from './replication'
 import { migrations } from './migrations'
 import { db } from './db'
+import authRouter from './auth'
 import { HTTPException } from 'hono/http-exception'
 import { serverLogger as log } from '../middleware/logger'
 import type { AppBindings } from '../types/hono'
-import authRoutes from './routes/auth'
-import internalAuthRoutes from './routes/internalAuth'
 
 // Create API router
 const api = new Hono<ApiEnv>()
 
 // Global middleware
 api.use('*', logger())
-api.use('*', cors())
+
+// REMOVE path-specific CORS middleware here - it will be handled in src/index.ts
+// api.use('/auth/*', cors({...}))
 
 // Mount routes with proper prefixes
 api.route('/projects', projects)
@@ -30,8 +32,7 @@ api.route('/sync', sync)
 api.route('/replication', replication)
 api.route('/migrations', migrations)
 api.route('/db', db)
-api.route('/auth', authRoutes)
-api.route('/internal/auth', internalAuthRoutes)
+api.route('/auth', authRouter)
 
 // Basic health check endpoint
 api.get('/health', (c) => {
@@ -39,4 +40,4 @@ api.get('/health', (c) => {
 })
 
 export default api
-export type ApiType = typeof api  // For client type generation 
+export type ApiType = typeof api 

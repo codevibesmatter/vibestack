@@ -4,16 +4,20 @@
 import 'reflect-metadata';
 
 // Import other dependencies
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
+import { Hono, Context } from 'hono';
+import { cors } from 'hono/cors'; // Re-add hono/cors import
 import api from './api';
 import { serverLogger } from './middleware/logger';
 import { createStructuredLogger } from './middleware/logger';
+// Removed manualCorsHeaders import
 import type { AppBindings } from './types/hono';
 import type { Env, ExecutionContext } from './types/env';
 import { SyncDO } from './sync/SyncDO';
 import { ReplicationDO } from './replication/ReplicationDO';
 import internalAuthApp from './auth/internal';
+import { getAuth, AuthType } from './lib/auth';
+
+// Remove temporary auth instance
 
 /**
  * Main API router for PUBLIC endpoints
@@ -21,10 +25,62 @@ import internalAuthApp from './auth/internal';
  */
 const apiApp = new Hono<AppBindings>().basePath('/api');
 
+// Add Hono's CORS middleware FIRST
+apiApp.use('*', cors({
+  origin: (origin) => {
+    // Dynamically allow the specific frontend origin
+    // or potentially others in the future
+    const allowedOrigins = ['http://localhost:5173'];
+    if (allowedOrigins.includes(origin)) {
+      return origin;
+    } else {
+      // Return a default allowed origin or null if none match
+      // Returning the first one here for consistency, though ideally, it should match.
+      return allowedOrigins[0]; 
+    }
+  },
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true, // Allow cookies/credentials
+  maxAge: 86400, // Cache preflight for 1 day
+}));
+
 // Use our structured logger middleware
 apiApp.use('*', createStructuredLogger());
 
-// Mount public API routes
+// Mount the Better Auth handler using double asterisk pattern for GET/POST
+// TEMPORARILY simplified for CORS debugging - Setting headers manually
+apiApp.on(["POST", "GET"], "/auth/**", 
+  // REMOVED manualCorsHeaders middleware usage
+  async (c) => { 
+    // Restore original handler logic
+    const requestId = c.req.header('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    console.log(`[${requestId}] [apiApp .on()] Handling auth path: ${c.req.path}, Method: ${c.req.method}`);
+    console.log(`[${requestId}] Request headers:`, Object.fromEntries(c.req.raw.headers.entries()));
+
+    console.log(`[${requestId}] Getting auth instance...`);
+    const authInstance = getAuth(c); 
+    try {
+      console.log(`[${requestId}] Calling auth handler...`);
+      const response = await authInstance.handler(c.req.raw);
+      console.log(`[${requestId}] Auth handler returned response:`, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries())
+      });
+
+      // Return the raw response directly. CORS middleware should handle headers.
+      return response;
+
+    } catch (error) {
+      console.error(`[${requestId}] Error in Better Auth handler:`, error);
+      // Return a simple error response. CORS middleware should handle headers.
+      return c.json({ error: "Internal Auth Error" }, 500);
+    }
+  }
+);
+
+// Mount OTHER public API routes 
 apiApp.route('/', api);
 
 /**
@@ -56,11 +112,10 @@ const worker = {
    * @returns Response to the request
    */
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    console.log('Environment check:', {
-      environment: env.ENVIRONMENT,
-      isDevelopment: env.ENVIRONMENT === 'development',
-      isProduction: env.ENVIRONMENT === 'production'
-    });
+    const requestId = request.headers.get('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    // console.log(`[${requestId}] Worker fetch called for: ${request.url}`); // Removed log
+    // console.log(`[${requestId}] Request method: ${request.method}`); // Removed log
+    // console.log(`[${requestId}] Request headers:`, Object.fromEntries(request.headers.entries())); // Removed log
     
     const url = new URL(request.url);
 
@@ -97,11 +152,16 @@ const worker = {
 
     // --- Route to PUBLIC API router ---
     if (url.pathname.startsWith('/api/')) {
-      serverLogger.debug(`Routing to public API app for path: ${url.pathname}`);
+      // console.log(`[${requestId}] Routing to public API app for path: ${url.pathname}`); // Removed log
       try {
-        return await apiApp.fetch(request, env, ctx);
+        // Hono app (apiApp) will handle the actual GET/POST for /api/auth/**
+        // including setting CORS headers on the response via the .on() handler
+        const response = await apiApp.fetch(request, env, ctx);
+        // console.log(`[${requestId}] API response status: ${response.status}`); // Removed log
+        // console.log(`[${requestId}] API response headers:`, Object.fromEntries(response.headers.entries())); // Removed log
+        return response;
       } catch (error) {
-        serverLogger.error('Error handling request', error);
+        console.error(`[${requestId}] Error handling request:`, error);
         return new Response(JSON.stringify({
           ok: false,
           error: {
@@ -119,7 +179,7 @@ const worker = {
     
     // --- Route to INTERNAL router ---
     if (url.pathname.startsWith('/internal/')) {
-      serverLogger.debug(`Routing to internal app for path: ${url.pathname}`);
+      // serverLogger.debug(`Routing to internal app for path: ${url.pathname}`); // Keep debug log potentially
       try {
         return await internalApp.fetch(request, env, ctx);
       } catch (error) {
@@ -129,7 +189,7 @@ const worker = {
     }
 
     // No route matched
-    serverLogger.debug('No route matched, returning 404');
+    // serverLogger.debug('No route matched, returning 404'); // Keep debug log potentially
     return new Response('Not Found', { status: 404 });
   }
 };

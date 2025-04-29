@@ -2,7 +2,8 @@ import { HTMLAttributes, useState } from 'react'
 import { z } from 'zod'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { toast } from 'sonner'
 import { IconBrandFacebook, IconBrandGithub } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -16,6 +17,8 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/password-input'
+import { authClient } from '@/lib/auth'
+import { useAuthStore } from '@/stores/authStore'
 
 type UserAuthFormProps = HTMLAttributes<HTMLFormElement>
 
@@ -36,6 +39,8 @@ const formSchema = z.object({
 
 export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const [isLoading, setIsLoading] = useState(false)
+  const setAuthenticated = useAuthStore((state) => state.setAuthenticated)
+  const navigate = useNavigate({ from: '/sign-in' })
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -45,14 +50,36 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     },
   })
 
-  function onSubmit(data: z.infer<typeof formSchema>) {
+  async function onSubmit(data: z.infer<typeof formSchema>) {
     setIsLoading(true)
-    // eslint-disable-next-line no-console
-    console.log(data)
+    try {
+      console.log("[Sign In] Attempting sign-in with:", data.email);
+      const result = await authClient.signIn.email({
+        email: data.email,
+        password: data.password,
+      });
 
-    setTimeout(() => {
+      console.log("[Sign In] Result:", result);
+
+      if ('data' in result && result.data?.user) {
+        setAuthenticated({ id: result.data.user.id, email: result.data.user.email });
+        toast.success("Login successful!");
+        navigate({ to: '/', replace: true });
+      } else if ('error' in result) {
+        console.error("[Sign In] Auth Error:", result.error);
+        const errorMessage = result.error?.message || "Sign in failed. Please check credentials.";
+        toast.error(errorMessage);
+      } else {
+        console.error("[Sign In] Unexpected response structure:", result);
+        toast.error("An unexpected error occurred during login.");
+      }
+    } catch (error: any) {
+      console.error("[Sign In] Network/Fetch Error:", error);
+      const errorMessage = error?.message || "A network error occurred. Please try again.";
+      toast.error(errorMessage);
+    } finally {
       setIsLoading(false)
-    }, 3000)
+    }
   }
 
   return (

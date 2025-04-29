@@ -2,6 +2,8 @@ import { HTMLAttributes, useState } from 'react'
 import { z } from 'zod'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
+import { useNavigate } from '@tanstack/react-router'
+import { toast } from 'sonner'
 import { IconBrandFacebook, IconBrandGithub } from '@tabler/icons-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -15,11 +17,14 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/password-input'
+import { authClient } from '@/lib/auth'
+import { useAuthStore } from '@/stores/authStore'
 
 type SignUpFormProps = HTMLAttributes<HTMLFormElement>
 
 const formSchema = z
   .object({
+    name: z.string().min(1, { message: 'Please enter your name' }),
     email: z
       .string()
       .min(1, { message: 'Please enter your email' })
@@ -41,24 +46,50 @@ const formSchema = z
 
 export function SignUpForm({ className, ...props }: SignUpFormProps) {
   const [isLoading, setIsLoading] = useState(false)
+  const setAuthenticated = useAuthStore((state) => state.setAuthenticated)
+  const navigate = useNavigate({ from: '/sign-up' })
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
+      name: '',
       email: '',
       password: '',
       confirmPassword: '',
     },
   })
 
-  function onSubmit(data: z.infer<typeof formSchema>) {
+  async function onSubmit(data: z.infer<typeof formSchema>) {
     setIsLoading(true)
-    // eslint-disable-next-line no-console
-    console.log(data)
+    try {
+      console.log("[Sign Up] Attempting sign-up with:", data.email);
+      const result = await authClient.signUp.email({
+        name: data.name,
+        email: data.email,
+        password: data.password,
+      });
 
-    setTimeout(() => {
+      console.log("[Sign Up] Result:", result);
+
+      if ('data' in result && result.data?.user) {
+        setAuthenticated({ id: result.data.user.id, email: result.data.user.email });
+        toast.success("Account created successfully!");
+        navigate({ to: '/', replace: true });
+      } else if ('error' in result) {
+        console.error("[Sign Up] Auth Error:", result.error);
+        const errorMessage = result.error?.message || "Sign up failed. Please try again.";
+        toast.error(errorMessage);
+      } else {
+        console.error("[Sign Up] Unexpected response structure:", result);
+        toast.error("An unexpected error occurred during sign up.");
+      }
+    } catch (error: any) {
+      console.error("[Sign Up] Network/Fetch Error:", error);
+      const errorMessage = error?.message || "A network error occurred. Please try again.";
+      toast.error(errorMessage);
+    } finally {
       setIsLoading(false)
-    }, 3000)
+    }
   }
 
   return (
@@ -68,6 +99,19 @@ export function SignUpForm({ className, ...props }: SignUpFormProps) {
         className={cn('grid gap-3', className)}
         {...props}
       >
+        <FormField
+          control={form.control}
+          name='name'
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Name</FormLabel>
+              <FormControl>
+                <Input placeholder='Your Name' {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
         <FormField
           control={form.control}
           name='email'

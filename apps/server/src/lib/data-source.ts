@@ -4,7 +4,7 @@
 
 // Now import other modules
 import 'reflect-metadata'; // Required by TypeORM
-import { DataSourceOptions } from 'typeorm';
+import { DataSourceOptions, EntitySchema } from 'typeorm';
 import { NeonDataSource, NeonDataSourceOptions, createNeonDataSource } from './neon-orm/NeonDataSource';
 import { NeonDriverOptions } from './neon-orm/NeonDriver'; // Keep NeonDriverOptions if used explicitly, though likely redundant now
 import * as ServerEntities from '@repo/dataforge/server-entities'; // Import all entities
@@ -62,7 +62,10 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
         // Create options for our factory function
         const neonDataSourceOptions: NeonDataSourceOptions = {
             url: urlWithTimeout, // Use URL from context with timeout
-            entities: Object.values(ServerEntities).filter(entity => typeof entity === 'function'),
+            // Filter based on object structure (presence of options.name) and cast
+            entities: Object.values(ServerEntities).filter(
+                entity => typeof entity === 'object' && entity !== null && (entity as any).options?.name
+            ) as EntitySchema<any>[], // Cast the result
             synchronize: c.env.NODE_ENV !== 'production',
             // Explicitly enable ALL logging for debugging
             logging: "all", 

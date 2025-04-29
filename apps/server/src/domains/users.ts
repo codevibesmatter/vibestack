@@ -1,5 +1,5 @@
 import { Client } from '@neondatabase/serverless';
-import { User, UserRole } from "@repo/dataforge/server-entities";
+import { User, UserRole } from "@repo/dataforge/generated/server-entities.js";
 import { validate } from "class-validator";
 
 // Simplified type definitions

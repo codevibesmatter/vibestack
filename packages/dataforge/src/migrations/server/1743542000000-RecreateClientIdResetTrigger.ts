@@ -20,8 +20,9 @@ export class RecreateClientIdResetTrigger1743542000000 implements MigrationInter
 
         // Add trigger to each domain table
         for (const table of SERVER_DOMAIN_TABLES) {
+            const tableNameString = table as string; // Assert type
             // Skip system tables and server-only tables
-            if (table.includes('change_history') || table.includes('client_migration')) {
+            if (tableNameString.includes('change_history') || tableNameString.includes('client_migration')) { // Use asserted string
                 continue;
             }
             
@@ -39,7 +40,8 @@ export class RecreateClientIdResetTrigger1743542000000 implements MigrationInter
     public async down(queryRunner: QueryRunner): Promise<void> {
         // Drop triggers from all domain tables
         for (const table of SERVER_DOMAIN_TABLES) {
-            if (table.includes('change_history') || table.includes('client_migration')) {
+            const tableNameString = table as string; // Assert type
+            if (tableNameString.includes('change_history') || tableNameString.includes('client_migration')) { // Use asserted string
                 continue;
             }
             

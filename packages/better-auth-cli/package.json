@@ -1,0 +1,25 @@
+{
+  "name": "@repo/better-auth-cli",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "migrate": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@better-auth/cli": "latest",
+    "better-auth": "latest",
+    "dotenv": "^16.4.5",
+    "kysely": "^0.28.2",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/pg": "^8.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.2"
+  }
+} 

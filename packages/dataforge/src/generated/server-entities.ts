@@ -1,240 +1,567 @@
 // Generated server entities - DO NOT EDIT
 
-import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, ManyToOne, OneToMany, ManyToMany, JoinColumn, JoinTable } from 'typeorm';
+import { EntitySchema } from 'typeorm';
 import { BaseDomainEntity } from '../entities/BaseDomainEntity.js';
 import { BaseSystemEntity } from '../entities/BaseSystemEntity.js';
-import { TaskStatus, TaskPriority } from '../entities/Task.js';
-export { TaskStatus, TaskPriority };
-import { ProjectStatus } from '../entities/Project.js';
-export { ProjectStatus };
-import { UserRole } from '../entities/User.js';
-export { UserRole };
-import { MigrationStatus } from '../entities/ClientMigrationStatus.js';
-export { MigrationStatus };
-import { MigrationType, MigrationState } from '../entities/ClientMigration.js';
-export { MigrationType, MigrationState };
 
-@Entity('change_history')
+// Enum Imports (dynamically generated)
+import { MigrationState, MigrationType } from '../entities/ClientMigration.js';
+import { ProjectStatus } from '../entities/Project.js';
+import { TaskPriority, TaskStatus } from '../entities/Task.js';
+import { UserRole } from '../entities/User.js';
+
+
+// Enum Exports
+export { MigrationState, MigrationType } from '../entities/ClientMigration.js';
+export { ProjectStatus } from '../entities/Project.js';
+export { TaskPriority, TaskStatus } from '../entities/Task.js';
+export { UserRole } from '../entities/User.js';
+
+
+// Generated Classes (for type checking and validation)
 export class ChangeHistory {
-  @PrimaryGeneratedColumn('uuid')
   id!: string;
 
-  @Column({"type":"text","nullable":false})
   lsn!: string;
 
-  @Column({"type":"text","nullable":false,"name":"table_name"})
   tableName!: string;
 
-  @Column({"type":"text","nullable":false})
   operation!: string;
 
-  @Column({"type":"jsonb","nullable":true})
   data?: any;
 
-  @CreateDateColumn({"type":"timestamptz"})
   timestamp!: Date;
 
 }
 
-@Entity('client_migration')
 export class ClientMigration {
-  @Column({"type":"text","name":"migration_name","primary":true})
   migrationName!: string;
 
-  @Column({"type":"text","name":"schema_version"})
   schemaVersion!: string;
 
-  @Column({"type":"text","array":true,"default":[]})
-  dependencies!: any[];
+  dependencies!: string[];
 
-  @Column({"type":"enum","enum":{"SCHEMA":"schema","DATA":"data","MIXED":"mixed"},"name":"migration_type"})
   migrationType!: MigrationType;
 
-  @Column({"type":"enum","enum":{"PENDING":"pending","AVAILABLE":"available","DEPRECATED":"deprecated","REQUIRED":"required"},"default":"pending"})
   state!: MigrationState;
 
-  @Column({"type":"text","array":true,"name":"up_queries"})
-  upQueries!: any[];
+  upQueries!: string[];
 
-  @Column({"type":"text","array":true,"name":"down_queries"})
-  downQueries!: any[];
+  downQueries!: string[];
 
-  @Column({"type":"text","nullable":true})
   description?: string;
 
-  @Column({"type":"bigint"})
   timestamp!: number;
 
-  @CreateDateColumn({"type":"timestamptz","name":"created_at"})
   createdAt!: Date;
 
 }
 
-@Entity('comments')
 export class Comment extends BaseDomainEntity {
-  @Column({"type":"text"})
   content!: string;
 
-  @Column({"type":"varchar","name":"entity_type"})
   entityType!: string;
 
-  @Column({"type":"uuid","name":"entity_id","nullable":true})
   entityId?: string;
 
-  @Column({"type":"uuid","name":"author_id","nullable":true})
   authorId?: string;
 
-  @Column({"type":"uuid","nullable":true,"name":"parent_id"})
   parentId?: string;
 
-  @ManyToOne(() => User, undefined, {"nullable":true})
-  @JoinColumn()
   author?: User;
 
-  @ManyToOne(() => Comment, undefined, {"nullable":true})
-  @JoinColumn()
   parent?: Comment;
 
-  @ManyToOne(() => Task, undefined, {"createForeignKeyConstraints":false})
-  @JoinColumn()
   task!: Task;
 
-  @ManyToOne(() => Project, undefined, {"createForeignKeyConstraints":false})
-  @JoinColumn()
   project!: Project;
 
 }
 
-@Entity('projects')
 export class Project extends BaseDomainEntity {
-  @Column({"type":"varchar","length":100})
   name!: string;
 
-  @Column({"type":"text","nullable":true})
   description?: string;
 
-  @Column({"type":"enum","enum":{"ACTIVE":"active","IN_PROGRESS":"in_progress","COMPLETED":"completed","ON_HOLD":"on_hold"},"default":"active"})
   status!: ProjectStatus;
 
-  @Column({"type":"uuid","name":"owner_id","nullable":true})
   ownerId?: string;
 
-  @ManyToOne(() => User, (user) => user.ownedProjects, {"nullable":true})
-  @JoinColumn()
   owner?: User;
 
-  @ManyToMany(() => User, (user) => user.memberProjects, {})
-  @JoinTable()
   members!: User[];
 
-  @OneToMany(() => Task, (task) => task.project, {})
   tasks!: Task[];
 
 }
 
-@Entity('tasks')
 export class Task extends BaseDomainEntity {
-  @Column({"type":"varchar","length":100})
   title!: string;
 
-  @Column({"type":"text","nullable":true})
   description?: string;
 
-  @Column({"type":"enum","enum":{"OPEN":"open","IN_PROGRESS":"in_progress","COMPLETED":"completed"}})
   status!: TaskStatus;
 
-  @Column({"type":"enum","enum":{"LOW":"low","MEDIUM":"medium","HIGH":"high"},"default":"medium"})
   priority!: TaskPriority;
 
-  @Column({"type":"timestamptz","nullable":true,"name":"due_date"})
   dueDate?: Date;
 
-  @Column({"type":"timestamptz","nullable":true,"name":"completed_at"})
   completedAt?: Date;
 
-  @Column({"type":"tsrange","nullable":true,"name":"time_range"})
-  timeRange?: string;
+  timeRange?: any;
 
-  @Column({"type":"interval","nullable":true,"name":"estimated_duration"})
-  estimatedDuration?: string;
+  estimatedDuration?: any;
 
-  @Column({"array":true,"default":[],"type":"text"})
-  tags!: any[];
+  tags!: string[];
 
-  @Column({"type":"uuid","name":"project_id","nullable":true})
   projectId?: string;
 
-  @Column({"type":"uuid","nullable":true,"name":"assignee_id"})
   assigneeId?: string;
 
-  @ManyToOne(() => Project, (project) => project.tasks, {"nullable":true})
-  @JoinColumn()
   project?: Project;
 
-  @ManyToOne(() => User, (user) => user.tasks, {"nullable":true})
-  @JoinColumn()
   assignee?: User;
 
-  @ManyToMany(() => Task, undefined, {})
-  @JoinTable()
   dependencies!: Task[];
 
 }
 
-@Entity('users')
 export class User extends BaseDomainEntity {
-  @Column({"type":"varchar","length":100})
   name!: string;
 
-  @Column({"type":"varchar","length":255,"unique":true})
   email!: string;
 
-  @Column({"type":"varchar","length":255,"nullable":true,"name":"avatar_url"})
   avatarUrl?: string;
 
-  @Column({"type":"enum","enum":{"ADMIN":"admin","MEMBER":"member","VIEWER":"viewer"},"default":"member"})
   role!: UserRole;
 
-  @OneToMany(() => Task, (task) => task.assignee, {})
   tasks!: Task[];
 
-  @OneToMany(() => Project, (project) => project.owner, {})
   ownedProjects!: Project[];
 
-  @ManyToMany(() => Project, (project) => project.members, {})
   memberProjects!: Project[];
 
-  @OneToMany(() => UserIdentity, (identity) => identity.user, {})
   identities!: UserIdentity[];
 
 }
 
-@Entity('user_identities')
 export class UserIdentity extends BaseSystemEntity {
-  @Column({"type":"uuid","name":"user_id"})
   userId!: string;
 
-  @Column({"type":"varchar","length":50})
   provider!: string;
 
-  @Column({"type":"varchar","length":255,"name":"provider_id"})
   providerId!: string;
 
-  @ManyToOne(() => User, (user) => user.identities, {})
-  @JoinColumn()
   user!: User;
 
 }
 
-// Export entity array for TypeORM
+
+// Entity Schemas (for TypeORM metadata)
+// Schema for ChangeHistory
+export const ChangeHistorySchema = new EntitySchema<ChangeHistory>({
+    target: ChangeHistory, // Link to generated class
+    name: 'ChangeHistory', 
+    tableName: 'change_history',
+    columns: {
+        'id': {
+            name: 'id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            primary: true
+        },
+        'lsn': {
+            name: 'lsn', // Explicit DB Name
+            type: 'text', // Use helper
+        },
+        'tableName': {
+            name: 'table_name', // Explicit DB Name
+            type: 'text', // Use helper
+        },
+        'operation': {
+            name: 'operation', // Explicit DB Name
+            type: 'text', // Use helper
+        },
+        'data': {
+            name: 'data', // Explicit DB Name
+            type: 'jsonb', // Use helper
+            nullable: true
+        },
+        'timestamp': {
+            name: 'timestamp', // Explicit DB Name
+            type: 'timestamptz', // Use helper
+            createDate: true,
+            default: undefined
+        }
+    },
+    relations: {
+    },
+});
+
+// Schema for ClientMigration
+export const ClientMigrationSchema = new EntitySchema<ClientMigration>({
+    target: ClientMigration, // Link to generated class
+    name: 'ClientMigration', 
+    tableName: 'client_migration',
+    columns: {
+        'migrationName': {
+            name: 'migration_name', // Explicit DB Name
+            type: 'text', // Use helper
+            primary: true
+        },
+        'schemaVersion': {
+            name: 'schema_version', // Explicit DB Name
+            type: 'text', // Use helper
+        },
+        'dependencies': {
+            name: 'dependencies', // Explicit DB Name
+            type: 'text', // Use helper
+            default: [],
+            array: true
+        },
+        'migrationType': {
+            name: 'migration_type', // Explicit DB Name
+            type: 'enum', // Use helper
+            enum: MigrationType, // Use name from decorator
+        },
+        'state': {
+            name: 'state', // Explicit DB Name
+            type: 'enum', // Use helper
+            default: "pending",
+            enum: MigrationState, // Use name from decorator
+        },
+        'upQueries': {
+            name: 'up_queries', // Explicit DB Name
+            type: 'text', // Use helper
+            array: true
+        },
+        'downQueries': {
+            name: 'down_queries', // Explicit DB Name
+            type: 'text', // Use helper
+            array: true
+        },
+        'description': {
+            name: 'description', // Explicit DB Name
+            type: 'text', // Use helper
+            nullable: true
+        },
+        'timestamp': {
+            name: 'timestamp', // Explicit DB Name
+            type: 'bigint', // Use helper
+        },
+        'createdAt': {
+            name: 'created_at', // Explicit DB Name
+            type: 'timestamptz', // Use helper
+            createDate: true
+        }
+    },
+    relations: {
+    },
+});
+
+// Schema for Comment
+export const CommentSchema = new EntitySchema<Comment>({
+    target: Comment, // Link to generated class
+    name: 'Comment', 
+    tableName: 'comments',
+    columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
+        updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
+        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        'content': {
+            name: 'content', // Explicit DB Name
+            type: 'text', // Use helper
+        },
+        'entityType': {
+            name: 'entity_type', // Explicit DB Name
+            type: 'varchar', // Use helper
+        },
+        'entityId': {
+            name: 'entity_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        },
+        'authorId': {
+            name: 'author_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        },
+        'parentId': {
+            name: 'parent_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        }
+    },
+    relations: {
+        'author': {
+            target: 'User', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'author_id' },
+            nullable: true
+        },
+        'parent': {
+            target: 'Comment', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'parent_id' },
+            nullable: true
+        },
+        'task': {
+            target: 'Task', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'entity_id', referencedColumnName: 'id' }
+        },
+        'project': {
+            target: 'Project', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'entity_id', referencedColumnName: 'id' }
+        }
+    },
+});
+
+// Schema for Project
+export const ProjectSchema = new EntitySchema<Project>({
+    target: Project, // Link to generated class
+    name: 'Project', 
+    tableName: 'projects',
+    columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
+        updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
+        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        'name': {
+            name: 'name', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 100
+        },
+        'description': {
+            name: 'description', // Explicit DB Name
+            type: 'text', // Use helper
+            nullable: true
+        },
+        'status': {
+            name: 'status', // Explicit DB Name
+            type: 'enum', // Use helper
+            default: "active",
+            enum: ProjectStatus, // Use name from decorator
+        },
+        'ownerId': {
+            name: 'owner_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        }
+    },
+    relations: {
+        'owner': {
+            target: 'User', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'owner_id' },
+            nullable: true
+        },
+        'members': {
+            target: 'User', // Target Entity Name (String)
+            type: 'many-to-many',
+            joinTable: {
+                name: 'project_members',
+                joinColumns: [{ name: 'project_id', referencedColumnName: 'id' }],
+                inverseJoinColumns: [{ name: 'user_id', referencedColumnName: 'id' }],
+            }
+        },
+        'tasks': {
+            target: 'Task', // Target Entity Name (String)
+            type: 'one-to-many'
+        }
+    },
+});
+
+// Schema for Task
+export const TaskSchema = new EntitySchema<Task>({
+    target: Task, // Link to generated class
+    name: 'Task', 
+    tableName: 'tasks',
+    columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
+        updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
+        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        'title': {
+            name: 'title', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 100
+        },
+        'description': {
+            name: 'description', // Explicit DB Name
+            type: 'text', // Use helper
+            nullable: true
+        },
+        'status': {
+            name: 'status', // Explicit DB Name
+            type: 'enum', // Use helper
+            enum: TaskStatus, // Use name from decorator
+        },
+        'priority': {
+            name: 'priority', // Explicit DB Name
+            type: 'enum', // Use helper
+            default: "medium",
+            enum: TaskPriority, // Use name from decorator
+        },
+        'dueDate': {
+            name: 'due_date', // Explicit DB Name
+            type: 'timestamptz', // Use helper
+            nullable: true
+        },
+        'completedAt': {
+            name: 'completed_at', // Explicit DB Name
+            type: 'timestamptz', // Use helper
+            nullable: true
+        },
+        'timeRange': {
+            name: 'time_range', // Explicit DB Name
+            type: 'tsrange', // Use helper
+            nullable: true
+        },
+        'estimatedDuration': {
+            name: 'estimated_duration', // Explicit DB Name
+            type: 'interval', // Use helper
+            nullable: true
+        },
+        'tags': {
+            name: 'tags', // Explicit DB Name
+            type: 'text', // Use helper
+            default: [],
+            array: true
+        },
+        'projectId': {
+            name: 'project_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        },
+        'assigneeId': {
+            name: 'assignee_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        }
+    },
+    relations: {
+        'project': {
+            target: 'Project', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'project_id' },
+            nullable: true
+        },
+        'assignee': {
+            target: 'User', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'assignee_id' },
+            nullable: true
+        },
+        'dependencies': {
+            target: 'Task', // Target Entity Name (String)
+            type: 'many-to-many',
+            joinTable: {
+                name: 'task_dependencies',
+                joinColumns: [{ name: 'dependent_task_id', referencedColumnName: 'id' }],
+                inverseJoinColumns: [{ name: 'dependency_task_id', referencedColumnName: 'id' }],
+            }
+        }
+    },
+});
+
+// Schema for User
+export const UserSchema = new EntitySchema<User>({
+    target: User, // Link to generated class
+    name: 'User', 
+    tableName: 'users',
+    columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
+        updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
+        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        'name': {
+            name: 'name', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 100
+        },
+        'email': {
+            name: 'email', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 255,
+            unique: true
+        },
+        'avatarUrl': {
+            name: 'avatar_url', // Explicit DB Name
+            type: 'varchar', // Use helper
+            nullable: true,
+            length: 255
+        },
+        'role': {
+            name: 'role', // Explicit DB Name
+            type: 'enum', // Use helper
+            default: "member",
+            enum: UserRole, // Use name from decorator
+        }
+    },
+    relations: {
+        'tasks': {
+            target: 'Task', // Target Entity Name (String)
+            type: 'one-to-many'
+        },
+        'ownedProjects': {
+            target: 'Project', // Target Entity Name (String)
+            type: 'one-to-many'
+        },
+        'memberProjects': {
+            target: 'Project', // Target Entity Name (String)
+            type: 'many-to-many'
+        },
+        'identities': {
+            target: 'UserIdentity', // Target Entity Name (String)
+            type: 'one-to-many'
+        }
+    },
+});
+
+// Schema for UserIdentity
+export const UserIdentitySchema = new EntitySchema<UserIdentity>({
+    target: UserIdentity, // Link to generated class
+    name: 'UserIdentity', 
+    tableName: 'user_identities',
+    columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        'userId': {
+            name: 'user_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+        },
+        'provider': {
+            name: 'provider', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 50
+        },
+        'providerId': {
+            name: 'provider_id', // Explicit DB Name
+            type: 'varchar', // Use helper
+            length: 255
+        }
+    },
+    relations: {
+        'user': {
+            target: 'User', // Target Entity Name (String)
+            type: 'many-to-one',
+            joinColumn: { name: 'user_id' }
+        }
+    },
+});
+
+
+// Exports
+// Export entity schema array for TypeORM
 export const serverEntities = [
-  ChangeHistory,
-  ClientMigration,
-  Comment,
-  Project,
-  Task,
-  User,
-  UserIdentity,
+  ChangeHistorySchema,
+  ClientMigrationSchema,
+  CommentSchema,
+  ProjectSchema,
+  TaskSchema,
+  UserSchema,
+  UserIdentitySchema
 ];
 
 // domain tables for server context
@@ -243,7 +570,7 @@ export const SERVER_DOMAIN_TABLES = [
   '"projects"',
   '"tasks"',
   '"users"',
-] as const;
+];
 
 // Table hierarchy levels for server domain tables
 // Level 0 = root tables (no dependencies)
@@ -260,9 +587,9 @@ export const SERVER_SYSTEM_TABLES = [
   '"change_history"',
   '"client_migration"',
   '"user_identities"',
-] as const;
+];
 
 // utility tables for server context
 export const SERVER_UTILITY_TABLES = [
-] as const;
+];
 

@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import type { StatusCode } from 'hono/utils/http-status';
+import type { StatusCode, ContentfulStatusCode } from 'hono/utils/http-status';
 
 // Define error types locally
 export enum ServiceErrorType {
@@ -68,5 +68,6 @@ export function databaseError(err: unknown): ErrorResponse {
 
 // Hono response helper
 export function json<T>(c: Context, response: ApiResponse<T>, status?: StatusCode) {
-  return c.json(response, status || (response.success ? 200 : 500));
+  const finalStatus = (status || (response.success ? 200 : 500)) as ContentfulStatusCode;
+  return c.json(response, finalStatus);
 } 

@@ -1,16 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { ColumnDef } from "@tanstack/react-table";
-import { DataTable } from "@/components/ui/data-table";
+import { DataTable } from "./components/data-table";
 import { Checkbox } from "@/components/ui/checkbox";
 import { columns as taskColumns } from './components/columns';
-import TasksMutateDrawer from './components/tasks-mutate-drawer';
+import { TasksMutateDrawer } from './components/tasks-mutate-drawer';
 import { useTasks } from './context/tasks-context';
-import { TasksProvider } from './context/tasks-context';
+import TasksProvider from './context/tasks-context';
 import { Main } from '@/components/layout/main';
 import { Header } from '@/components/layout/header';
 import { TopNav } from '@/components/layout/top-nav';
 import { Button } from '@/components/ui/button';
-import { clientEntities, Task } from '@dataforge/generated/client-entities'; // Updated path
+import { clientEntities, Task } from '@repo/dataforge/client-entities'; // Corrected path
 import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
 import { Search } from '@/components/search'
 import { ThemeSwitch } from '@/components/theme-switch'
@@ -71,7 +71,15 @@ const Tasks: React.FC = () => {
       console.log("Tasks component: Creating QueryBuilder for tasks..."); 
       const taskRepo = dataSource.getRepository(Task);
       const qb = taskRepo.createQueryBuilder("task")
-        .select("task"); // Just select the task entity, no joins
+        // Explicitly select necessary database columns
+        .select([
+          "task.id",
+          "task.title",
+          "task.status",
+          "task.priority",
+          "task.created_at", // Include for sorting/filtering if needed
+          "task.updated_at"
+        ]); 
         
       setQueryBuilder(qb);
     } else {

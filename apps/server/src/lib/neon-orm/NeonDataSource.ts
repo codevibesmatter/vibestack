@@ -180,7 +180,7 @@ export function createNeonDataSource(options: NeonDataSourceOptions): NeonDataSo
                 this.logger.log("log", "NeonDataSource initialized successfully.");
                 return this;
             } catch (error) {
-                this.logger.log("warn", 'Failed to initialize NeonDataSource:', error);
+                this.logger.log("warn", `Failed to initialize NeonDataSource: ${error}`); 
                 // Attempt to clean up driver connection if initialization failed partially
                 if (this.driver && this.driver.isInitialized) {
                      await this.driver.disconnect().catch(e => this.logger.log("warn", "Error during cleanup disconnect:", e));
@@ -221,7 +221,7 @@ export function createNeonDataSource(options: NeonDataSourceOptions): NeonDataSo
             // Build metadata and subscribers using the arrays
             // Assign results back to the main NeonDataSource instance
             this.entityMetadatas = await metadataBuilder.buildEntityMetadatas(entitiesArray);
-            this.subscribers = metadataBuilder.buildSubscribers(subscribersArray);
+            this.subscribers = await metadataBuilder.buildSubscribers(subscribersArray);
         },
 
         async destroy(): Promise<void> {

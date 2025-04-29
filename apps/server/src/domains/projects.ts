@@ -1,5 +1,5 @@
 import { Client } from '@neondatabase/serverless';
-import { Project, ProjectStatus } from "@repo/dataforge/server-entities";
+import { Project, ProjectStatus } from "@repo/dataforge/generated/server-entities.js";
 import { validate } from "class-validator";
 
 // Simplified type definitions

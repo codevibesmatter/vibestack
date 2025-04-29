@@ -31,6 +31,10 @@ export interface Env {
   TYPEORM_LOGGING: boolean;
   NODE_ENV: string;
   
+  // Auth variables
+  BETTER_AUTH_SECRET: string;
+  BETTER_AUTH_URL: string;
+  
   // Durable Object bindings (from wrangler.toml)
   SYNC: DurableObjectNamespace; 
   REPLICATION: DurableObjectNamespace;

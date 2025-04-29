@@ -20,10 +20,12 @@ export class AddDomainTableClientIdTriggers1742067963372 implements MigrationInt
 
         // Add trigger to each domain table
         for (const table of SERVER_DOMAIN_TABLES) {
+            // Explicitly assert type to resolve potential inference issue
+            const tableNameString = table as string;
             // Remove quotes from table name for trigger name
-            const cleanTableName = table.replace(/"/g, '');
+            const cleanTableName = tableNameString.replace(/"/g, '');
             await queryRunner.query(`
-                CREATE TRIGGER reset_client_id_trigger
+                CREATE TRIGGER reset_client_id_trigger_${cleanTableName}
                 BEFORE UPDATE ON ${table}
                 FOR EACH ROW
                 EXECUTE FUNCTION reset_client_id();
@@ -34,8 +36,11 @@ export class AddDomainTableClientIdTriggers1742067963372 implements MigrationInt
     public async down(queryRunner: QueryRunner): Promise<void> {
         // Drop triggers from all domain tables
         for (const table of SERVER_DOMAIN_TABLES) {
+            // Explicitly assert type and clean name for dropping trigger
+            const tableNameString = table as string;
+            const cleanTableName = tableNameString.replace(/"/g, '');
             await queryRunner.query(`
-                DROP TRIGGER IF EXISTS reset_client_id_trigger ON ${table};
+                DROP TRIGGER IF EXISTS reset_client_id_trigger_${cleanTableName} ON ${table};
             `);
         }
 
