@@ -17,6 +17,7 @@ import { User } from './User.js';
 import { Project } from './Project.js';
 import { BaseDomainEntity } from './BaseDomainEntity.js';
 // No need for ServerOnly/ClientOnly decorators as this is a shared entity
+import { EnumTypeName } from '../utils/decorators.js'; // Import the new decorator
 
 // These enum values must match the database exactly
 export enum TaskStatus {
@@ -54,10 +55,12 @@ export class Task extends BaseDomainEntity {
   
   @Column({ type: "enum", enum: TaskStatus })
   @IsEnum(TaskStatus)
+  @EnumTypeName('TaskStatus')
   status!: TaskStatus;
   
   @Column({ type: "enum", enum: TaskPriority, default: TaskPriority.MEDIUM })
   @IsEnum(TaskPriority)
+  @EnumTypeName('TaskPriority')
   priority!: TaskPriority;
   
   @Column({ type: "timestamptz", nullable: true, name: "due_date" })

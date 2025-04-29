@@ -9,45 +9,49 @@ import { ProjectStatus } from '../entities/Project.js';
 export { ProjectStatus };
 import { UserRole } from '../entities/User.js';
 export { UserRole };
+import { MigrationStatus } from '../entities/ClientMigrationStatus.js';
+export { MigrationStatus };
+import { MigrationType, MigrationState } from '../entities/ClientMigration.js';
+export { MigrationType, MigrationState };
 
 @Entity('change_history')
 export class ChangeHistory {
   @PrimaryGeneratedColumn('uuid')
-  id!: any;
+  id!: string;
 
   @Column({"type":"text","nullable":false})
-  lsn!: any;
+  lsn!: string;
 
   @Column({"type":"text","nullable":false,"name":"table_name"})
-  tableName!: any;
+  tableName!: string;
 
   @Column({"type":"text","nullable":false})
-  operation!: any;
+  operation!: string;
 
   @Column({"type":"jsonb","nullable":true})
   data?: any;
 
   @CreateDateColumn({"type":"timestamptz"})
-  timestamp!: any;
+  timestamp!: Date;
 
 }
 
 @Entity('client_migration')
 export class ClientMigration {
   @Column({"type":"text","name":"migration_name","primary":true})
-  migrationName!: any;
+  migrationName!: string;
 
   @Column({"type":"text","name":"schema_version"})
-  schemaVersion!: any;
+  schemaVersion!: string;
 
   @Column({"type":"text","array":true,"default":[]})
   dependencies!: any[];
 
   @Column({"type":"enum","enum":{"SCHEMA":"schema","DATA":"data","MIXED":"mixed"},"name":"migration_type"})
-  migrationType!: ClientMigration;
+  migrationType!: MigrationType;
 
   @Column({"type":"enum","enum":{"PENDING":"pending","AVAILABLE":"available","DEPRECATED":"deprecated","REQUIRED":"required"},"default":"pending"})
-  state!: ClientMigration;
+  state!: MigrationState;
 
   @Column({"type":"text","array":true,"name":"up_queries"})
   upQueries!: any[];
@@ -56,32 +60,32 @@ export class ClientMigration {
   downQueries!: any[];
 
   @Column({"type":"text","nullable":true})
-  description?: any;
+  description?: string;
 
   @Column({"type":"bigint"})
-  timestamp!: any;
+  timestamp!: number;
 
   @CreateDateColumn({"type":"timestamptz","name":"created_at"})
-  createdAt!: any;
+  createdAt!: Date;
 
 }
 
 @Entity('comments')
 export class Comment extends BaseDomainEntity {
   @Column({"type":"text"})
-  content!: any;
+  content!: string;
 
   @Column({"type":"varchar","name":"entity_type"})
-  entityType!: any;
+  entityType!: string;
 
   @Column({"type":"uuid","name":"entity_id","nullable":true})
-  entityId?: any;
+  entityId?: string;
 
   @Column({"type":"uuid","name":"author_id","nullable":true})
-  authorId?: any;
+  authorId?: string;
 
   @Column({"type":"uuid","nullable":true,"name":"parent_id"})
-  parentId?: any;
+  parentId?: string;
 
   @ManyToOne(() => User, undefined, {"nullable":true})
   @JoinColumn()
@@ -104,16 +108,16 @@ export class Comment extends BaseDomainEntity {
 @Entity('projects')
 export class Project extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  name!: any;
+  name!: string;
 
   @Column({"type":"text","nullable":true})
-  description?: any;
+  description?: string;
 
   @Column({"type":"enum","enum":{"ACTIVE":"active","IN_PROGRESS":"in_progress","COMPLETED":"completed","ON_HOLD":"on_hold"},"default":"active"})
-  status!: Project;
+  status!: ProjectStatus;
 
   @Column({"type":"uuid","name":"owner_id","nullable":true})
-  ownerId?: any;
+  ownerId?: string;
 
   @ManyToOne(() => User, (user) => user.ownedProjects, {"nullable":true})
   @JoinColumn()
@@ -131,37 +135,37 @@ export class Project extends BaseDomainEntity {
 @Entity('tasks')
 export class Task extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  title!: any;
+  title!: string;
 
   @Column({"type":"text","nullable":true})
-  description?: any;
+  description?: string;
 
   @Column({"type":"enum","enum":{"OPEN":"open","IN_PROGRESS":"in_progress","COMPLETED":"completed"}})
-  status!: Task;
+  status!: TaskStatus;
 
   @Column({"type":"enum","enum":{"LOW":"low","MEDIUM":"medium","HIGH":"high"},"default":"medium"})
-  priority!: Task;
+  priority!: TaskPriority;
 
   @Column({"type":"timestamptz","nullable":true,"name":"due_date"})
-  dueDate?: any;
+  dueDate?: Date;
 
   @Column({"type":"timestamptz","nullable":true,"name":"completed_at"})
-  completedAt?: any;
+  completedAt?: Date;
 
   @Column({"type":"tsrange","nullable":true,"name":"time_range"})
-  timeRange?: any;
+  timeRange?: string;
 
   @Column({"type":"interval","nullable":true,"name":"estimated_duration"})
-  estimatedDuration?: any;
+  estimatedDuration?: string;
 
   @Column({"array":true,"default":[],"type":"text"})
   tags!: any[];
 
   @Column({"type":"uuid","name":"project_id","nullable":true})
-  projectId?: any;
+  projectId?: string;
 
   @Column({"type":"uuid","nullable":true,"name":"assignee_id"})
-  assigneeId?: any;
+  assigneeId?: string;
 
   @ManyToOne(() => Project, (project) => project.tasks, {"nullable":true})
   @JoinColumn()
@@ -180,16 +184,16 @@ export class Task extends BaseDomainEntity {
 @Entity('users')
 export class User extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  name!: any;
+  name!: string;
 
   @Column({"type":"varchar","length":255,"unique":true})
-  email!: any;
+  email!: string;
 
   @Column({"type":"varchar","length":255,"nullable":true,"name":"avatar_url"})
-  avatarUrl?: any;
+  avatarUrl?: string;
 
   @Column({"type":"enum","enum":{"ADMIN":"admin","MEMBER":"member","VIEWER":"viewer"},"default":"member"})
-  role!: User;
+  role!: UserRole;
 
   @OneToMany(() => Task, (task) => task.assignee, {})
   tasks!: Task[];
@@ -208,13 +212,13 @@ export class User extends BaseDomainEntity {
 @Entity('user_identities')
 export class UserIdentity extends BaseSystemEntity {
   @Column({"type":"uuid","name":"user_id"})
-  userId!: any;
+  userId!: string;
 
   @Column({"type":"varchar","length":50})
-  provider!: any;
+  provider!: string;
 
   @Column({"type":"varchar","length":255,"name":"provider_id"})
-  providerId!: any;
+  providerId!: string;
 
   @ManyToOne(() => User, (user) => user.identities, {})
   @JoinColumn()

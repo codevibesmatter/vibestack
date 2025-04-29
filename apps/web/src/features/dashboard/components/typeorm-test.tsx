@@ -422,9 +422,9 @@ export function TypeORMTest() {
       const updatedTitle = `${testTitle} (Updated)`;
       messageLog.push(`3. Updating task title to: ${updatedTitle}`);
       foundTask.title = updatedTitle;
-      foundTask.status = TaskStatus.IN_PROGRESS; // Should work now with typed foundTask
+      foundTask.status = TaskStatus.IN_PROGRESS; // Removed cast
       const updatedTask = await taskRepo.save(foundTask); // save can also update
-      if (updatedTask.title !== updatedTitle || updatedTask.status !== TaskStatus.IN_PROGRESS) throw new Error('Update (save) failed: Title or status mismatch');
+      if (updatedTask.title !== updatedTitle || updatedTask.status !== TaskStatus.IN_PROGRESS) throw new Error('Update (save) failed: Title or status mismatch'); // Removed cast
       messageLog.push(`   - Updated task status: ${updatedTask.status}`);
 
       // Update (using QueryBuilder update method - WORKAROUND for alias issue)
@@ -432,13 +432,13 @@ export function TypeORMTest() {
        messageLog.push(`4. Updating task title again using QueryBuilder 'update': ${updatedTitle2}`);
       const updateResult = await taskRepo.createQueryBuilder('task_alias_for_update') // Provide explicit alias
           .update(Task)
-          .set({ title: updatedTitle2, priority: TaskPriority.HIGH })
+          .set({ title: updatedTitle2, priority: TaskPriority.HIGH }) // Removed casts
           .where("id = :id", { id: testId })
           .execute();
 
       if (!updateResult.affected || updateResult.affected === 0) throw new Error('Update (QueryBuilder update) failed: No rows affected');
       const verifiedUpdate = await taskRepo.findOneBy({ id: testId });
-      if (!verifiedUpdate || verifiedUpdate.title !== updatedTitle2 || verifiedUpdate.priority !== TaskPriority.HIGH) throw new Error('Update (QueryBuilder update) verification failed');
+      if (!verifiedUpdate || verifiedUpdate.title !== updatedTitle2 || verifiedUpdate.priority !== TaskPriority.HIGH) throw new Error('Update (QueryBuilder update) verification failed'); // Removed cast
       messageLog.push(`   - Verified updated priority: ${verifiedUpdate.priority}`);
 
       // Delete (using QueryBuilder delete method - WORKAROUND for alias issue)
@@ -457,7 +457,14 @@ export function TypeORMTest() {
 
       // Re-create for testing 'delete' via QueryBuilder
       messageLog.push(`6. Re-creating task for 'delete' test`);
-      const taskToDeleteAgain = taskRepo.create({ id: testId, title: testTitle, status: TaskStatus.OPEN, priority: TaskPriority.LOW });
+      // Use new Task() pattern and remove enum casts
+      const taskToDeleteAgain = new Task();
+      Object.assign(taskToDeleteAgain, { 
+          title: testTitle, 
+          status: TaskStatus.OPEN, // Removed cast
+          priority: TaskPriority.LOW // Removed cast
+      });
+      taskToDeleteAgain.id = testId; // Assign ID
       await taskRepo.save(taskToDeleteAgain);
       const foundTaskToDelete = await taskRepo.findOneBy({ id: testId });
       if (!foundTaskToDelete) throw new Error("Re-creation for delete test failed");
@@ -511,12 +518,12 @@ export function TypeORMTest() {
       const existingTasks = await taskRepo.find({ take: 5 });
       if (existingTasks.length < 2) {
           messageLog.push("Warning: Need at least 2 tasks for IN filter test. Creating dummy tasks.");
-          // Pass plain objects directly to save for batch insert
+          // Pass plain objects directly to save for batch insert, remove enum casts
           await taskRepo.save([
-              { id: uuidv4(), title: 'Filter Test Task 1', status: TaskStatus.OPEN, priority: TaskPriority.LOW, tags: ['filter'] },
-              { id: uuidv4(), title: 'Filter Test Task 2', status: TaskStatus.IN_PROGRESS, priority: TaskPriority.MEDIUM, tags: ['filter', 'test'] },
-              { id: uuidv4(), title: 'Filter Test Task 3', status: TaskStatus.COMPLETED, priority: TaskPriority.HIGH, tags: ['test'] }
-          ] as DeepPartial<Task>[]); // Cast the array
+              { id: uuidv4(), title: 'Filter Test Task 1', status: TaskStatus.OPEN, priority: TaskPriority.LOW, tags: ['filter'] }, // Removed casts
+              { id: uuidv4(), title: 'Filter Test Task 2', status: TaskStatus.IN_PROGRESS, priority: TaskPriority.MEDIUM, tags: ['filter', 'test'] }, // Removed casts
+              { id: uuidv4(), title: 'Filter Test Task 3', status: TaskStatus.COMPLETED, priority: TaskPriority.HIGH, tags: ['test'] } // Removed casts
+          ] as DeepPartial<Task>[]); // Keep outer cast for save compatibility if needed
       }
       const tasksForInFilter = await taskRepo.find({ take: 2 });
       const taskIdsForIn = tasksForInFilter.map((t: Task) => t.id);
@@ -728,12 +735,12 @@ export function TypeORMTest() {
                 newTasks.push({
                     id: uuidv4(),
                     title: `Pagination Task ${i + 1}`,
-                    status: TaskStatus.OPEN,
-                    priority: i % 2 === 0 ? TaskPriority.MEDIUM : TaskPriority.LOW,
+                    status: TaskStatus.OPEN, // Removed cast
+                    priority: (i % 2 === 0 ? TaskPriority.MEDIUM : TaskPriority.LOW), // Removed cast
                     createdAt: new Date(Date.now() - i * 1000 * 60) // Stagger creation time
                 });
             }
-            await taskRepo.save(newTasks);
+            await taskRepo.save(newTasks as DeepPartial<Task>[]); // Keep outer cast for save compatibility if needed
         }
 
         // Test Ordering (by title ASC)
@@ -820,9 +827,9 @@ export function TypeORMTest() {
             const task1 = transactionalEntityManager.create(Task, {
                 id: task1Id,
                 title: 'Transaction Task 1',
-                status: TaskStatus.OPEN,
-                priority: TaskPriority.MEDIUM
-            } as DeepPartial<Task>);
+                status: TaskStatus.OPEN, // Removed cast
+                priority: TaskPriority.MEDIUM // Removed cast
+            }); 
             await transactionalEntityManager.save(task1);
             messageLog.push(`   - Saved Task 1 (ID: ${task1Id})`);
 
@@ -832,9 +839,9 @@ export function TypeORMTest() {
             const task2 = transactionalEntityManager.create(Task, {
                 id: task2Id,
                 title: 'Transaction Task 2',
-                status: TaskStatus.OPEN,
-                priority: TaskPriority.MEDIUM
-            } as DeepPartial<Task>);
+                status: TaskStatus.OPEN, // Removed cast
+                priority: TaskPriority.MEDIUM // Removed cast
+            }); 
              await transactionalEntityManager.save(task2);
              messageLog.push(`   - Saved Task 2 (ID: ${task2Id})`);
         });
@@ -858,9 +865,9 @@ export function TypeORMTest() {
                  const taskFail = transactionalEntityManager.create(Task, {
                     id: uuidv4(), // Use a new ID
                     title: failingTaskTitle,
-                    status: TaskStatus.OPEN,
-                    priority: TaskPriority.LOW
-                 } as DeepPartial<Task>);
+                    status: TaskStatus.OPEN, // Removed cast
+                    priority: TaskPriority.LOW // Removed cast
+                 }); 
                 await transactionalEntityManager.save(taskFail);
                 messageLog.push(`   - Saved task (should be rolled back)`);
 
@@ -950,7 +957,7 @@ export function TypeORMTest() {
 
           // Test countBy
            messageLog.push(`2. Getting count of OPEN tasks using countBy()`);
-          const openCount = await taskRepo.countBy({ status: TaskStatus.OPEN });
+          const openCount = await taskRepo.countBy({ status: TaskStatus.OPEN }); // Cast was already removed
           messageLog.push(`   - Open tasks: ${openCount}`);
           finalData.openCount = openCount;
 

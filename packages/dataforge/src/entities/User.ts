@@ -15,6 +15,7 @@ import { Task } from './Task.js';
 import { Project } from './Project.js';
 import { BaseDomainEntity } from './BaseDomainEntity.js';
 import { UserIdentity } from './UserIdentity.js';
+import { EnumTypeName } from '../utils/decorators.js';
 
 export enum UserRole {
   ADMIN = 'admin',
@@ -49,6 +50,7 @@ export class User extends BaseDomainEntity {
   
   @Column({ type: "enum", enum: UserRole, default: UserRole.MEMBER })
   @IsEnum(UserRole)
+  @EnumTypeName('UserRole')
   role!: UserRole;
   
   // Relationship fields using Relation wrapper to avoid circular dependencies

@@ -14,6 +14,7 @@ import { User } from './User.js';
 import { Task } from './Task.js';
 import { BaseDomainEntity } from './BaseDomainEntity.js';
 // No need for ServerOnly/ClientOnly decorators as this is a shared entity
+import { EnumTypeName } from '../utils/decorators.js';
 
 export enum ProjectStatus {
   ACTIVE = 'active',
@@ -46,6 +47,7 @@ export class Project extends BaseDomainEntity {
   
   @Column({ type: "enum", enum: ProjectStatus, default: ProjectStatus.ACTIVE })
   @IsEnum(ProjectStatus)
+  @EnumTypeName('ProjectStatus')
   status!: ProjectStatus;
   
   @Column({ type: "uuid", name: "owner_id", nullable: true })

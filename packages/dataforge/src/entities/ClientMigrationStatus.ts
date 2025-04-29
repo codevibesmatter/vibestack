@@ -1,6 +1,7 @@
 import { Entity, Column, PrimaryColumn, CreateDateColumn, Index } from 'typeorm';
 import { IsString, IsNumber, IsEnum, Matches } from 'class-validator';
 import { ClientOnly, TableCategory } from '../utils/context.js';
+import { EnumTypeName } from '../utils/decorators.js';
 
 export enum MigrationStatus {
   PENDING = 'pending',          // Not yet started
@@ -31,6 +32,7 @@ export class ClientMigrationStatus {
 
   @Column({ type: "enum", enum: MigrationStatus })
   @IsEnum(MigrationStatus)
+  @EnumTypeName('MigrationStatus')
   status!: MigrationStatus;
 
   @Column({ type: "timestamptz", nullable: true, name: "started_at" })

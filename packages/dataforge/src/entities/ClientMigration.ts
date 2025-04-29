@@ -1,6 +1,7 @@
 import { Entity, Column, PrimaryColumn, CreateDateColumn, Index } from 'typeorm';
 import { IsString, IsArray, IsNumber, IsOptional, IsEnum, Matches } from 'class-validator';
 import { ServerOnly, TableCategory } from '../utils/context.js';
+import { EnumTypeName } from '../utils/decorators.js';
 
 export enum MigrationType {
   SCHEMA = 'schema',    // Changes to table structure
@@ -42,10 +43,12 @@ export class ClientMigration {
 
   @Column({ type: 'enum', enum: MigrationType, name: 'migration_type' })
   @IsEnum(MigrationType)
+  @EnumTypeName('MigrationType')
   migrationType!: MigrationType;
 
   @Column({ type: 'enum', enum: MigrationState, default: MigrationState.PENDING })
   @IsEnum(MigrationState)
+  @EnumTypeName('MigrationState')
   state!: MigrationState;
 
   @Column({ type: 'text', array: true, name: 'up_queries' })

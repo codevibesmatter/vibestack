@@ -9,54 +9,58 @@ import { ProjectStatus } from '../entities/Project.js';
 export { ProjectStatus };
 import { UserRole } from '../entities/User.js';
 export { UserRole };
+import { MigrationStatus } from '../entities/ClientMigrationStatus.js';
+export { MigrationStatus };
+import { MigrationType, MigrationState } from '../entities/ClientMigration.js';
+export { MigrationType, MigrationState };
 
 @Entity('client_migration_status')
 export class ClientMigrationStatus {
   @Column({"type":"text","name":"migration_name","primary":true})
-  migrationName!: any;
+  migrationName!: string;
 
   @Column({"type":"text","name":"schema_version"})
-  schemaVersion!: any;
+  schemaVersion!: string;
 
   @Column({"type":"enum","enum":{"PENDING":"pending","IN_PROGRESS":"in_progress","COMPLETED":"completed","FAILED":"failed","ROLLED_BACK":"rolled_back"}})
-  status!: ClientMigrationStatus;
+  status!: MigrationStatus;
 
   @Column({"type":"timestamptz","nullable":true,"name":"started_at"})
-  startedAt?: any;
+  startedAt?: Date;
 
   @Column({"type":"timestamptz","nullable":true,"name":"completed_at"})
-  completedAt?: any;
+  completedAt?: Date;
 
   @Column({"type":"text","nullable":true,"name":"error_message"})
-  errorMessage?: any;
+  errorMessage?: string;
 
   @Column({"type":"integer","default":0})
-  attempts!: any;
+  attempts!: number;
 
   @Column({"type":"bigint"})
-  timestamp!: any;
+  timestamp!: number;
 
   @CreateDateColumn({"type":"timestamptz","name":"created_at"})
-  createdAt!: any;
+  createdAt!: Date;
 
 }
 
 @Entity('comments')
 export class Comment extends BaseDomainEntity {
   @Column({"type":"text"})
-  content!: any;
+  content!: string;
 
   @Column({"type":"varchar","name":"entity_type"})
-  entityType!: any;
+  entityType!: string;
 
   @Column({"type":"uuid","name":"entity_id","nullable":true})
-  entityId?: any;
+  entityId?: string;
 
   @Column({"type":"uuid","name":"author_id","nullable":true})
-  authorId?: any;
+  authorId?: string;
 
   @Column({"type":"uuid","nullable":true,"name":"parent_id"})
-  parentId?: any;
+  parentId?: string;
 
   @ManyToOne(() => User, undefined, {"nullable":true})
   @JoinColumn()
@@ -79,38 +83,38 @@ export class Comment extends BaseDomainEntity {
 @Entity('local_changes')
 export class LocalChanges extends BaseSystemEntity {
   @Column({"type":"text"})
-  table!: any;
+  table!: string;
 
   @Column({"type":"text"})
-  operation!: any;
+  operation!: string;
 
   @Column({"type":"jsonb"})
   data!: any;
 
   @Column({"type":"text"})
-  lsn!: any;
+  lsn!: string;
 
   @Column({"type":"timestamptz","name":"updated_at"})
-  updatedAt!: any;
+  updatedAt!: Date;
 
   @Column({"type":"integer","default":0,"name":"processed_sync"})
-  processedSync!: any;
+  processedSync!: number;
 
 }
 
 @Entity('projects')
 export class Project extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  name!: any;
+  name!: string;
 
   @Column({"type":"text","nullable":true})
-  description?: any;
+  description?: string;
 
   @Column({"type":"enum","enum":{"ACTIVE":"active","IN_PROGRESS":"in_progress","COMPLETED":"completed","ON_HOLD":"on_hold"},"default":"active"})
-  status!: Project;
+  status!: ProjectStatus;
 
   @Column({"type":"uuid","name":"owner_id","nullable":true})
-  ownerId?: any;
+  ownerId?: string;
 
   @ManyToOne(() => User, (user) => user.ownedProjects, {"nullable":true})
   @JoinColumn()
@@ -128,59 +132,59 @@ export class Project extends BaseDomainEntity {
 @Entity('sync_metadata')
 export class SyncMetadata {
   @Column({"type":"text","primary":true})
-  id!: any;
+  id!: string;
 
   @Column({"type":"text","name":"client_id"})
-  clientId!: any;
+  clientId!: string;
 
   @Column({"type":"text","name":"current_lsn","default":"0/0"})
-  currentLsn!: any;
+  currentLsn!: string;
 
   @Column({"type":"text","name":"sync_state","default":"disconnected"})
-  syncState!: any;
+  syncState!: string;
 
   @Column({"type":"timestamptz","name":"last_sync_time","nullable":true})
-  lastSyncTime?: any;
+  lastSyncTime?: Date;
 
   @Column({"type":"integer","name":"pending_changes_count","default":0})
-  pendingChangesCount!: any;
+  pendingChangesCount!: number;
 
 }
 
 @Entity('tasks')
 export class Task extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  title!: any;
+  title!: string;
 
   @Column({"type":"text","nullable":true})
-  description?: any;
+  description?: string;
 
   @Column({"type":"enum","enum":{"OPEN":"open","IN_PROGRESS":"in_progress","COMPLETED":"completed"}})
-  status!: Task;
+  status!: TaskStatus;
 
   @Column({"type":"enum","enum":{"LOW":"low","MEDIUM":"medium","HIGH":"high"},"default":"medium"})
-  priority!: Task;
+  priority!: TaskPriority;
 
   @Column({"type":"timestamptz","nullable":true,"name":"due_date"})
-  dueDate?: any;
+  dueDate?: Date;
 
   @Column({"type":"timestamptz","nullable":true,"name":"completed_at"})
-  completedAt?: any;
+  completedAt?: Date;
 
   @Column({"type":"tsrange","nullable":true,"name":"time_range"})
-  timeRange?: any;
+  timeRange?: string;
 
   @Column({"type":"interval","nullable":true,"name":"estimated_duration"})
-  estimatedDuration?: any;
+  estimatedDuration?: string;
 
   @Column({"array":true,"default":[],"type":"text"})
   tags!: any[];
 
   @Column({"type":"uuid","name":"project_id","nullable":true})
-  projectId?: any;
+  projectId?: string;
 
   @Column({"type":"uuid","nullable":true,"name":"assignee_id"})
-  assigneeId?: any;
+  assigneeId?: string;
 
   @ManyToOne(() => Project, (project) => project.tasks, {"nullable":true})
   @JoinColumn()
@@ -199,16 +203,16 @@ export class Task extends BaseDomainEntity {
 @Entity('users')
 export class User extends BaseDomainEntity {
   @Column({"type":"varchar","length":100})
-  name!: any;
+  name!: string;
 
   @Column({"type":"varchar","length":255,"unique":true})
-  email!: any;
+  email!: string;
 
   @Column({"type":"varchar","length":255,"nullable":true,"name":"avatar_url"})
-  avatarUrl?: any;
+  avatarUrl?: string;
 
   @Column({"type":"enum","enum":{"ADMIN":"admin","MEMBER":"member","VIEWER":"viewer"},"default":"member"})
-  role!: User;
+  role!: UserRole;
 
   @OneToMany(() => Task, (task) => task.assignee, {})
   tasks!: Task[];
