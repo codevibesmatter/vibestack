@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 // import { getPGliteRepository } from '@/db/typeorm/typeorm-service'; // REMOVE OLD IMPORT
 import { NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource'; // ADD DataSource TYPE IMPORT
 import { Repository } from 'typeorm'; // ADD Repository IMPORT
-import { Task } from '@dataforge/generated/client-entities'; // Updated path
+import { Task } from '@repo/dataforge/client-entities'; // Corrected path
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';

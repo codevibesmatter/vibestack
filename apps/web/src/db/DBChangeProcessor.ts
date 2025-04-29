@@ -1,8 +1,9 @@
-import { PGliteRepository, PGliteQueryBuilder } from './typeorm/PGliteQueryBuilder';
-import { PGliteQueryRunner } from './typeorm/PGliteQueryRunner';
+// import { PGliteRepository, PGliteQueryBuilder as NewPGliteQueryBuilder } from './newtypeorm/NewPGliteQueryBuilder'; // Removed - File likely doesn't exist
+import { NewPGliteQueryRunner } from './newtypeorm/NewPGliteQueryRunner'; // Corrected path and name
 import { getNewPGliteDataSource } from './newtypeorm/NewDataSource';
-import { Task } from '@dataforge/generated/client-entities';
-import { EntityManager } from 'typeorm';
+import { Task } from '@repo/dataforge/client-entities'; // Corrected path
+import { EntityManager, Repository, SelectQueryBuilder } from 'typeorm'; // Added Repository and SelectQueryBuilder
+import { QueryBuilderFactory } from './newtypeorm/QueryBuilderFactory'; // Added QueryBuilderFactory
 
 /**
  * Represents a database change operation
@@ -36,13 +37,13 @@ export class DBChangeProcessorError extends Error {
  * DBChangeProcessor handles all database change operations using TypeORM
  */
 export class DBChangeProcessor {
-  private repositories: Map<string, PGliteRepository<any>> = new Map();
-  private queryBuilders: Map<string, PGliteQueryBuilder<any>> = new Map();
+  private repositories: Map<string, Repository<any>> = new Map(); // Use standard Repository type
+  private queryBuilders: Map<string, SelectQueryBuilder<any>> = new Map(); // Use standard SelectQueryBuilder type
 
   constructor(
-    private queryRunner: PGliteQueryRunner,
-    private getRepository: (entity: string) => PGliteRepository<any>,
-    private getQueryBuilder: (entity: string) => PGliteQueryBuilder<any>
+    private queryRunner: NewPGliteQueryRunner, // Use correct QueryRunner type
+    private getRepository: (entity: string) => Repository<any>, // Use standard Repository type
+    private getQueryBuilder: (entity: string) => SelectQueryBuilder<any> // Use standard SelectQueryBuilder type
   ) {}
 
   /**

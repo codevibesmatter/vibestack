@@ -1,13 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
-import { Task, User, Project } from '@dataforge/generated/client-entities';
-import { TaskStatus, TaskPriority } from '@dataforge/entities/Task';
-import { UserRole } from '@dataforge/entities/User';
-import { ProjectStatus } from '@dataforge/entities/Project';
+import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
+import { Task, User, Project, TaskStatus, TaskPriority, UserRole, ProjectStatus } from '@repo/dataforge/client-entities';
 import { DataSource, EntityManager, SelectQueryBuilder, QueryBuilder, In, Between, IsNull, FindOperator, SaveOptions, DeepPartial } from 'typeorm';
-import { clientEntities } from '@dataforge/generated/client-entities';
+import { clientEntities } from '@repo/dataforge/client-entities';
 import { DBChangeProcessor, Change } from '@/db/DBChangeProcessor';
 import { NewPGliteQueryRunner } from '@/db/newtypeorm/NewPGliteQueryRunner';
 import { useLiveEntity } from '@/db/hooks/useLiveEntity';
@@ -221,13 +218,16 @@ export function TypeORMTest() {
 
       // --- Tests using taskRepoInstance --- 
       const newTaskId = uuidv4();
-      const newTask = taskRepoInstance.create({
-        id: newTaskId,
+      // Use new Task() and Object.assign()
+      const newTask = new Task();
+      Object.assign(newTask, {
         title: 'Test Task ChangeProc', 
         status: TaskStatus.OPEN, 
         description: 'Created by DBChangeProcessor test'
       });
-      const insertedTask = await taskRepoInstance.save(newTask);
+      newTask.id = newTaskId; // Assign ID before saving
+      const insertedTask: Task | undefined = await taskRepoInstance.save(newTask);
+      // Check if insertedTask is correctly typed (should be Task, not Task[])
       if (!insertedTask?.id || insertedTask.id !== newTaskId) {
           throw new Error('Task insert failed or ID mismatch');
       }
@@ -356,7 +356,7 @@ export function TypeORMTest() {
       // Use manager.update directly, providing the EntityTarget (Task)
       await manager.update(Task, taskToUpdate.id, { 
         title: `${taskToUpdate.title} (Updated)` 
-      });
+      } as DeepPartial<Task>); // Added cast to update object
       
       setResults(prev => [
         {
@@ -398,20 +398,23 @@ export function TypeORMTest() {
 
       // Create (using save on new entity)
       messageLog.push(`1. Creating task: ${testTitle}`);
-      const newTask = taskRepo.create({
-        id: testId,
-        title: testTitle,
-        status: TaskStatus.OPEN,
-        priority: TaskPriority.LOW,
-        tags: ['crud-test'],
+      // Use new Task() and Object.assign() here too
+      const newTaskCrud = new Task();
+      Object.assign(newTaskCrud, { 
+          // id: testId, // Assign ID after creation
+          title: testTitle,
+          status: TaskStatus.OPEN,
+          priority: TaskPriority.LOW,
+          tags: ['crud-test'],
       });
-      const savedTask = await taskRepo.save(newTask);
+      newTaskCrud.id = testId; // Assign ID
+      const savedTask = await taskRepo.save(newTaskCrud);
       messageLog.push(`   - Saved task ID: ${savedTask.id}`);
       if (savedTask.id !== testId) throw new Error('Create failed: ID mismatch');
 
       // Read (findOneBy)
       messageLog.push(`2. Reading task ID: ${testId}`);
-      const foundTask = await taskRepo.findOneBy({ id: testId });
+      const foundTask: Task | null = await taskRepo.findOneBy({ id: testId }); // Explicitly type foundTask
       if (!foundTask || foundTask.title !== testTitle) throw new Error('Read failed: Task not found or title mismatch');
       messageLog.push(`   - Found task title: ${foundTask.title}`);
 
@@ -419,7 +422,7 @@ export function TypeORMTest() {
       const updatedTitle = `${testTitle} (Updated)`;
       messageLog.push(`3. Updating task title to: ${updatedTitle}`);
       foundTask.title = updatedTitle;
-      foundTask.status = TaskStatus.IN_PROGRESS;
+      foundTask.status = TaskStatus.IN_PROGRESS; // Should work now with typed foundTask
       const updatedTask = await taskRepo.save(foundTask); // save can also update
       if (updatedTask.title !== updatedTitle || updatedTask.status !== TaskStatus.IN_PROGRESS) throw new Error('Update (save) failed: Title or status mismatch');
       messageLog.push(`   - Updated task status: ${updatedTask.status}`);
@@ -508,14 +511,15 @@ export function TypeORMTest() {
       const existingTasks = await taskRepo.find({ take: 5 });
       if (existingTasks.length < 2) {
           messageLog.push("Warning: Need at least 2 tasks for IN filter test. Creating dummy tasks.");
+          // Pass plain objects directly to save for batch insert
           await taskRepo.save([
               { id: uuidv4(), title: 'Filter Test Task 1', status: TaskStatus.OPEN, priority: TaskPriority.LOW, tags: ['filter'] },
               { id: uuidv4(), title: 'Filter Test Task 2', status: TaskStatus.IN_PROGRESS, priority: TaskPriority.MEDIUM, tags: ['filter', 'test'] },
               { id: uuidv4(), title: 'Filter Test Task 3', status: TaskStatus.COMPLETED, priority: TaskPriority.HIGH, tags: ['test'] }
-          ]);
+          ] as DeepPartial<Task>[]); // Cast the array
       }
       const tasksForInFilter = await taskRepo.find({ take: 2 });
-      const taskIdsForIn = tasksForInFilter.map(t => t.id);
+      const taskIdsForIn = tasksForInFilter.map((t: Task) => t.id);
 
       // Test IN filter
       messageLog.push(`1. Filtering by ID IN [${taskIdsForIn.join(', ')}]`);
@@ -590,26 +594,34 @@ export function TypeORMTest() {
         let testUser = await userRepo.findOne({ where: { email: 'relation-test@example.com' } });
         if (!testUser) {
             messageLog.push("Creating test user...");
-            const newUser = userRepo.create({ 
-                id: uuidv4(), 
+            const newUserId = uuidv4();
+            // Use new User() and Object.assign()
+            const newUser = new User(); 
+            Object.assign(newUser, {
                 name: 'Relation Tester', 
                 email: 'relation-test@example.com', 
                 role: UserRole.MEMBER
             });
-            testUser = await userRepo.save(newUser);
+            newUser.id = newUserId; // Assign ID
+            testUser = await userRepo.save(newUser); // Assign result of save
+            if (!testUser || testUser.id !== newUserId) throw new Error("User creation failed or ID mismatch");
         }
 
         let testProject = await projectRepo.findOne({ where: { name: 'Relation Test Project' } });
         if (!testProject) {
             messageLog.push("Creating test project...");
             if (!testUser) throw new Error("Cannot create project without a user");
-            const newProject = projectRepo.create({ 
-                id: uuidv4(), 
+            const newProjectId = uuidv4();
+             // Use new Project() and Object.assign()
+            const newProject = new Project();
+            Object.assign(newProject, { 
                 name: 'Relation Test Project', 
                 status: ProjectStatus.ACTIVE,
                 ownerId: testUser.id 
             });
-            testProject = await projectRepo.save(newProject);
+            newProject.id = newProjectId; // Assign ID
+            testProject = await projectRepo.save(newProject); // Assign result of save
+            if (!testProject || testProject.id !== newProjectId) throw new Error("Project creation failed or ID mismatch");
         }
 
         let testTask = await taskRepo.findOne({ where: { title: 'Relation Test Task' } });
@@ -617,15 +629,19 @@ export function TypeORMTest() {
              messageLog.push("Creating test task with relations...");
              if (!testProject) throw new Error("Cannot create task without a project");
              if (!testUser) throw new Error("Cannot create task without a user assignee");
-             const newTask = taskRepo.create({
-                id: uuidv4(),
+             const newTaskIdRel = uuidv4();
+             // Use new Task() and Object.assign()
+             const newTask = new Task();
+             Object.assign(newTask, {
                 title: 'Relation Test Task',
                 status: TaskStatus.OPEN,
                 priority: TaskPriority.MEDIUM,
                 projectId: testProject.id,
                 assigneeId: testUser.id
             });
-            testTask = await taskRepo.save(newTask);
+            newTask.id = newTaskIdRel; // Assign ID
+            testTask = await taskRepo.save(newTask); // Assign result of save
+            if (!testTask || testTask.id !== newTaskIdRel) throw new Error("Task creation failed or ID mismatch");
         }
 
         // Test Left Join (Task -> Project, Task -> Assignee)
@@ -806,7 +822,7 @@ export function TypeORMTest() {
                 title: 'Transaction Task 1',
                 status: TaskStatus.OPEN,
                 priority: TaskPriority.MEDIUM
-            });
+            } as DeepPartial<Task>);
             await transactionalEntityManager.save(task1);
             messageLog.push(`   - Saved Task 1 (ID: ${task1Id})`);
 
@@ -818,8 +834,8 @@ export function TypeORMTest() {
                 title: 'Transaction Task 2',
                 status: TaskStatus.OPEN,
                 priority: TaskPriority.MEDIUM
-            });
-            await transactionalEntityManager.save(task2);
+            } as DeepPartial<Task>);
+             await transactionalEntityManager.save(task2);
              messageLog.push(`   - Saved Task 2 (ID: ${task2Id})`);
         });
         messageLog.push(`   - Transaction committed.`);
@@ -844,7 +860,7 @@ export function TypeORMTest() {
                     title: failingTaskTitle,
                     status: TaskStatus.OPEN,
                     priority: TaskPriority.LOW
-                 });
+                 } as DeepPartial<Task>);
                 await transactionalEntityManager.save(taskFail);
                 messageLog.push(`   - Saved task (should be rolled back)`);
 
