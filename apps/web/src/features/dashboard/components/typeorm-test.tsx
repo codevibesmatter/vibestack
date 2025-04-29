@@ -1,13 +1,18 @@
+import React, { useState, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { useState, useEffect } from 'react';
-import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
+import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
+import { Task, User, Project } from '@dataforge/generated/client-entities';
+import { TaskStatus, TaskPriority } from '@dataforge/entities/Task';
+import { UserRole } from '@dataforge/entities/User';
+import { ProjectStatus } from '@dataforge/entities/Project';
 import { DataSource, EntityManager, SelectQueryBuilder, QueryBuilder, In, Between, IsNull, FindOperator, SaveOptions, DeepPartial } from 'typeorm';
-import { clientEntities, Task, TaskStatus, User, Project, TaskPriority, UserRole, ProjectStatus } from '@repo/dataforge';
+import { clientEntities } from '@dataforge/generated/client-entities';
 import { DBChangeProcessor, Change } from '@/db/DBChangeProcessor';
 import { NewPGliteQueryRunner } from '@/db/newtypeorm/NewPGliteQueryRunner';
 import { useLiveEntity } from '@/db/hooks/useLiveEntity';
 import { v4 as uuidv4 } from 'uuid';
+import { Repository } from 'typeorm';
 
 interface TypeORMTestResult {
   success: boolean;

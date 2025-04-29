@@ -17,9 +17,9 @@ import { ThemeSwitch } from '@/components/theme-switch'
 import { RecentTasks } from './components/recent-tasks'
 import { TypeORMTest } from './components/typeorm-test'
 import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource'
+import type { Task, User, Project, Comment } from '@dataforge/generated/client-entities'
 import { Repository } from 'typeorm'
 import { SyncVisualizer } from '../sync/components/SyncVisualizer'
-import { Task, User, Project, Comment } from '@repo/dataforge'
 
 export default function Dashboard() {
   const [tableCounts, setTableCounts] = useState<{ [key: string]: number }>({});
@@ -55,16 +55,16 @@ export default function Dashboard() {
       try {
         console.log('[Dashboard] DataSource ready. Fetching table counts...');
         
-        const userRepo = dataSource.getRepository(User);
-        const projectRepo = dataSource.getRepository(Project);
-        const taskRepo = dataSource.getRepository(Task);
-        const commentRepo = dataSource.getRepository(Comment);
+        const userRepo = dataSource.getRepository<User>('users');
+        const projectRepo = dataSource.getRepository<Project>('projects');
+        const taskRepo = dataSource.getRepository<Task>('tasks');
+        const commentRepo = dataSource.getRepository<Comment>('comments');
         
         const [userCount, projectCount, taskCount, commentCount] = await Promise.all([
-          userRepo.createQueryBuilder('user').getCount(),
-          projectRepo.createQueryBuilder('project').getCount(),
-          taskRepo.createQueryBuilder('task').getCount(),
-          commentRepo.createQueryBuilder('comment').getCount()
+          userRepo.count(),
+          projectRepo.count(),
+          taskRepo.count(),
+          commentRepo.count()
         ]);
         
         console.log('[Dashboard] Counts received:', { userCount, projectCount, taskCount, commentCount });

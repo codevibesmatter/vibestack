@@ -1,19 +1,25 @@
-import { Header } from '@/components/layout/header'
-import { Main } from '@/components/layout/main'
-import { ProfileDropdown } from '@/components/profile-dropdown'
+import React, { useState, useEffect } from 'react';
+import { ColumnDef } from "@tanstack/react-table";
+import { DataTable } from "@/components/ui/data-table";
+import { Checkbox } from "@/components/ui/checkbox";
+import { columns as taskColumns } from './components/columns';
+import TasksMutateDrawer from './components/tasks-mutate-drawer';
+import { useTasks } from './context/tasks-context';
+import { TasksProvider } from './context/tasks-context';
+import { Main } from '@/components/layout/main';
+import { Header } from '@/components/layout/header';
+import { TopNav } from '@/components/layout/top-nav';
+import { Button } from '@/components/ui/button';
+import { clientEntities, Task } from '@dataforge/generated/client-entities'; // Updated path
+import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
 import { Search } from '@/components/search'
 import { ThemeSwitch } from '@/components/theme-switch'
-import { columns } from './components/columns'
-import { DataTable } from './components/data-table'
+import { ProfileDropdown } from '@/components/profile-dropdown'
 import { TasksDialogs } from './components/tasks-dialogs'
 import { TasksPrimaryButtons } from './components/tasks-primary-buttons'
-import TasksProvider from './context/tasks-context'
-import { useState, useEffect } from 'react';
-import { SortingState } from '@tanstack/react-table';
-import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
-import { clientEntities, Task } from '@repo/dataforge'; // Assuming Task entity is here
-import { useLiveEntity } from '@/db/hooks/useLiveEntity';
-import { SelectQueryBuilder } from 'typeorm'; // Import SelectQueryBuilder
+import { SortingState } from '@tanstack/react-table'
+import { useLiveEntity } from '@/db/hooks/useLiveEntity'
+import { SelectQueryBuilder } from 'typeorm'
 
 /**
  * Main Tasks Feature Component
@@ -116,7 +122,7 @@ const Tasks: React.FC = () => {
             // Pass sorting state and handler to DataTable
             <DataTable 
               data={(liveTasks || []).filter(Boolean)} 
-              columns={columns} 
+              columns={taskColumns} 
               sorting={sorting}
               setSorting={setSorting}
             /> 

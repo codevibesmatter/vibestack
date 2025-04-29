@@ -20,7 +20,7 @@ import type {
   ServerSyncCompletedMessage
 } from '@repo/sync-types';
 import inquirer from 'inquirer';
-import { serverDataSource } from '@repo/dataforge';
+import { serverDataSource } from '@dataforge/datasources/server';
 import { 
   Task, TaskStatus, TaskPriority,
   Project, ProjectStatus,
@@ -35,6 +35,9 @@ import type { Config } from './types.ts';
 import { DEFAULT_CONFIG } from './config.ts';
 import fs from 'fs';
 import path from 'path';
+import { DataSource } from 'typeorm';
+import { ChangeHistory, ClientMigration, ClientMigrationStatus, LocalChanges, SyncMetadata, UserIdentity } from '@dataforge/generated/server-entities';
+import { faker } from '@faker-js/faker';
 
 type EntityMap = {
   users: typeof User;

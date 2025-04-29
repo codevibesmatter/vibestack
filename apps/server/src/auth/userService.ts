@@ -1,8 +1,10 @@
-import { serverDataSource } from '@repo/dataforge';
-import { User, UserIdentity } from '@repo/dataforge';
+import { User, UserIdentity } from '@repo/dataforge/generated/server-entities';
 import { EntityManager } from 'typeorm';
 import { serverLogger as log } from '../middleware/logger';
 import { HTTPException } from 'hono/http-exception';
+import { getDataSource } from '../lib/data-source'; // Import getDataSource
+import type { Context } from 'hono'; // Import Hono context
+import type { Env } from '../types/env'; // Import Env type
 
 // Define the structure of the identity payload we expect from the auth worker
 // This should match the schema used in the Hono route validator
@@ -19,11 +21,12 @@ interface IdentityPayload {
  * links the identity if the user exists but the identity doesn't, 
  * or creates a new user and identity if neither exists.
  * 
+ * @param c - The Hono context, used to get the DataSource.
  * @param identity - The identity payload from the OpenAuth worker.
  * @returns The internal application userId.
  * @throws HTTPException for invalid input or database errors.
  */
-export async function findOrCreateUserFromIdentity(identity: IdentityPayload): Promise<string> {
+export async function findOrCreateUserFromIdentity(c: Context<{ Bindings: Env }>, identity: IdentityPayload): Promise<string> {
   log.info(`[AuthService] Finding or creating user for provider: ${identity.provider}`);
   
   // 1. Extract provider, providerId, email, name, avatarUrl from identity
@@ -52,9 +55,17 @@ export async function findOrCreateUserFromIdentity(identity: IdentityPayload): P
   }
 
   try {
-    // Get repositories (outside transaction for initial reads)
-    const userIdentityRepo = serverDataSource.getRepository(UserIdentity);
-    const userRepo = serverDataSource.getRepository(User);
+    // Get the DataSource instance using the Hono context
+    const dataSource = await getDataSource(c);
+    if (!dataSource || !dataSource.isInitialized) {
+      // Handle case where DataSource isn't ready (getDataSource should ideally throw, but double-check)
+      log.error('[AuthService] Failed to get initialized DataSource.');
+      throw new HTTPException(500, { message: 'Database connection is not available.' });
+    }
+
+    // Get repositories from the obtained DataSource instance
+    const userIdentityRepo = dataSource.getRepository(UserIdentity);
+    const userRepo = dataSource.getRepository(User);
 
     // 2. Query UserIdentity by provider and providerId
     log.debug(`[AuthService] Searching UserIdentity for provider=${provider}, providerId=${providerId}`);
@@ -75,7 +86,8 @@ export async function findOrCreateUserFromIdentity(identity: IdentityPayload): P
 
     // 5. Use a transaction for create/link operations
     let userId: string;
-    await serverDataSource.transaction(async (transactionalEntityManager: EntityManager) => {
+    // Use the obtained dataSource's manager for the transaction
+    await dataSource.manager.transaction(async (transactionalEntityManager: EntityManager) => {
         const transUserRepo = transactionalEntityManager.getRepository(User);
         const transUserIdentityRepo = transactionalEntityManager.getRepository(UserIdentity);
 

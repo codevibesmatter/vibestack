@@ -21,9 +21,12 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { SelectDropdown } from '@/components/select-dropdown'
-import { Task, TaskStatus, TaskPriority } from '@repo/dataforge'
+import { Task } from '@dataforge/generated/client-entities'
+import { TaskStatus, TaskPriority } from '@dataforge/entities/Task'
 import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource'
 import { useState } from 'react'
+import { zodResolver } from "@hookform/resolvers/zod"
+import * as z from "zod"
 
 interface Props {
   open: boolean

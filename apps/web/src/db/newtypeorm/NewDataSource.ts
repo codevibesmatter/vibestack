@@ -12,9 +12,10 @@ import { ConnectionMetadataBuilder } from 'typeorm/connection/ConnectionMetadata
 import { NewPGliteDriver, NewPGliteDriverOptions } from './NewPGliteDriver';
 import { NewPGliteQueryRunner } from './NewPGliteQueryRunner';
 import { QueryBuilderFactory } from './QueryBuilderFactory';
-
-// --- Entities --- 
-import { Task, User, Project, Comment, BaseDomainEntity } from '@repo/dataforge';
+import { PGliteDriver } from 'typeorm-pglite'; // Assuming the typeorm-pglite driver
+// import { Task, User, Project, Comment, BaseDomainEntity } from '@repo/dataforge'; // Keep commented or remove if unused elsewhere
+// Import the generated client entities array using the exported path
+import { clientEntities } from '@repo/dataforge/client-entities'; // Use the defined export path
 
 /**
  * Configuration options for creating a new PGLite data source
@@ -291,29 +292,11 @@ export async function getNewPGliteDataSource(
     try {
         console.log("Creating new NewPGliteDataSource object...");
         
-        // Define the core entities required by the application
-        const coreEntities = [Task, User, Project, Comment, BaseDomainEntity];
-        
-        // Get entities from the provided config, ensuring it's an array
-        const providedEntities = Array.isArray(config?.entities) ? config.entities : [];
-
-        // Filter provided entities to exclude duplicates of core entities
-        const additionalEntities = providedEntities.filter((entity: Function | string | EntitySchema<any>) => {
-            // Don't include if it's one of the core entity constructors
-            if (typeof entity === 'function' && coreEntities.some(core => core === entity)) {
-                return false;
-            }
-            // Add more sophisticated checks if needed (e.g., matching string paths to core entity names)
-            return true;
-        });
-
-        // Merge provided config with default entities
+        // Merge provided config with the imported clientEntities
         const effectiveConfig: NewPGliteDataSourceOptions = {
             ...(config || {}), // Spread provided config first
-            entities: [
-                ...coreEntities,
-                ...additionalEntities,
-            ],
+            // Use the imported clientEntities directly
+            entities: clientEntities, 
         };
         
         const ds = createNewPGliteDataSource(effectiveConfig);

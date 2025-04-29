@@ -1,6 +1,8 @@
 import { PGliteRepository, PGliteQueryBuilder } from './typeorm/PGliteQueryBuilder';
 import { PGliteQueryRunner } from './typeorm/PGliteQueryRunner';
-import { Task } from '@repo/dataforge';
+import { getNewPGliteDataSource } from './newtypeorm/NewDataSource';
+import { Task } from '@dataforge/generated/client-entities';
+import { EntityManager } from 'typeorm';
 
 /**
  * Represents a database change operation

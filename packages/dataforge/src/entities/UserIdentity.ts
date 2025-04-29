@@ -2,13 +2,13 @@ import {
   Entity, 
   Column, 
   ManyToOne, 
-  Relation, 
   Unique, 
   JoinColumn
 } from 'typeorm';
 import { IsString, MinLength } from 'class-validator';
 import { BaseSystemEntity } from './BaseSystemEntity.js';
 import { User } from './User.js'; // Import User for relation
+import { ServerOnly } from '../utils/context.js'; // Import ServerOnly
 
 /**
  * UserIdentity entity
@@ -17,13 +17,14 @@ import { User } from './User.js'; // Import User for relation
  */
 @Entity('user_identities')
 @Unique(['provider', 'providerId']) // Ensure a providerId is unique for a given provider
+@(ServerOnly() as ClassDecorator) // Add ServerOnly decorator
 export class UserIdentity extends BaseSystemEntity {
   @Column({ type: 'uuid', name: 'user_id' })
   userId!: string;
 
   @ManyToOne(() => User, (user) => user.identities) // Link back to the User entity
   @JoinColumn({ name: 'user_id' }) // Specify the foreign key column
-  user!: Relation<User>;
+  user!: Promise<import('./User.js').User>;
 
   @Column({ type: 'varchar', length: 50 })
   @IsString()

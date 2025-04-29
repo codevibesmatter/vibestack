@@ -10,7 +10,17 @@ import { DataSource, Repository, In, ObjectLiteral, LessThan, Not } from 'typeor
 import { v4 as uuidv4 } from 'uuid';
 import { TableChangeTest } from './types.ts';
 import { validate } from 'class-validator';
-import { serverDataSource } from '@repo/dataforge';
+import { DataChange } from "../../types";
+import { 
+    ChangeHistory, 
+    Comment, 
+    Project, 
+    Task, 
+    User, 
+    UserIdentity, 
+    serverDataSource // Re-exporting here for clarity or import directly 
+} from "@dataforge/generated/server-entities"; // Assuming server entities are needed
+// import { serverDataSource } from '@repo/dataforge'; // Removed old import
 
 import { createLogger } from '../logger.ts';
 import { EntityType, getEntityClass, TABLE_TO_ENTITY, DEPENDENCY_ORDER, getEntityCascadeGraph, getCascadeRelationships } from './entity-adapter.ts';

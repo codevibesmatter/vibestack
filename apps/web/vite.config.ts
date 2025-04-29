@@ -43,8 +43,13 @@ export default defineConfig({
     tailwindcss(),
   ],
   optimizeDeps: {
-    include: ['reflect-metadata'],
+    include: ['reflect-metadata', 'class-transformer', 'class-validator', 'typeorm/browser'],
     exclude: ['@electric-sql/pglite']
+  },
+  esbuild: {
+    supported: {
+      'decorator': true
+    }
   },
   worker: {
     format: 'es'
@@ -53,8 +58,7 @@ export default defineConfig({
     alias: {
       // Ensure TypeORM uses its browser bundle
       typeorm: 'typeorm/browser',
-      // Restore alias, pointing to JS file for Vite runtime
-      '@repo/dataforge/client-entities': path.resolve(__dirname, '../../packages/dataforge/dist/client-entities.js'), 
+      // Keep sync-types alias pointing to dist (as it might be pre-built)
       '@repo/sync-types': path.resolve(__dirname, '../../packages/sync-types/dist/index.js'),
       '@': path.resolve(__dirname, './src'),
 
@@ -73,6 +77,15 @@ export default defineConfig({
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp'
+    },
+    proxy: {
+      // Proxy requests starting with /api to your backend server
+      '/api': {
+        target: 'http://localhost:8787', // Your backend server URL
+        changeOrigin: true, // Recommended for virtual hosted sites
+        // secure: false, // Uncomment if backend uses self-signed SSL cert
+        // rewrite: (path) => path.replace(/^\/api/, ''), // Uncomment if backend doesn't expect /api prefix
+      }
     }
   }
 })

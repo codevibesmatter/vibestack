@@ -1,6 +1,6 @@
 import React, { useState } from 'react'
 import useDialogState from '@/hooks/use-dialog-state'
-import { Task } from '@repo/dataforge'
+import { Task } from '@dataforge/generated/client-entities'
 
 type TasksDialogType = 'create' | 'update' | 'delete' | 'import'
 

@@ -1,4 +1,4 @@
-import { Entity, Column, OneToMany, Relation, ManyToMany } from 'typeorm';
+import { Entity, Column, OneToMany, ManyToMany } from 'typeorm';
 import { 
   IsString, 
   IsEmail, 
@@ -53,14 +53,15 @@ export class User extends BaseDomainEntity {
   
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @OneToMany(() => Task, (task) => task.assignee)
-  tasks!: Relation<Task[]>;
+  tasks!: Promise<import('./Task.js').Task[]>;
   
   @OneToMany(() => Project, (project) => project.owner)
-  ownedProjects!: Relation<Project[]>;
+  ownedProjects!: Promise<import('./Project.js').Project[]>;
   
   @ManyToMany(() => Project, (project) => project.members)
-  memberProjects!: Relation<Project[]>;
+  memberProjects!: Promise<import('./Project.js').Project[]>;
 
+  @ServerOnly()
   @OneToMany(() => UserIdentity, (identity) => identity.user)
-  identities!: Relation<UserIdentity[]>;
+  identities!: Promise<import('./UserIdentity.js').UserIdentity[]>;
 } 

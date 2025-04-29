@@ -18,10 +18,8 @@ const config = {
     'pg',
   ],
   treeshake: false,
-  esbuildOptions(options: { supported: Record<string, boolean> }) {
-    options.supported = {
-      'decorator-metadata': true
-    };
+  esbuildOptions(options) {
+    options.tsconfig = 'tsconfig.json';
   }
 };
 

@@ -30,7 +30,8 @@ internalAuthApp.post('/find-or-create', async (c) => {
     serverLogger.debug('[Server:InternalAuth] Request body:', openAuthValue);
 
     // Use the proper user service implementation
-    const userId = await findOrCreateUserFromIdentity(openAuthValue);
+    // Pass the Hono context 'c' to the function
+    const userId = await findOrCreateUserFromIdentity(c, openAuthValue);
     serverLogger.info(`[Server:InternalAuth] Successfully found/created user. Returning userId: ${userId}`);
 
     // Return both userId and workspaceId for OpenAuth subject schema

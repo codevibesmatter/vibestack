@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, OneToMany, ManyToMany, JoinTable, Relation, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, OneToMany, ManyToMany, JoinTable, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
@@ -56,7 +56,7 @@ export class Project extends BaseDomainEntity {
   // Relationship fields using Relation wrapper to avoid circular dependencies
   @ManyToOne(() => User, (user) => user.ownedProjects, { nullable: true })
   @JoinColumn({ name: "owner_id" })
-  owner?: Relation<User>;
+  owner?: Promise<import('./User.js').User>;
   
   @ManyToMany(() => User, (user) => user.memberProjects)
   @JoinTable({
@@ -70,8 +70,8 @@ export class Project extends BaseDomainEntity {
       referencedColumnName: 'id'
     }
   })
-  members!: Relation<User[]>;
+  members!: Promise<import('./User.js').User[]>;
   
   @OneToMany(() => Task, (task) => task.project)
-  tasks!: Relation<Task[]>;
+  tasks!: Promise<import('./Task.js').Task[]>;
 } 

@@ -323,7 +323,11 @@ export class NeonDriver implements Driver {
         if (!nativeParameters || Object.keys(nativeParameters).length === 0) {
             // If nativeParameters is empty, check the other 'parameters' argument
             if (parameters && Object.keys(parameters).length > 0) {
-                console.warn("NeonDriver.escapeQueryWithParameters: Native parameters empty, falling back to using 'parameters' argument.");
+                // This is where the "ERROR" log happens
+                // console.error(`[${requestId}] NeonDriver.escapeQueryWithParameters: Native parameters empty, falling back to using 'parameters' argument.`);
+                // Need to extract values from the 'parameters' object.
+                // CRITICAL: The order might not match the SQL parameter placeholders ($1, $2)
+                // This fallback is potentially unsafe if the order isn't guaranteed.
                 paramsToUse = parameters;
                 sourceUsed = "parameters";
             } else {

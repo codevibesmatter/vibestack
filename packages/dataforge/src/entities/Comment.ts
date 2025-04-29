@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, Index, Relation, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, Index, JoinColumn } from 'typeorm';
 import { 
   IsString, 
   MinLength, 
@@ -57,11 +57,11 @@ export class Comment extends BaseDomainEntity {
   // Relationship fields with explicit JoinColumn decorators
   @ManyToOne(() => User, { nullable: true })
   @JoinColumn({ name: "author_id" })
-  author?: Relation<User>;
+  author?: User;
   
   @ManyToOne(() => Comment, { nullable: true })
   @JoinColumn({ name: "parent_id" })
-  parent?: Relation<Comment>;
+  parent?: Comment;
   
   // Note: For polymorphic relationships, we need application code to determine
   // which relationship to use based on entityType
@@ -69,11 +69,11 @@ export class Comment extends BaseDomainEntity {
   @JoinColumn([
     { name: "entity_id", referencedColumnName: "id" }
   ])
-  task?: Relation<Task>;
+  task?: Task;
   
   @ManyToOne(() => Project, { createForeignKeyConstraints: false })
   @JoinColumn([
     { name: "entity_id", referencedColumnName: "id" }
   ])
-  project?: Relation<Project>;
+  project?: Project;
 } 

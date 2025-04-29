@@ -1,55 +1,47 @@
-import Cookies from 'js-cookie'
-import { create } from 'zustand'
+import { create } from 'zustand';
 
-const ACCESS_TOKEN = 'thisisjustarandomstring'
+// No longer need js-cookie
+// import Cookies from 'js-cookie';
 
-interface AuthUser {
-  accountNo: string
-  email: string
-  role: string[]
-  exp: number
+// Define a simpler state focused on auth status and user data
+interface UserInfo {
+  id: string;
+  email?: string;
+  // Add other relevant fields from your User model
 }
 
 interface AuthState {
-  auth: {
-    user: AuthUser | null
-    setUser: (user: AuthUser | null) => void
-    accessToken: string
-    setAccessToken: (accessToken: string) => void
-    resetAccessToken: () => void
-    reset: () => void
-  }
+  isAuthenticated: boolean;
+  user: UserInfo | null;
+  isLoading: boolean; // Tracks initial auth status check
 }
 
-export const useAuthStore = create<AuthState>()((set) => {
-  const cookieState = Cookies.get(ACCESS_TOKEN)
-  const initToken = cookieState ? JSON.parse(cookieState) : ''
-  return {
-    auth: {
-      user: null,
-      setUser: (user) =>
-        set((state) => ({ ...state, auth: { ...state.auth, user } })),
-      accessToken: initToken,
-      setAccessToken: (accessToken) =>
-        set((state) => {
-          Cookies.set(ACCESS_TOKEN, JSON.stringify(accessToken))
-          return { ...state, auth: { ...state.auth, accessToken } }
-        }),
-      resetAccessToken: () =>
-        set((state) => {
-          Cookies.remove(ACCESS_TOKEN)
-          return { ...state, auth: { ...state.auth, accessToken: '' } }
-        }),
-      reset: () =>
-        set((state) => {
-          Cookies.remove(ACCESS_TOKEN)
-          return {
-            ...state,
-            auth: { ...state.auth, user: null, accessToken: '' },
-          }
-        }),
-    },
-  }
-})
+interface AuthActions {
+  setAuthenticated: (user: UserInfo) => void;
+  setUnauthenticated: () => void;
+  setLoading: (loading: boolean) => void;
+}
 
-// export const useAuth = () => useAuthStore((state) => state.auth)
+export const useAuthStore = create<AuthState & AuthActions>((set) => ({
+  // Initial state assumes we need to check with the backend
+  isAuthenticated: false,
+  user: null,
+  isLoading: true, // Start loading until initial check completes
+
+  setAuthenticated: (user) => {
+    console.log("[AUTH] Setting state to AUTHENTICATED. User:", user);
+    set({ isAuthenticated: true, user: user, isLoading: false });
+  },
+
+  setUnauthenticated: () => {
+    console.log("[AUTH] Setting state to UNAUTHENTICATED.");
+    set({ isAuthenticated: false, user: null, isLoading: false });
+  },
+
+  setLoading: (loading) => {
+    // console.log(`[AUTH] Setting loading state: ${loading}`);
+    set({ isLoading: loading });
+  },
+}));
+
+console.log("[AUTH] Zustand auth store initialized. Initial state:", useAuthStore.getState());

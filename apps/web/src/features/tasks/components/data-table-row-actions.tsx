@@ -14,7 +14,9 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useTasks } from '../context/tasks-context'
-import { Task } from '@repo/dataforge'
+import { Task } from '@dataforge/generated/client-entities'
+import { labels, statuses } from "../data/data"
+import { taskSchema } from "../data/schema"
 
 interface DataTableRowActionsProps {
   row: Row<Task>
