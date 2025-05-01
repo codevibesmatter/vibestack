@@ -6,6 +6,7 @@ import {
   Index
 } from 'typeorm';
 import { ServerOnly } from '../utils/context.js';
+import { BaseSystemEntity } from './BaseSystemEntity.js';
 
 /**
  * ChangeHistory entity for tracking changes for catchup sync
@@ -13,10 +14,7 @@ import { ServerOnly } from '../utils/context.js';
  */
 @Entity({ name: 'change_history' })
 @ServerOnly()
-export class ChangeHistory {
-  @PrimaryGeneratedColumn('uuid')
-  id!: string;
-
+export class ChangeHistory extends BaseSystemEntity {
   // Regular text index for basic lookups
   @Index()
   @Column({ type: 'text', nullable: false })

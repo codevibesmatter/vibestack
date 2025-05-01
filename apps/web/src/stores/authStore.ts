@@ -20,9 +20,10 @@ interface AuthActions {
   setAuthenticated: (user: UserInfo) => void;
   setUnauthenticated: () => void;
   setLoading: (loading: boolean) => void;
+  ensureAuthInitialized: () => Promise<void>;
 }
 
-export const useAuthStore = create<AuthState & AuthActions>((set) => ({
+export const useAuthStore = create<AuthState & AuthActions>((set, get) => ({
   // Initial state assumes we need to check with the backend
   isAuthenticated: false,
   user: null,
@@ -41,6 +42,25 @@ export const useAuthStore = create<AuthState & AuthActions>((set) => ({
   setLoading: (loading) => {
     // console.log(`[AUTH] Setting loading state: ${loading}`);
     set({ isLoading: loading });
+  },
+
+  // New function to ensure authentication check has completed
+  ensureAuthInitialized: () => {
+    return new Promise((resolve) => {
+      const state = get(); // Get current state
+      if (!state.isLoading) {
+        // If not loading, resolve immediately
+        resolve();
+      } else {
+        // If loading, subscribe to changes and wait for isLoading to become false
+        const unsubscribe = useAuthStore.subscribe((currentState) => {
+          if (!currentState.isLoading) {
+            resolve();
+            unsubscribe(); // Clean up the subscription
+          }
+        });
+      }
+    });
   },
 }));
 

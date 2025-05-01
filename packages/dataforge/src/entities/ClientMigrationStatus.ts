@@ -2,6 +2,7 @@ import { Entity, Column, PrimaryColumn, CreateDateColumn, Index } from 'typeorm'
 import { IsString, IsNumber, IsEnum, Matches } from 'class-validator';
 import { ClientOnly, TableCategory } from '../utils/context.js';
 import { EnumTypeName } from '../utils/decorators.js';
+import { BaseSystemEntity } from './BaseSystemEntity.js';
 
 export enum MigrationStatus {
   PENDING = 'pending',          // Not yet started
@@ -20,8 +21,8 @@ export enum MigrationStatus {
 @Entity('client_migration_status')
 @(ClientOnly() as ClassDecorator)
 @(TableCategory('system') as ClassDecorator)
-export class ClientMigrationStatus {
-  @PrimaryColumn({ type: "text", name: "migration_name" })
+export class ClientMigrationStatus extends BaseSystemEntity {
+  @Column({ type: "text", name: "migration_name" })
   @IsString()
   migrationName!: string;
 

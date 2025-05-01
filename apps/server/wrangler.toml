@@ -5,11 +5,13 @@ compatibility_flags = ["nodejs_compat"]
 
 # Development server configuration
 [dev]
-ip = "localhost"
+ip = "127.0.0.1"
 port = 8787
 local_protocol = "http"
 upstream_protocol = "http"
 host = "127.0.0.1"
+# cert = "./server.pem"
+# key = "./server-key.pem"
 
 # Environment variables
 [vars]

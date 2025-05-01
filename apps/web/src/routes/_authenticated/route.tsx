@@ -8,29 +8,21 @@ import SkipToMain from '@/components/skip-to-main'
 import { useAuthStore } from '@/stores/authStore'
 
 export const Route = createFileRoute('/_authenticated')({
-  beforeLoad: ({ location }) => {
-    // Check authentication state using Zustand store
+  beforeLoad: async ({ location }) => {
+    // TEMPORARILY REMOVED to test login navigation
+    // await useAuthStore.getState().ensureAuthInitialized(); 
+
+    // Check the auth state directly
     const isAuthenticated = useAuthStore.getState().isAuthenticated;
-    const isLoadingAuth = useAuthStore.getState().isLoading; // Check loading state
 
-    console.log(`[AUTH] beforeLoad (_authenticated): Is Authenticated? ${isAuthenticated}, Is Loading? ${isLoadingAuth}`);
+    console.log(`[AUTH] beforeLoad (_authenticated) check: Is Authenticated? ${isAuthenticated}`);
 
-    // If still loading auth status, don't redirect yet (wait for initial check)
-    // Note: This simple check might cause a flicker if the initial check is slow.
-    // A more robust solution might involve a dedicated loading state/component.
-    if (isLoadingAuth) {
-       console.log("[AUTH] beforeLoad (_authenticated): Auth status loading, deferring redirect check.");
-       // Potentially return a loading indicator promise here if needed by router
-       return; 
-    }
-
-    // If not authenticated (and not loading), redirect to sign-in
+    // If not authenticated, redirect to sign-in
     if (!isAuthenticated) {
       console.log('[AUTH] beforeLoad (_authenticated): Not authenticated, redirecting to /sign-in.');
       throw redirect({
         to: '/sign-in', 
         search: {
-          // Optionally preserve the intended destination
           redirect: location.href,
         }, 
         replace: true

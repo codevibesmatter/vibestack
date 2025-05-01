@@ -2,19 +2,40 @@ import { createAuthClient } from "better-auth/react"; // Use React client
 
 // Define the base URL for the Better Auth server
 // In production, this should come from an environment variable
-const authApiBaseUrl = import.meta.env.VITE_API_URL || "http://localhost:8787/api/auth";
+const authApiBaseUrl = import.meta.env.VITE_API_URL || "http://127.0.0.1:8787";
 
 // Create the Better Auth client instance
 export const authClient = createAuthClient({
-  baseURL: authApiBaseUrl,
+  baseURL: `${authApiBaseUrl}/api/auth`,
   credentials: 'include', // Ensure credentials are sent with requests
   headers: {
     'Content-Type': 'application/json',
   },
-  // Revert back to standard CORS mode
   mode: 'cors',
-  // Restore withCredentials if authClient uses it, otherwise ensure credentials: 'include' is present (which it is)
-  // withCredentials: true, 
+  fetch: (url: string, options: RequestInit) => {
+    console.log(`[AUTH] Fetch request to: ${url}`);
+    console.log('[AUTH] Request options:', JSON.stringify({
+      method: options.method,
+      headers: options.headers,
+      credentials: options.credentials,
+      mode: options.mode
+    }, null, 2));
+    
+    // Ensure cookies are sent
+    const enhancedOptions = {
+      ...options,
+      credentials: 'include' as RequestCredentials,
+    };
+    
+    return fetch(url, enhancedOptions).then(response => {
+      console.log(`[AUTH] Response status: ${response.status}`);
+      console.log(`[AUTH] Response headers:`, Object.fromEntries(response.headers.entries()));
+      return response;
+    }).catch(error => {
+      console.error('[AUTH] Fetch error:', error);
+      throw error;
+    });
+  }
 });
 
 // No longer need redirectUri for PKCE

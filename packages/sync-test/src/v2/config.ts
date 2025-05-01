@@ -40,7 +40,7 @@ export const SERVER_DOMAIN_TABLE_MAP = {
  */
 export const WS_CONFIG = {
   // Default WebSocket URL
-  URL: process.env.WS_URL || 'ws://localhost:8787/api/sync',
+  URL: process.env.WS_URL || 'wss://127.0.0.1:8787/api/sync',
   
   // WebSocket connection parameters
   PARAMS: {
@@ -61,7 +61,7 @@ export const WS_CONFIG = {
  */
 export const API_CONFIG = {
   // Base API URL - hardcoded for simplicity
-  BASE_URL: 'http://localhost:8787',
+  BASE_URL: 'https://127.0.0.1:8787',
   
   // Replication initialization endpoint
   REPLICATION_INIT: '/api/replication/init',

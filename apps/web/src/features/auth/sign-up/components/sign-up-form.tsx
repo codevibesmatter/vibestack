@@ -62,29 +62,29 @@ export function SignUpForm({ className, ...props }: SignUpFormProps) {
   async function onSubmit(data: z.infer<typeof formSchema>) {
     setIsLoading(true)
     try {
-      console.log("[Sign Up] Attempting sign-up with:", data.email);
+      console.log("[AUTH] Attempting sign-up with:", data.email);
       const result = await authClient.signUp.email({
         name: data.name,
         email: data.email,
         password: data.password,
       });
 
-      console.log("[Sign Up] Result:", result);
+      console.log("[AUTH] Sign Up Result:", result);
 
       if ('data' in result && result.data?.user) {
         setAuthenticated({ id: result.data.user.id, email: result.data.user.email });
         toast.success("Account created successfully!");
         navigate({ to: '/', replace: true });
       } else if ('error' in result) {
-        console.error("[Sign Up] Auth Error:", result.error);
+        console.error("[AUTH] Sign Up Auth Error:", result.error);
         const errorMessage = result.error?.message || "Sign up failed. Please try again.";
         toast.error(errorMessage);
       } else {
-        console.error("[Sign Up] Unexpected response structure:", result);
+        console.error("[AUTH] Unexpected Sign Up response structure:", result);
         toast.error("An unexpected error occurred during sign up.");
       }
     } catch (error: any) {
-      console.error("[Sign Up] Network/Fetch Error:", error);
+      console.error("[AUTH] Sign Up Network/Fetch Error:", error);
       const errorMessage = error?.message || "A network error occurred. Please try again.";
       toast.error(errorMessage);
     } finally {

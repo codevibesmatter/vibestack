@@ -14,8 +14,10 @@ import type { AppBindings } from './types/hono';
 import type { Env, ExecutionContext } from './types/env';
 import { SyncDO } from './sync/SyncDO';
 import { ReplicationDO } from './replication/ReplicationDO';
-import internalAuthApp from './auth/internal';
-import { getAuth, AuthType } from './lib/auth';
+import { getAuth, AuthType, initializeAuth } from './lib/auth';
+import { serverLogger as log } from './middleware/logger';
+import { authMiddleware } from './middleware/auth'; // <-- Import the new middleware
+import authRouter from './api/auth';
 
 // Remove temporary auth instance
 
@@ -30,12 +32,13 @@ apiApp.use('*', cors({
   origin: (origin) => {
     // Dynamically allow the specific frontend origin
     // or potentially others in the future
-    const allowedOrigins = ['http://localhost:5173'];
+    const allowedOrigins = ['https://127.0.0.1:5173', 'http://127.0.0.1:5173', 'http://localhost:5173'];
+    if (!origin) return allowedOrigins[0]; // Default for non-browser requests
     if (allowedOrigins.includes(origin)) {
       return origin;
     } else {
       // Return a default allowed origin or null if none match
-      // Returning the first one here for consistency, though ideally, it should match.
+      console.warn(`[CORS] Rejected origin: ${origin}`);
       return allowedOrigins[0]; 
     }
   },
@@ -43,42 +46,17 @@ apiApp.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true, // Allow cookies/credentials
   maxAge: 86400, // Cache preflight for 1 day
+  exposeHeaders: ['Set-Cookie'], // Expose Set-Cookie header to JavaScript
 }));
 
 // Use our structured logger middleware
 apiApp.use('*', createStructuredLogger());
 
-// Mount the Better Auth handler using double asterisk pattern for GET/POST
-// TEMPORARILY simplified for CORS debugging - Setting headers manually
-apiApp.on(["POST", "GET"], "/auth/**", 
-  // REMOVED manualCorsHeaders middleware usage
-  async (c) => { 
-    // Restore original handler logic
-    const requestId = c.req.header('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    console.log(`[${requestId}] [apiApp .on()] Handling auth path: ${c.req.path}, Method: ${c.req.method}`);
-    console.log(`[${requestId}] Request headers:`, Object.fromEntries(c.req.raw.headers.entries()));
+// Apply the authentication middleware to check session status on all requests
+apiApp.use('*', authMiddleware);
 
-    console.log(`[${requestId}] Getting auth instance...`);
-    const authInstance = getAuth(c); 
-    try {
-      console.log(`[${requestId}] Calling auth handler...`);
-      const response = await authInstance.handler(c.req.raw);
-      console.log(`[${requestId}] Auth handler returned response:`, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: Object.fromEntries(response.headers.entries())
-      });
-
-      // Return the raw response directly. CORS middleware should handle headers.
-      return response;
-
-    } catch (error) {
-      console.error(`[${requestId}] Error in Better Auth handler:`, error);
-      // Return a simple error response. CORS middleware should handle headers.
-      return c.json({ error: "Internal Auth Error" }, 500);
-    }
-  }
-);
+// Mount the auth router
+apiApp.route('/auth', authRouter);
 
 // Mount OTHER public API routes 
 apiApp.route('/', api);
@@ -90,9 +68,6 @@ const internalApp = new Hono<AppBindings>().basePath('/internal');
 
 // Use logger for internal routes too
 internalApp.use('*', createStructuredLogger());
-
-// Mount internal auth routes
-internalApp.route('/auth', internalAuthApp);
 
 /**
  * Main worker export
@@ -128,6 +103,69 @@ const worker = {
      * 3. They use Cloudflare's WebSocket Hibernation API
      */
     if (url.pathname === '/api/sync') {
+      // --- BEGIN CORS CHECK for /api/sync ---
+      const origin = request.headers.get('Origin');
+      const allowedOrigins = ['https://127.0.0.1:5173', 'http://127.0.0.1:5173', 'http://localhost:5173']; // Match the API allowed origins
+      let allowedOrigin = null;
+
+      if (origin && allowedOrigins.includes(origin)) {
+        allowedOrigin = origin;
+      } else if (origin) {
+        // Origin is present but not allowed
+        console.warn(`[${requestId}] [Sync CORS] Forbidden origin: ${origin}`);
+        return new Response('Forbidden', { status: 403 });
+      } else {
+        // Origin header is missing - this might be allowed for same-origin or non-browser clients
+        // For security, we could reject here, but let's assume allowed for now if credentials aren't strictly needed
+        // If cookies are essential, we should probably reject missing origins.
+        // For now, let's proceed but not set the Allow-Origin header.
+        console.log(`[${requestId}] [Sync CORS] Origin header missing, proceeding.`);
+      }
+      // --- END CORS CHECK ---
+
+      // --- BEGIN AUTH CHECK for /api/sync ---
+      try {
+        const auth = initializeAuth(env); // Initialize auth using env
+        
+        // Check for auth token in query parameters (for WebSocket connections)
+        const authToken = url.searchParams.get('auth');
+        let sessionData = null;
+        
+        if (authToken) {
+          // Create a modified request with the auth token in the Authorization header
+          console.log(`[${requestId}] [Sync Auth] Attempting to authenticate with token parameter`);
+          try {
+            // Create a new request with the token in the Authorization header
+            const modifiedHeaders = new Headers(request.headers);
+            modifiedHeaders.set('Cookie', `session_token=${authToken}`);
+            
+            // Try to get session using the modified headers
+            sessionData = await auth.api.getSession({ headers: modifiedHeaders });
+          } catch (tokenError) {
+            console.error(`[${requestId}] [Sync Auth] Token-based auth failed:`, tokenError);
+          }
+        }
+        
+        // If no token or token validation failed, fall back to cookie-based auth
+        if (!sessionData && auth.api && typeof auth.api.getSession === 'function') {
+          sessionData = await auth.api.getSession({ headers: request.headers });
+        }
+        
+        if (!sessionData) {
+          // No valid session, reject the request before WebSocket upgrade
+          console.log(`[${requestId}] [Sync Auth] No valid session found`);
+          return new Response('Unauthorized: No active session found.', { status: 401 });
+        }
+        
+        // Session is valid, proceed with WebSocket logic
+        // Optionally: log user ID or other details from sessionData.user
+        console.log(`[${requestId}] [Sync Auth] User ${sessionData.user?.id} authenticated for sync.`);
+      } catch (error) {
+        console.error(`[${requestId}] [Sync Auth] Error during session check:`, error);
+        return new Response('Internal Server Error during authentication.', { status: 500 });
+      }
+      // --- END AUTH CHECK for /api/sync ---
+
       // Check for WebSocket upgrade request
       const upgradeHeader = request.headers.get('Upgrade');
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
@@ -147,7 +185,21 @@ const worker = {
       const obj = env.SYNC.get(id);
       
       // Forward the request to the Durable Object
-      return obj.fetch(request);
+      const doResponse = await obj.fetch(request);
+
+      // Add CORS headers to the DO response if origin was allowed
+      if (allowedOrigin) {
+        const responseWithCors = new Response(doResponse.body, doResponse);
+        responseWithCors.headers.set('Access-Control-Allow-Origin', allowedOrigin);
+        responseWithCors.headers.set('Access-Control-Allow-Credentials', 'true');
+        // Add Vary header to indicate that the response depends on the Origin header
+        responseWithCors.headers.append('Vary', 'Origin'); 
+        console.log(`[${requestId}] [Sync CORS] Added CORS headers for origin: ${allowedOrigin}`);
+        return responseWithCors;
+      } else {
+        // Return the original DO response if origin wasn't explicitly allowed (e.g., missing origin header)
+        return doResponse;
+      }
     }
 
     // --- Route to PUBLIC API router ---

@@ -53,28 +53,30 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   async function onSubmit(data: z.infer<typeof formSchema>) {
     setIsLoading(true)
     try {
-      console.log("[Sign In] Attempting sign-in with:", data.email);
+      console.log("[AUTH] Attempting sign-in with:", data.email);
       const result = await authClient.signIn.email({
         email: data.email,
         password: data.password,
       });
 
-      console.log("[Sign In] Result:", result);
+      console.log("[AUTH] Full API Result:", JSON.stringify(result, null, 2)); 
+
+      console.log("[AUTH] Sign In Result Object:", result); 
 
       if ('data' in result && result.data?.user) {
         setAuthenticated({ id: result.data.user.id, email: result.data.user.email });
         toast.success("Login successful!");
         navigate({ to: '/', replace: true });
       } else if ('error' in result) {
-        console.error("[Sign In] Auth Error:", result.error);
+        console.error("[AUTH] Sign In Error:", result.error);
         const errorMessage = result.error?.message || "Sign in failed. Please check credentials.";
         toast.error(errorMessage);
       } else {
-        console.error("[Sign In] Unexpected response structure:", result);
+        console.error("[AUTH] Unexpected Sign In response structure:", result);
         toast.error("An unexpected error occurred during login.");
       }
     } catch (error: any) {
-      console.error("[Sign In] Network/Fetch Error:", error);
+      console.error("[AUTH] Sign In Network/Fetch Error:", error);
       const errorMessage = error?.message || "A network error occurred. Please try again.";
       toast.error(errorMessage);
     } finally {

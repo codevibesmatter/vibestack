@@ -43,22 +43,6 @@ importers:
         specifier: ~5.8.3
         version: 5.8.3
 
-  apps/cors-test-app:
-    dependencies:
-      hono:
-        specifier: ^4.7.8
-        version: 4.7.8
-    devDependencies:
-      '@cloudflare/workers-types':
-        specifier: ^4.20240823.0
-        version: 4.20250423.0
-      typescript:
-        specifier: ^5.8.3
-        version: 5.8.3
-      wrangler:
-        specifier: ^4.14.0
-        version: 4.14.0(@cloudflare/workers-types@4.20250423.0)
-
   apps/openauth:
     dependencies:
       '@hono/zod-validator':
@@ -123,11 +107,11 @@ importers:
         specifier: ^4.7.7
         version: 4.7.7
       kysely:
-        specifier: ^0.28.2
-        version: 0.28.2
+        specifier: ^0.27.0
+        version: 0.27.6
       kysely-neon:
-        specifier: ^1.1.0
-        version: 1.3.0(@neondatabase/serverless@0.7.2)(kysely@0.28.2)
+        specifier: ^1.0.0
+        version: 1.3.0(@neondatabase/serverless@0.7.2)(kysely@0.27.6)
       pg:
         specifier: ^8.15.6
         version: 8.15.6
@@ -158,7 +142,7 @@ importers:
         version: 1.6.1(@types/node@18.19.87)
       wrangler:
         specifier: ^4.14.0
-        version: 4.14.0(@cloudflare/workers-types@4.20250423.0)
+        version: 4.14.0
 
   apps/web:
     dependencies:
@@ -1900,7 +1884,7 @@ packages:
       vite: ^6.1.0
       wrangler: ^3.101.0 || ^4.0.0
     dependencies:
-      '@cloudflare/unenv-preset': 2.3.1(unenv@2.0.0-rc.15)(workerd@1.20250422.0)
+      '@cloudflare/unenv-preset': 2.3.1(unenv@2.0.0-rc.15)(workerd@1.20250428.0)
       '@hattip/adapter-node': 0.0.49
       '@rollup/plugin-replace': 6.0.2(rollup@2.79.2)
       get-port: 7.1.0
@@ -9643,7 +9627,7 @@ packages:
       zod-validation-error: 3.4.0(zod@3.24.3)
     dev: true
 
-  /kysely-neon@1.3.0(@neondatabase/serverless@0.7.2)(kysely@0.28.2):
+  /kysely-neon@1.3.0(@neondatabase/serverless@0.7.2)(kysely@0.27.6):
     resolution: {integrity: sha512-CIIlbmqpIXVJDdBEYtEOwbmALag0jmqYrGfBeM4cHKb9AgBGs+X1SvXUZ8TqkDacQEqEZN2XtsDoUkcMIISjHw==}
     peerDependencies:
       '@neondatabase/serverless': ^0.4.3
@@ -9654,7 +9638,7 @@ packages:
         optional: true
     dependencies:
       '@neondatabase/serverless': 0.7.2
-      kysely: 0.28.2
+      kysely: 0.27.6
     dev: false
 
   /kysely@0.27.6:
@@ -13231,7 +13215,7 @@ packages:
       - utf-8-validate
     dev: true
 
-  /wrangler@4.14.0(@cloudflare/workers-types@4.20250423.0):
+  /wrangler@4.14.0:
     resolution: {integrity: sha512-WhypgOBEYuUMo/ZFw8MgZ0wtyE7EmDanytjD8Me+OMm62raKU9V9DZTlF1UVLkNfilfQNlRbMnFRdzSBji/MEA==}
     engines: {node: '>=18.0.0'}
     hasBin: true
@@ -13243,7 +13227,6 @@ packages:
     dependencies:
       '@cloudflare/kv-asset-handler': 0.4.0
       '@cloudflare/unenv-preset': 2.3.1(unenv@2.0.0-rc.15)(workerd@1.20250428.0)
-      '@cloudflare/workers-types': 4.20250423.0
       blake3-wasm: 2.1.5
       esbuild: 0.25.2
       miniflare: 4.20250428.0

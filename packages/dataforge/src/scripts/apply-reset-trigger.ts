@@ -14,7 +14,7 @@ async function applyTrigger() {
     // Get a query runner
     const queryRunner = serverDataSource.createQueryRunner();
     
-    console.log(`Applying migration: ${migration.name}`);
+    console.log(`Applying migration: RecreateClientIdResetTrigger1743542000000`);
     
     // Apply the migration
     await migration.up(queryRunner);

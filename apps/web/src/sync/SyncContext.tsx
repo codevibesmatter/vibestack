@@ -198,19 +198,8 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
           // Wait a moment for event handlers to be properly registered
           setTimeout(async () => {
             try {
-              // Use the config function to get the URL, respecting environment variables
-              const correctUrl = getSyncWebSocketUrl();
-              
-              // Set the serverUrl state to the correct URL (for UI consistency)
-              setServerUrl(correctUrl);
-              
-              // Connect with timeout handling
-              await Promise.race([
-                syncManager.connect(correctUrl),
-                new Promise((_, reject) => 
-                  setTimeout(() => reject(new Error('Auto-connect timeout')), 8000)
-                )
-              ]);
+              // Call the proper auto-connect method which has internal checks
+              await syncManager.autoConnectToServer();
               
               // No additional success log - SyncManager already logs this
             } catch (err) {
@@ -219,8 +208,8 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
               // Schedule a single retry after 3 seconds
               setTimeout(async () => {
                 try {
-                  // Use the same URL from config for retry
-                  await syncManager.connect(serverUrl);
+                  // Retry with the auto-connect method as well
+                  await syncManager.autoConnectToServer();
                   // No additional success log
                 } catch (retryErr) {
                   console.error('SyncContext: Auto-connect retry also failed');
@@ -228,7 +217,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
                 }
               }, 3000);
             }
-          }, 1000);
+          }, 1000); // Delay slightly to ensure listeners are attached
         }
         
         // Cleanup on unmount

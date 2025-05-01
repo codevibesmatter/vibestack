@@ -80,33 +80,55 @@ export class SyncChangeManager {
    * Initialize TypeORM DataSource and load pending changes count
    */
   private async initializeDataSourceAndLoadChanges(): Promise<void> {
-    if (this.dataSource) {
+    if (this.dataSource && this.dataSource.isInitialized) { // Check if already initialized
       console.log('SyncChangeManager: DataSource already initialized.');
-      return this.loadPendingChangesCount(); // Load count if DS already exists
+      return this.loadPendingChangesCount(); // Load count if DS already exists and is initialized
+    }
+
+    // Check if already initializing to prevent race conditions
+    if (this.dataSource && !this.dataSource.isInitialized) {
+        console.log('SyncChangeManager: DataSource is initializing, waiting...');
+        // Optionally, wait for the existing initialization to complete
+        // This might require a more complex promise-based mechanism
+        // For now, we'll let the existing process handle it or retry later
+        return;
     }
 
     try {
       console.log('SyncChangeManager: Initializing New PGLite DataSource...');
       // Use the new factory function
-      // TODO: Review and update the configuration options as needed for the new source
       this.dataSource = await getNewPGliteDataSource({
         database: 'shadadmin_db', // Or your actual DB name
         synchronize: false, // Ensure this is false for production/stable schema
         logging: false, // Set logging as needed (e.g., true for development)
         // Use the imported clientEntities array
-        entities: clientEntities 
+        entities: clientEntities
       });
 
-      if (!this.dataSource || !this.dataSource.isInitialized) {
-        // Check isInitialized as the new source might not throw but fail init
-        throw new Error('Failed to initialize New PGLite DataSource or it did not initialize correctly.');
+      if (!this.dataSource) {
+        throw new Error('Failed to get New PGLite DataSource instance.');
       }
 
-      console.log('SyncChangeManager: New PGLite DataSource initialized, loading pending changes.');
-      await this.loadPendingChangesCount(); // Load count after successful initialization
+      // Explicitly initialize the DataSource and wait for it
+      console.log('SyncChangeManager: Awaiting DataSource initialization...');
+      await this.dataSource.initialize();
+
+      // Check if initialization was successful AFTER awaiting initialize()
+      if (!this.dataSource.isInitialized) {
+        throw new Error('New PGLite DataSource failed to initialize correctly.');
+      }
+
+      console.log('SyncChangeManager: New PGLite DataSource initialized successfully, scheduling change load.');
+
+      // Introduce a minimal delay before loading changes
+      await new Promise(resolve => setTimeout(resolve, 0)); // Yield to event loop
+
+      await this.loadPendingChangesCount(); // Load count after successful initialization and delay
 
     } catch (error) {
-      console.error('SyncChangeManager: Failed to initialize New PGLite DataSource:', error);
+      console.error('SyncChangeManager: Failed to initialize New PGLite DataSource or load changes:', error);
+      // Clear the potentially partially initialized dataSource on failure
+      this.dataSource = null;
       // Retry initialization after a delay
       setTimeout(() => this.initializeDataSourceAndLoadChanges(), 5000);
     }
@@ -1305,18 +1327,31 @@ export class SyncChangeManager {
    * Specifically handles fields for the Comment entity.
    */
   private mapIncomingDataToEntityProperties(data: Record<string, unknown>): Partial<Comment> {
-    return {
+    const mappedData: Partial<Comment> = {
       id: data.id as string,
       content: data.content as string,
-      entityType: data.entity_type as string, // Map snake_case to camelCase
-      entityId: data.entity_id as string | undefined, // Map snake_case to camelCase
       authorId: data.author_id as string | undefined, // Map snake_case to camelCase
       parentId: data.parent_id as string | undefined, // Map snake_case to camelCase
       createdAt: data.created_at ? new Date(data.created_at as string) : undefined, // Convert string to Date
       updatedAt: data.updated_at ? new Date(data.updated_at as string) : undefined, // Convert string to Date
-      // Include other base fields if necessary and present in data
-      clientId: data.client_id as string | undefined, 
+      clientId: data.client_id as string | undefined,
     };
+
+    // Map entity_type/entity_id to specific FKs
+    const entityType = data.entity_type as string;
+    const entityId = data.entity_id as string | undefined;
+
+    if (entityId) {
+        if (entityType === 'task') { // Assuming 'task' is the type string
+            mappedData.taskId = entityId;
+        } else if (entityType === 'project') { // Assuming 'project' is the type string
+            mappedData.projectId = entityId;
+        } else {
+            console.warn(`[SyncChangeManager] Unknown entityType '${entityType}' for comment ${data.id}`);
+        }
+    }
+
+    return mappedData;
   }
 
   /**

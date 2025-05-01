@@ -9,10 +9,6 @@ import { isServerEntity } from '../utils/context.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Import server entities dynamically for ESM
-// This will be fixed after building the entities
-import { serverEntities } from "../generated/server-entities.js";
-
 // Load environment variables from .env file
 config();
 
@@ -28,9 +24,9 @@ const serverDataSource = new DataSource({
   password: process.env.DB_PASSWORD || "postgres",
   database: process.env.DB_NAME || "vibestack",
   ssl: process.env.DB_SSL === "true",
-  // Use the pre-filtered server entities
-  entities: serverEntities,
-  migrations: ["src/migrations/server/*.ts"],
+  // Dynamically load entities from the entities directory
+  entities: [path.join(__dirname, '../entities/*.ts')],
+  migrations: [path.join(__dirname, "../migrations/server/*.ts")],
   // Set default schema for all entities
   schema: "public",
   logging: true,
@@ -38,10 +34,5 @@ const serverDataSource = new DataSource({
   entitySkipConstructor: true,
   synchronize: false,
 });
-
-// For debug purposes
-if (process.env.DEBUG) {
-  console.log("Server entities:", serverEntities.map((e: any) => e.name));
-}
 
 export default serverDataSource; 

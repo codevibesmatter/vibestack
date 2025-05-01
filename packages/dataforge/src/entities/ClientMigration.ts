@@ -2,6 +2,7 @@ import { Entity, Column, PrimaryColumn, CreateDateColumn, Index } from 'typeorm'
 import { IsString, IsArray, IsNumber, IsOptional, IsEnum, Matches } from 'class-validator';
 import { ServerOnly, TableCategory } from '../utils/context.js';
 import { EnumTypeName } from '../utils/decorators.js';
+import { BaseSystemEntity } from './BaseSystemEntity.js';
 
 export enum MigrationType {
   SCHEMA = 'schema',    // Changes to table structure
@@ -27,8 +28,8 @@ export enum MigrationState {
 @Entity('client_migration')
 @(ServerOnly() as ClassDecorator)
 @(TableCategory('system') as ClassDecorator)
-export class ClientMigration {
-  @PrimaryColumn({ type: 'text', name: 'migration_name' })
+export class ClientMigration extends BaseSystemEntity {
+  @Column({ type: 'text', name: 'migration_name' })
   @IsString()
   migrationName!: string;
 

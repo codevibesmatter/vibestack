@@ -68,7 +68,7 @@ async function getNextSchemaVersion(dataSource: DataSource): Promise<number> {
 
 async function uploadClientMigrations() {
   try {
-    // Initialize server connection
+    // Initialize server connection (no pre-check needed here)
     await serverDataSource.initialize();
 
     // Get existing migrations from server
@@ -159,7 +159,10 @@ async function uploadClientMigrations() {
     console.error('Error uploading client migrations:', error);
     process.exit(1);
   } finally {
-    await serverDataSource.destroy();
+    // Ensure destroy is called even if initialization failed
+    if (serverDataSource.isInitialized) {
+      await serverDataSource.destroy();
+    }
   }
 }
 

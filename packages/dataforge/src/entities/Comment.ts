@@ -14,11 +14,11 @@ import { BaseDomainEntity } from './BaseDomainEntity.js';
 
 /**
  * Universal Comment entity that can be associated with any entity type
- * Uses a polymorphic association pattern with entityType and entityId
+ * Uses separate nullable foreign key columns (taskId, projectId, etc.)
  * Extends BaseDomainEntity for common fields and behavior
  */
 @Entity('comments')
-@Index("IDX_comments_entity_type_entity_id", ["entityType", "entityId"]) // Index for faster lookups by entity
+// Removed index: @Index("IDX_comments_entity_type_entity_id", ["entityType", "entityId"]) 
 export class Comment extends BaseDomainEntity {
   @Column({ type: "text" })
   @IsString()
@@ -26,21 +26,8 @@ export class Comment extends BaseDomainEntity {
   @MaxLength(5000, { message: "Content cannot exceed 5000 characters" })
   content!: string;
   
-  /**
-   * The type of entity this comment is associated with (e.g., 'task', 'project')
-   */
-  @Column({ type: "varchar", name: "entity_type" })
-  @IsString()
-  entityType!: string;
-  
-  /**
-   * The ID of the entity this comment is associated with
-   */
-  @Column({ type: "uuid", name: "entity_id", nullable: true })
-  @IsOptional()
-  @IsUUID(4)
-  entityId?: string;
-  
+  // Removed entityType and entityId columns
+
   @Column({ type: "uuid", name: "author_id", nullable: true })
   @IsOptional()
   @IsUUID(4)
@@ -53,8 +40,19 @@ export class Comment extends BaseDomainEntity {
   @IsOptional()
   @IsUUID(4)
   parentId?: string;
+
+  // --- New FK columns ---
+  @Column({ type: "uuid", name: "task_id", nullable: true })
+  @IsOptional()
+  @IsUUID(4)
+  taskId?: string;
+
+  @Column({ type: "uuid", name: "project_id", nullable: true })
+  @IsOptional()
+  @IsUUID(4)
+  projectId?: string;
   
-  // Relationship fields with explicit JoinColumn decorators
+  // --- Relationships ---
   @ManyToOne(() => User, { nullable: true })
   @JoinColumn({ name: "author_id" })
   author?: User;
@@ -63,17 +61,12 @@ export class Comment extends BaseDomainEntity {
   @JoinColumn({ name: "parent_id" })
   parent?: Comment;
   
-  // Note: For polymorphic relationships, we need application code to determine
-  // which relationship to use based on entityType
-  @ManyToOne(() => Task, { createForeignKeyConstraints: false })
-  @JoinColumn([
-    { name: "entity_id", referencedColumnName: "id" }
-  ])
+  // --- Relations using new FK columns ---
+  @ManyToOne(() => Task, { nullable: true }) // Add nullable here too
+  @JoinColumn({ name: "task_id" }) // Join on the specific task_id column
   task?: Task;
   
-  @ManyToOne(() => Project, { createForeignKeyConstraints: false })
-  @JoinColumn([
-    { name: "entity_id", referencedColumnName: "id" }
-  ])
+  @ManyToOne(() => Project, { nullable: true }) // Add nullable here too
+  @JoinColumn({ name: "project_id" }) // Join on the specific project_id column
   project?: Project;
 } 

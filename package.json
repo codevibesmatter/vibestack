@@ -39,5 +39,10 @@
     "@electric-sql/pglite-repl": "^0.2.18",
     "hono": "^4.7.8",
     "tailwindcss": "^4.1.4"
+  },
+  "pnpm": {
+    "overrides": {
+      "kysely": "^0.27.0"
+    }
   }
 }

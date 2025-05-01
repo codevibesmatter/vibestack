@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getNewPGliteDataSource, NewPGliteDataSource } from '../db/newtypeorm/NewDataSource';
 import { getSyncWebSocketUrl } from './config';
 import { SyncEventEmitter } from './SyncEventEmitter';
+import { SyncMetadata } from '@repo/dataforge/client-entities';
 
 // Define sync states
 export type SyncState = 'disconnected' | 'connecting' | 'initial' | 'catchup' | 'live';
@@ -200,178 +201,130 @@ export class SyncManager {
     console.log('SyncManager: Loading sync metadata from database using TypeORM');
 
     try {
-      const dataSource = await getNewPGliteDataSource();
-      if (!dataSource || !dataSource.isInitialized) {
-          throw new Error('Failed to get initialized TypeORM DataSource.');
-      }
+        const dataSource = await getNewPGliteDataSource();
+        if (!dataSource || !dataSource.isInitialized) {
+            throw new Error('Failed to get initialized TypeORM DataSource for loading.');
+        }
 
-      // Query the sync_metadata table directly, assuming it exists
-      try {
-        const result = await dataSource.manager.query('SELECT * FROM sync_metadata WHERE id = $1', [this.metadataKey]);
-        
-        // Check if we got valid results (TypeORM query result is typically an array)
-        if (!result || !Array.isArray(result)) {
-          throw new Error('Invalid query result structure');
-        }
-        
-        // Check if we have any rows
-        if (result.length > 0) {
-          const metadata = result[0];
-          
-          // Only log detailed metadata in development environment
-          if (process.env.NODE_ENV !== 'production') {
-            console.debug('SyncManager: Found existing sync metadata:', metadata);
-          } else {
-            console.log('SyncManager: Found existing sync metadata');
-          }
-          
-          // Load LSN
-          if (metadata.current_lsn) {
-            this.currentLSN = metadata.current_lsn;
-            console.log(`SyncManager: Using LSN from database: ${this.currentLSN}`);
-          }
-          
-          // Load client ID
-          if (metadata.client_id) {
-            this.clientId = metadata.client_id;
-            console.log(`SyncManager: Using client ID from database: ${this.clientId}`);
-          }
-          
-          // We always start in disconnected state regardless of stored state
-          if (metadata.sync_state !== 'disconnected') {
-            console.log(`SyncManager: Resetting state to 'disconnected' (stored: ${metadata.sync_state})`);
-          }
-          
-          // Load pending changes count
-          if (metadata.pending_changes_count !== undefined) {
-            this.pendingChanges = metadata.pending_changes_count;
-            if (this.pendingChanges > 0) {
-              console.log(`SyncManager: Loaded ${this.pendingChanges} pending changes from database`);
-            }
-          }
-          
-          // Load last sync time
-          if (metadata.last_sync_time) {
-            this.lastSyncTime = new Date(metadata.last_sync_time);
-          }
+        const metadataRepo = dataSource.getRepository(SyncMetadata);
+
+        // Find existing metadata (should be only one row)
+        const existingMetadataArray = await metadataRepo.find(); // Use find() instead of raw query
+
+        if (existingMetadataArray && existingMetadataArray.length > 0) {
+            const metadata = existingMetadataArray[0]; // Get the first (only) row
+            console.log(`SyncManager: Found existing sync metadata with ID: ${metadata.id}`);
+
+            // Load data from existing record
+            this.currentLSN = metadata.currentLsn || '0/0';
+            // Ensure clientId exists, generate if somehow missing
+            this.clientId = metadata.clientId || this.generateClientId(); 
+            this.pendingChanges = metadata.pendingChangesCount || 0;
+            this.lastSyncTime = metadata.lastSyncTime || null;
+
+            console.log(`SyncManager: Loaded metadata - ClientID: ${this.clientId}, LSN: ${this.currentLSN}`);
+            // Always start disconnected
+            this.syncState = 'disconnected';
+
         } else {
-          console.log('SyncManager: No existing sync metadata, creating new client ID');
-          this.clientId = this.generateClientId();
-          console.log(`SyncManager: Generated new client ID: ${this.clientId}`);
-          await this.saveMetadata(true); // Force immediate save
+            // No existing record, generate ID and create initial record
+            console.log('SyncManager: No existing sync metadata found. Generating new client ID and creating initial record.');
+            this.clientId = this.generateClientId();
+            this.currentLSN = '0/0';
+            this.syncState = 'disconnected';
+            this.pendingChanges = 0;
+            this.lastSyncTime = null;
+
+            console.log(`SyncManager: Generated new ClientID: ${this.clientId}. Saving initial metadata.`);
+            // Call the *correct* save function immediately
+            await this.doSaveMetadata(); // Use the refactored save method
         }
-      } catch (queryError) {
-        console.error('SyncManager: Error querying sync_metadata:', queryError);
-        throw queryError;
-      }
+
     } catch (error) {
-      console.error('SyncManager: Error loading sync metadata:', error);
-      // If loading fails, generate a new client ID
-      this.clientId = this.generateClientId();
-      console.log(`SyncManager: Generated new client ID after error: ${this.clientId}`);
-    }
-  }
-  
-  /**
-   * Save sync metadata to the database with debouncing
-   * Note: The server manages initial sync resume state based on clientId.
-   * Client only needs to persist clientId and LSN reliably.
-   */
-  private saveMetadata(immediate: boolean = false): Promise<void> {
-    // Skip saving if nothing has changed
-    if (!this.pendingMetadataSave && !immediate) {
-      return Promise.resolve();
-    }
-    
-    // Clear any existing timer
-    if (this.saveMetadataDebounceTimer) {
-      clearTimeout(this.saveMetadataDebounceTimer);
-      this.saveMetadataDebounceTimer = null;
-    }
-    
-    // Mark that we have a pending save
-    this.pendingMetadataSave = true;
-    
-    // If immediate save is requested, save now
-    if (immediate) {
-      return this.doSaveMetadata();
-    }
-    
-    // Otherwise, debounce the save operation
-    return new Promise((resolve) => {
-      this.saveMetadataDebounceTimer = setTimeout(async () => {
+        console.error('SyncManager: Error loading/initializing sync metadata:', error);
+        // Fallback: Generate a new client ID if loading fails completely
+        console.log('SyncManager: Falling back to generating new client ID due to load error.');
+        this.clientId = this.generateClientId();
+        this.currentLSN = '0/0';
+        this.syncState = 'disconnected';
+        this.pendingChanges = 0;
+        this.lastSyncTime = null;
+        console.log(`SyncManager: Generated new ClientID after error: ${this.clientId}`);
+        // Attempt an initial save in the fallback case as well
         try {
-          await this.doSaveMetadata();
-          resolve();
-        } catch (error) {
-          console.error('SyncManager: Error in debounced metadata save:', error);
-          resolve(); // Resolve anyway to prevent hanging promises
+            await this.doSaveMetadata();
+        } catch (saveError) {
+            console.error('SyncManager: Failed to save fallback metadata:', saveError);
         }
-      }, this.SAVE_DEBOUNCE_DELAY);
-    });
+    }
   }
   
   /**
-   * Actually perform the database save operation
+   * Saves the current metadata state to the database using TypeORM repository.
+   * This operation is debounced to prevent excessive database writes.
+   * Attempts to find the single existing metadata row and updates it,
+   * or creates a new one if none exists.
    */
   private async doSaveMetadata(): Promise<void> {
-    if (!this.pendingMetadataSave) {
-      return; // No pending changes to save
-    }
-    
     try {
       const dataSource = await getNewPGliteDataSource();
       if (!dataSource || !dataSource.isInitialized) {
-          throw new Error('Failed to get initialized TypeORM DataSource for saving.');
+        console.error("SyncManager: DataSource not available or not initialized for saving metadata.");
+        // Keep pending flag true for retry
+        this.pendingMetadataSave = true; 
+        return;
       }
 
-      // Prepare metadata object
-      const metadata = {
-        id: this.metadataKey,
-        client_id: this.clientId,
-        current_lsn: this.currentLSN,
-        sync_state: this.syncState,
-        last_sync_time: this.lastSyncTime || new Date(),
-        pending_changes_count: this.pendingChanges
-      };
+      // Get the repository for SyncMetadata
+      const metadataRepo = dataSource.getRepository(SyncMetadata);
+
+      // Attempt to find the single existing metadata record
+      // Since there should only ever be one, findOne() without args might work,
+      // or find() and take the first element. Let's try find().
+      const existingMetadataArray = await metadataRepo.find();
+      let metadataToSave: SyncMetadata | undefined;
+
+      if (existingMetadataArray && existingMetadataArray.length > 0) {
+        // If found, update the existing record
+        metadataToSave = existingMetadataArray[0];
+        console.log(`SyncManager: Found existing metadata record with ID: ${metadataToSave.id}`);
+        metadataToSave.clientId = this.clientId; // Update properties
+        metadataToSave.currentLsn = this.currentLSN;
+        metadataToSave.syncState = this.syncState;
+        metadataToSave.lastSyncTime = this.lastSyncTime || new Date(); // Use current time if null
+        metadataToSave.pendingChangesCount = this.pendingChanges;
+      } else {
+        // If not found, create a new record
+        console.log(`SyncManager: No existing metadata record found. Creating new one.`);
+        metadataToSave = metadataRepo.create({
+          // ID will be auto-generated by the database (UUID)
+          clientId: this.clientId,
+          currentLsn: this.currentLSN,
+          syncState: this.syncState,
+          lastSyncTime: this.lastSyncTime || new Date(), // Use current time if null
+          pendingChangesCount: this.pendingChanges
+        });
+      }
       
-      // Log what we're saving
-      console.log(`SyncManager: Saving metadata with clientId ${this.clientId}, LSN ${this.currentLSN}, state ${this.syncState}`);
-      
-      // Use dataSource.manager.query for the UPSERT operation directly, assuming table exists
-      await dataSource.manager.query(
-        `INSERT INTO sync_metadata (
-          id, client_id, current_lsn, sync_state, last_sync_time, pending_changes_count
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (id) DO UPDATE SET
-          client_id = EXCLUDED.client_id,
-          current_lsn = EXCLUDED.current_lsn,
-          sync_state = EXCLUDED.sync_state,
-          last_sync_time = EXCLUDED.last_sync_time,
-          pending_changes_count = EXCLUDED.pending_changes_count`,
-        [
-          metadata.id,
-          metadata.client_id,
-          metadata.current_lsn,
-          metadata.sync_state,
-          metadata.last_sync_time,
-          metadata.pending_changes_count
-        ]
-      );
-      
+      // Log what we're attempting to save
+      console.log(`SyncManager: Attempting to save metadata: ID=${metadataToSave.id}, ClientID=${metadataToSave.clientId}, LSN=${metadataToSave.currentLsn}, State=${metadataToSave.syncState}`);
+
+      // Save the new or updated record
+      await metadataRepo.save(metadataToSave);
+
       // Reset the pending flag
       this.pendingMetadataSave = false;
-      
-      // Always log LSN saves to help with debugging
-      console.log(`SyncManager: Saved metadata to database with LSN: ${this.currentLSN}, state: ${this.syncState}`);
+
+      // Log success
+      console.log(`SyncManager: Saved metadata to database. LSN: ${this.currentLSN}, State: ${this.syncState}`);
+
     } catch (error) {
-      console.error('SyncManager: Error saving metadata:', error);
-      // Keep the pending flag true so we'll retry on the next save attempt
-      
-      // In development, provide more details about the error
+      console.error('SyncManager: Error saving metadata using Repository:', error);
+      this.pendingMetadataSave = true; // Keep pending flag true for retry
+
+      // Enhanced logging for development
       if (process.env.NODE_ENV !== 'production') {
         console.error('SyncManager: Error details:', {
-          metadataKey: this.metadataKey,
           clientId: this.clientId,
           lsn: this.currentLSN,
           state: this.syncState,
@@ -385,13 +338,83 @@ export class SyncManager {
    * Ensure any pending metadata is saved before the component unmounts
    */
   public flushMetadata(): Promise<void> {
-    return this.saveMetadata(true);
+    return this.doSaveMetadata(); // Use doSaveMetadata
   }
   
   /**
    * Connect to the sync server
+   * @param serverUrl Optional server URL to connect to
+   * @param suppressAuthErrors If true, don't emit errors for auth failures (useful during initial app load)
    */
-  public async connect(serverUrl?: string): Promise<boolean> {
+  public async connect(serverUrl?: string, suppressAuthErrors: boolean = false): Promise<boolean> {
+    console.log('SyncManager: Starting connection attempt');
+    
+    // First check authentication status via JWT token
+    let authToken = '';
+    let authError = false;
+    
+    try {
+      console.log('SyncManager: Attempting to fetch JWT token');
+      
+      // Get the base URL from environment
+      const apiBaseUrl = import.meta.env.VITE_API_URL || "http://127.0.0.1:8787";
+      const tokenUrl = `${apiBaseUrl}/api/auth/token`;
+      
+      console.log('SyncManager: Requesting JWT token from:', tokenUrl);
+      
+      // Call the /token endpoint directly with credentials to get JWT token
+      const tokenResponse = await fetch(tokenUrl, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (tokenResponse.ok) {
+        const tokenData = await tokenResponse.json();
+        
+        if (tokenData && tokenData.token) {
+          authToken = tokenData.token;
+          console.log('SyncManager: Successfully obtained JWT token');
+        } else {
+          console.warn('SyncManager: Token endpoint returned success but no token in response');
+          authError = true;
+        }
+      } else {
+        console.error('SyncManager: Failed to fetch JWT token -', 
+          tokenResponse.status, tokenResponse.statusText);
+          
+        // If token endpoint fails with a 401, user is not authenticated
+        if (tokenResponse.status === 401) {
+          console.log('SyncManager: User is not authenticated for sync connection');
+          authError = true;
+          
+          if (!suppressAuthErrors) {
+            this.events.emit('error', new Error('Authentication required for sync'));
+          }
+          return false;
+        }
+      }
+    } catch (tokenError) {
+      console.error('SyncManager: Error fetching JWT token:', tokenError);
+      authError = true;
+    }
+    
+    // Verify we have a token before proceeding
+    if (!authToken) {
+      console.error('SyncManager: No valid authentication token obtained, cannot connect');
+      
+      if (authError && !suppressAuthErrors) {
+        this.events.emit('error', new Error('Authentication required for sync'));
+      } else if (!authError && !suppressAuthErrors) {
+        // This is a different kind of error, not authentication related
+        this.events.emit('error', new Error('Could not obtain authentication token'));
+      }
+      
+      return false;
+    }
+    
     // If already connected, disconnect first
     if (this.webSocket) {
       console.log('SyncManager: Already connected, disconnecting first');
@@ -423,10 +446,14 @@ export class SyncManager {
         reject(new Error('Connection timeout'));
       }, 10000);
       
-      // Build WebSocket URL with client ID and LSN
+      // Build WebSocket URL with client ID, LSN, and auth token
       const wsUrl = new URL(this.serverUrl);
       wsUrl.searchParams.set('clientId', this.clientId);
       wsUrl.searchParams.set('lsn', this.currentLSN);
+      
+      // Add auth token
+      wsUrl.searchParams.set('auth', authToken);
+      console.log(`SyncManager: Adding JWT auth token to WebSocket URL`);
       
       console.log(`SyncManager: Connecting with LSN: ${this.currentLSN} and clientId: ${this.clientId}`);
       
@@ -439,6 +466,10 @@ export class SyncManager {
           console.log('SyncManager: WebSocket connected successfully');
           clearTimeout(timeoutId);
           this.handleOpen(event);
+          
+          // Reset errors since we successfully connected
+          this.syncErrorCount = 0;
+          
           resolve(true);
         };
         
@@ -446,7 +477,17 @@ export class SyncManager {
           console.log(`SyncManager: WebSocket closed during connection: code=${event.code}, reason=${event.reason}`);
           clearTimeout(timeoutId);
           this.handleClose(event);
-          if (event.code !== 1000) {
+          
+          // If we get a 401 unauthorized close, emit an auth error
+          if (event.code === 1006 && event.reason && event.reason.includes('401')) {
+            console.error('SyncManager: Authentication failed for WebSocket connection');
+            
+            if (!suppressAuthErrors) {
+              this.events.emit('error', new Error('Authentication failed for sync connection'));
+            }
+            
+            reject(new Error('Authentication failed: ' + event.reason));
+          } else if (event.code !== 1000) {
             reject(new Error(`WebSocket closed with code ${event.code}: ${event.reason || 'No reason provided'}`));
           }
         };
@@ -596,7 +637,7 @@ export class SyncManager {
     this.events.emit('connection:status', false);
     
     // Save the disconnected state to the database IMMEDIATELY to ensure it's persisted
-    this.saveMetadata(true).catch(error => 
+    this.doSaveMetadata().catch(error => 
       console.error('SyncManager: Error saving disconnected state:', error)
     );
     
@@ -691,7 +732,7 @@ export class SyncManager {
     this.currentLSN = '0/0';
     
     // Update database
-    await this.saveMetadata();
+    await this.doSaveMetadata(); // Use doSaveMetadata
     
     // Emit event
     this.events.emit('lsnUpdate', this.currentLSN);
@@ -719,7 +760,7 @@ export class SyncManager {
       this.events.emit('stateChange', state);
       
       // Save state change to database (debounced)
-      this.saveMetadata().catch(error => 
+      this.doSaveMetadata().catch(error => 
         console.error('SyncManager: Error saving state change:', error)
       );
     }
@@ -736,7 +777,7 @@ export class SyncManager {
       
       // Save LSN change to database IMMEDIATELY to ensure it's persisted
       console.log(`SyncManager: Saving LSN update to database immediately`);
-      this.saveMetadata(true).catch(error => 
+      this.doSaveMetadata().catch(error => 
         console.error('SyncManager: Error saving LSN change:', error)
       );
     }
@@ -772,7 +813,7 @@ export class SyncManager {
       this.events.emit('pendingChangesUpdate', count);
       
       // Save change to database (debounced)
-      this.saveMetadata().catch(error => 
+      this.doSaveMetadata().catch(error => 
         console.error('SyncManager: Error saving pending changes count:', error)
       );
     }
@@ -782,7 +823,7 @@ export class SyncManager {
    * Register an event listener
    */
   public on(event: string, listener: (...args: any[]) => void): void {
-    console.log(`[SyncManager.on] Registering listener for: ${event}. Emitter instance:`, this.events);
+    // console.log(`[SyncManager.on] Registering listener for: ${event}. Emitter instance:`, this.events);
     this.events.on(event, listener);
   }
   
@@ -790,7 +831,7 @@ export class SyncManager {
    * Remove an event listener
    */
   public off(event: string, listener: (...args: any[]) => void): void {
-    console.log(`[SyncManager.off] Removing listener for: ${event}. Emitter instance:`, this.events);
+    // console.log(`[SyncManager.off] Removing listener for: ${event}. Emitter instance:`, this.events);
     this.events.off(event, listener);
   }
   
@@ -850,7 +891,7 @@ export class SyncManager {
     }
     
     // Save metadata to ensure persistence
-    this.saveMetadata(true).catch(err => 
+    this.doSaveMetadata().catch(err => 
       console.error('SyncManager: Error saving state after disconnect:', err)
     );
   };
@@ -1265,7 +1306,7 @@ export class SyncManager {
     
     // Update last sync time
     this.lastSyncTime = new Date();
-    this.saveMetadata().catch(error => console.error('Error saving sync time:', error));
+    this.doSaveMetadata().catch(error => console.error('Error saving sync time:', error));
     
     // Explicitly trigger processing of any pending changes
     console.log('[SyncManager] Triggering process_all_changes event after catchup completion');
@@ -1295,7 +1336,7 @@ export class SyncManager {
     
     // Update last sync time
     this.lastSyncTime = new Date();
-    this.saveMetadata().catch(error => console.error('Error saving sync time:', error));
+    this.doSaveMetadata().catch(error => console.error('Error saving sync time:', error));
     
     // Explicitly trigger processing of any pending changes
     // TODO: Review if this manual trigger is necessary or if state changes handle it
@@ -1327,7 +1368,7 @@ export class SyncManager {
       }
       
       // Make sure all metadata is saved immediately
-      this.saveMetadata(true).catch(error => 
+      this.doSaveMetadata().catch(error => 
         console.error('SyncManager: Error saving final state after reconnect failure:', error)
       );
       
@@ -1444,8 +1485,8 @@ export class SyncManager {
       const url = this.serverUrl || this.getDefaultServerUrl();
       console.log(`SyncManager: Auto-connecting to ${url}`);
       
-      // Use the same approach as the manual connect
-      await this.connect(url);
+      // Use the same approach as the manual connect but suppress auth errors during auto-connect
+      await this.connect(url, true);
     } catch (connectError) {
       console.error('SyncManager: Auto-connect failed', connectError);
       // Reconnect logic is handled by handleClose/attemptReconnect
@@ -1456,14 +1497,28 @@ export class SyncManager {
    * Get default server URL from config
    */
   private getDefaultServerUrl(): string {
-    // Try to get URL from window location
     try {
+      // Determine protocol based on current window protocol
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.host;
-      return `${protocol}//${host}/api/sync`;
+      
+      // Use the API_URL from environment if available, or fall back to default
+      const apiUrl = import.meta.env.VITE_API_URL;
+      
+      if (apiUrl) {
+        // Extract host from API_URL if provided
+        try {
+          const url = new URL(apiUrl);
+          return `${protocol}//${url.host}/api/sync`;
+        } catch (e) {
+          console.warn('SyncManager: Invalid API_URL format:', apiUrl);
+        }
+      }
+      
+      // Fall back to the fixed development server address
+      return `${protocol}//127.0.0.1:8787/api/sync`;
     } catch (e) {
-      // Fallback for environments without window
-      return 'ws://localhost:3000/api/sync';
+      // Default fallback
+      return 'ws://127.0.0.1:8787/api/sync';
     }
   }
 } 

@@ -38,26 +38,33 @@ export const Route = createRootRouteWithContext<{
         if (sessionError) {
           // Handle error (likely means unauthenticated or server issue)
           console.error("[AUTH] Session check error:", sessionError);
-          if (isAuthenticated || isLoading) {
+          // Only update if state is not already unauthenticated or if it's loading
+          if (isAuthenticated || isLoading) { 
              console.log("[AUTH] Session error implies unauthenticated. Setting store state.");
              setUnauthenticated(); // Set unauthenticated on error
-             if (isLoading) setLoading(false); // Ensure loading is false
+             // No need to set loading false here, setUnauthenticated does it
           }
         } else if (sessionData?.user) {
           // Handle successful authentication
-          if (!isAuthenticated || useAuthStore.getState().user?.id !== sessionData.user.id) {
+          // Only update if not already authenticated with the same user, or if loading
+          if (!isAuthenticated || isLoading || useAuthStore.getState().user?.id !== sessionData.user.id) { 
             console.log("[AUTH] Session data received. Setting authenticated state.", sessionData.user);
             setAuthenticated({ id: sessionData.user.id, email: sessionData.user.email });
+            // No need to set loading false here, setAuthenticated does it
           }
-           if (isLoading) setLoading(false); // Ensure loading is false
         } else {
           // Handle case where session check completes without error but no user (unauthenticated)
-          if (isAuthenticated || isLoading) {
-            console.log("[AUTH] Session check successful but no user data (unauthenticated). Setting store state.");
-            setUnauthenticated();
-             if (isLoading) setLoading(false); // Ensure loading is false
+          // Only update if state is currently authenticated or loading
+          if (isAuthenticated || isLoading) { 
+            // console.log("[AUTH] Session check successful but no user data (unauthenticated). Setting store state ONLY if currently authenticated or loading.");
+            // REMOVED: setUnauthenticated(); // DO NOT overwrite state if login/signup just happened
+            // No need to set loading false here, setUnauthenticated does it
           }
         }
+         // Ensure loading is false *after* processing, only if it was true
+         // This check might be redundant now as setAuthenticated/setUnauthenticated handle it.
+         // Consider removing if confirmed redundant.
+         // if (useAuthStore.getState().isLoading) setLoading(false); 
       }
     // Watch session hook results for changes
     }, [sessionData, isPending, sessionError, setAuthenticated, setUnauthenticated, setLoading, isAuthenticated, isLoading]);

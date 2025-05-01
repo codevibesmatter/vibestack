@@ -10,7 +10,7 @@ const isProduction = import.meta.env.PROD;
 const isDeployedPreview = import.meta.env.VITE_PREVIEW === 'true';
 
 // Default development URLs
-const DEV_API_HOST = 'localhost:8787';
+const DEV_API_HOST = '127.0.0.1:8787';
 const DEV_WS_PROTOCOL = 'ws';
 
 // Production URLs
@@ -51,7 +51,7 @@ export function getApiBaseUrl(): string {
   }
   
   // Default to local development
-  return `http://${DEV_API_HOST}`;
+  return `https://${DEV_API_HOST}`;
 }
 
 /**
@@ -114,4 +114,20 @@ export const syncConfig = {
 };
 
 // Export default config
-export default syncConfig; 
+export default syncConfig;
+
+/**
+ * Get default server URL from config
+ */
+export function getDefaultServerUrl(): string {
+  // Try to get URL from window location
+  try {
+    // Dynamically use the same protocol that the page is loaded with
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host || '127.0.0.1:8787';
+    return `${protocol}//${host}/api/sync`;
+  } catch (e) {
+    // Fallback for environments without window
+    return 'ws://127.0.0.1:8787/api/sync';
+  }
+} 

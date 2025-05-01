@@ -25,7 +25,7 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import { useAuthStore } from '@/stores/authStore'
-import axios from 'axios'
+import { authClient } from '@/lib/auth'
 
 export function NavUser({
   user,
@@ -42,11 +42,11 @@ export function NavUser({
 
   const handleSignOut = async () => {
     try {
-      console.log('[AUTH] Attempting to sign out via /api/auth/logout...');
-      await axios.post('/api/auth/logout', {}, { withCredentials: true });
-      console.log('[AUTH] Logout API call successful.');
+      console.log('[AUTH] Attempting to sign out via authClient.signOut()...');
+      await authClient.signOut();
+      console.log('[AUTH] authClient.signOut() successful.');
     } catch (error) {
-      console.error('[AUTH] Logout API call failed:', error);
+      console.error('[AUTH] authClient.signOut() failed:', error);
     }
     console.log('[AUTH] Clearing frontend auth state and redirecting to sign-in.');
     setUnauthenticated();

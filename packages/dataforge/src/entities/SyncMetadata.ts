@@ -2,6 +2,7 @@ import { Entity, Column, PrimaryColumn } from 'typeorm';
 import { IsString, IsNumber, IsDate, IsOptional } from 'class-validator';
 import { ClientOnly } from '../utils/context.js';
 import { TableCategory } from '../utils/context.js';
+import { BaseSystemEntity } from './BaseSystemEntity.js';
 
 /**
  * SyncMetadata entity
@@ -14,11 +15,7 @@ import { TableCategory } from '../utils/context.js';
 @Entity('sync_metadata')
 @ClientOnly()
 @TableCategory('system')
-export class SyncMetadata {
-  @PrimaryColumn('text')
-  @IsString()
-  id!: string;
-
+export class SyncMetadata extends BaseSystemEntity {
   @Column({ type: 'text', name: 'client_id' })
   @IsString()
   clientId!: string;

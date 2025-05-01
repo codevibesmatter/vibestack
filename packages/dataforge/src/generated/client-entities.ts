@@ -19,7 +19,7 @@ export { UserRole } from '../entities/User.js';
 
 
 // Generated Classes (for type checking and validation)
-export class ClientMigrationStatus {
+export class ClientMigrationStatus extends BaseSystemEntity {
   migrationName!: string;
 
   schemaVersion!: string;
@@ -36,28 +36,26 @@ export class ClientMigrationStatus {
 
   timestamp!: number;
 
-  createdAt!: Date;
-
 }
 
 export class Comment extends BaseDomainEntity {
   content!: string;
 
-  entityType!: string;
-
-  entityId?: string;
-
   authorId?: string;
 
   parentId?: string;
+
+  taskId?: string;
+
+  projectId?: string;
 
   author?: User;
 
   parent?: Comment;
 
-  task!: Task;
+  task?: Task;
 
-  project!: Project;
+  project?: Project;
 
 }
 
@@ -93,9 +91,7 @@ export class Project extends BaseDomainEntity {
 
 }
 
-export class SyncMetadata {
-  id!: string;
-
+export class SyncMetadata extends BaseSystemEntity {
   clientId!: string;
 
   currentLsn!: string;
@@ -144,7 +140,9 @@ export class User extends BaseDomainEntity {
 
   email!: string;
 
-  avatarUrl?: string;
+  emailVerified!: boolean;
+
+  image?: string;
 
   role!: UserRole;
 
@@ -164,10 +162,11 @@ export const ClientMigrationStatusSchema = new EntitySchema<ClientMigrationStatu
     name: 'ClientMigrationStatus', 
     tableName: 'client_migration_status',
     columns: {
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         'migrationName': {
             name: 'migration_name', // Explicit DB Name
             type: 'text', // Use helper
-            primary: true
         },
         'schemaVersion': {
             name: 'schema_version', // Explicit DB Name
@@ -201,11 +200,6 @@ export const ClientMigrationStatusSchema = new EntitySchema<ClientMigrationStatu
         'timestamp': {
             name: 'timestamp', // Explicit DB Name
             type: 'bigint', // Use helper
-        },
-        'createdAt': {
-            name: 'created_at', // Explicit DB Name
-            type: 'timestamptz', // Use helper
-            createDate: true
         }
     },
     relations: {
@@ -221,19 +215,10 @@ export const CommentSchema = new EntitySchema<Comment>({
         id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
         createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
-        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        clientId: { name: 'client_id', type: 'uuid', nullable: true },
         'content': {
             name: 'content', // Explicit DB Name
             type: 'text', // Use helper
-        },
-        'entityType': {
-            name: 'entity_type', // Explicit DB Name
-            type: 'varchar', // Use helper
-        },
-        'entityId': {
-            name: 'entity_id', // Explicit DB Name
-            type: 'uuid', // Use helper
-            nullable: true
         },
         'authorId': {
             name: 'author_id', // Explicit DB Name
@@ -242,6 +227,16 @@ export const CommentSchema = new EntitySchema<Comment>({
         },
         'parentId': {
             name: 'parent_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        },
+        'taskId': {
+            name: 'task_id', // Explicit DB Name
+            type: 'uuid', // Use helper
+            nullable: true
+        },
+        'projectId': {
+            name: 'project_id', // Explicit DB Name
             type: 'uuid', // Use helper
             nullable: true
         }
@@ -262,12 +257,14 @@ export const CommentSchema = new EntitySchema<Comment>({
         'task': {
             target: 'Task', // Target Entity Name (String)
             type: 'many-to-one',
-            joinColumn: { name: 'entity_id', referencedColumnName: 'id' }
+            joinColumn: { name: 'task_id' },
+            nullable: true
         },
         'project': {
             target: 'Project', // Target Entity Name (String)
             type: 'many-to-one',
-            joinColumn: { name: 'entity_id', referencedColumnName: 'id' }
+            joinColumn: { name: 'project_id' },
+            nullable: true
         }
     },
 });
@@ -279,6 +276,7 @@ export const LocalChangesSchema = new EntitySchema<LocalChanges>({
     tableName: 'local_changes',
     columns: {
         id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         'table': {
             name: 'table', // Explicit DB Name
             type: 'text', // Use helper
@@ -298,6 +296,7 @@ export const LocalChangesSchema = new EntitySchema<LocalChanges>({
         'updatedAt': {
             name: 'updated_at', // Explicit DB Name
             type: 'timestamptz', // Use helper
+            updateDate: true
         },
         'processedSync': {
             name: 'processed_sync', // Explicit DB Name
@@ -318,7 +317,7 @@ export const ProjectSchema = new EntitySchema<Project>({
         id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
         createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
-        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        clientId: { name: 'client_id', type: 'uuid', nullable: true },
         'name': {
             name: 'name', // Explicit DB Name
             type: 'varchar', // Use helper
@@ -370,11 +369,8 @@ export const SyncMetadataSchema = new EntitySchema<SyncMetadata>({
     name: 'SyncMetadata', 
     tableName: 'sync_metadata',
     columns: {
-        'id': {
-            name: 'id', // Explicit DB Name
-            type: 'text', // Use helper
-            primary: true
-        },
+        id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
+        createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         'clientId': {
             name: 'client_id', // Explicit DB Name
             type: 'text', // Use helper
@@ -413,7 +409,7 @@ export const TaskSchema = new EntitySchema<Task>({
         id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
         createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
-        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        clientId: { name: 'client_id', type: 'uuid', nullable: true },
         'title': {
             name: 'title', // Explicit DB Name
             type: 'varchar', // Use helper
@@ -506,7 +502,7 @@ export const UserSchema = new EntitySchema<User>({
         id: { name: 'id', type: 'uuid', primary: true, generated: 'uuid' },
         createdAt: { name: 'created_at', type: 'timestamptz', createDate: true },
         updatedAt: { name: 'updated_at', type: 'timestamptz', updateDate: true },
-        clientId: { name: 'client_id', type: 'varchar', length: 255, nullable: true },
+        clientId: { name: 'client_id', type: 'uuid', nullable: true },
         'name': {
             name: 'name', // Explicit DB Name
             type: 'varchar', // Use helper
@@ -518,8 +514,13 @@ export const UserSchema = new EntitySchema<User>({
             length: 255,
             unique: true
         },
-        'avatarUrl': {
-            name: 'avatar_url', // Explicit DB Name
+        'emailVerified': {
+            name: 'email_verified', // Explicit DB Name
+            type: 'boolean', // Use helper
+            default: false
+        },
+        'image': {
+            name: 'image', // Explicit DB Name
             type: 'varchar', // Use helper
             nullable: true,
             length: 255
@@ -549,7 +550,7 @@ export const UserSchema = new EntitySchema<User>({
 
 
 // Exports
-// Export entity schema array for TypeORM
+// Export entity class array for TypeORM
 export const clientEntities = [
   ClientMigrationStatusSchema,
   CommentSchema,
@@ -557,7 +558,7 @@ export const clientEntities = [
   ProjectSchema,
   SyncMetadataSchema,
   TaskSchema,
-  UserSchema
+  UserSchema,
 ];
 
 // domain tables for client context
