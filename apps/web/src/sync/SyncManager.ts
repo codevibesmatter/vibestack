@@ -349,72 +349,6 @@ export class SyncManager {
   public async connect(serverUrl?: string, suppressAuthErrors: boolean = false): Promise<boolean> {
     console.log('SyncManager: Starting connection attempt');
     
-    // First check authentication status via JWT token
-    let authToken = '';
-    let authError = false;
-    
-    try {
-      console.log('SyncManager: Attempting to fetch JWT token');
-      
-      // Get the base URL from environment
-      const apiBaseUrl = import.meta.env.VITE_API_URL || "http://127.0.0.1:8787";
-      const tokenUrl = `${apiBaseUrl}/api/auth/token`;
-      
-      console.log('SyncManager: Requesting JWT token from:', tokenUrl);
-      
-      // Call the /token endpoint directly with credentials to get JWT token
-      const tokenResponse = await fetch(tokenUrl, {
-        method: 'GET',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (tokenResponse.ok) {
-        const tokenData = await tokenResponse.json();
-        
-        if (tokenData && tokenData.token) {
-          authToken = tokenData.token;
-          console.log('SyncManager: Successfully obtained JWT token');
-        } else {
-          console.warn('SyncManager: Token endpoint returned success but no token in response');
-          authError = true;
-        }
-      } else {
-        console.error('SyncManager: Failed to fetch JWT token -', 
-          tokenResponse.status, tokenResponse.statusText);
-          
-        // If token endpoint fails with a 401, user is not authenticated
-        if (tokenResponse.status === 401) {
-          console.log('SyncManager: User is not authenticated for sync connection');
-          authError = true;
-          
-          if (!suppressAuthErrors) {
-            this.events.emit('error', new Error('Authentication required for sync'));
-          }
-          return false;
-        }
-      }
-    } catch (tokenError) {
-      console.error('SyncManager: Error fetching JWT token:', tokenError);
-      authError = true;
-    }
-    
-    // Verify we have a token before proceeding
-    if (!authToken) {
-      console.error('SyncManager: No valid authentication token obtained, cannot connect');
-      
-      if (authError && !suppressAuthErrors) {
-        this.events.emit('error', new Error('Authentication required for sync'));
-      } else if (!authError && !suppressAuthErrors) {
-        // This is a different kind of error, not authentication related
-        this.events.emit('error', new Error('Could not obtain authentication token'));
-      }
-      
-      return false;
-    }
-    
     // If already connected, disconnect first
     if (this.webSocket) {
       console.log('SyncManager: Already connected, disconnecting first');
@@ -446,14 +380,10 @@ export class SyncManager {
         reject(new Error('Connection timeout'));
       }, 10000);
       
-      // Build WebSocket URL with client ID, LSN, and auth token
+      // Build WebSocket URL with client ID and LSN
       const wsUrl = new URL(this.serverUrl);
       wsUrl.searchParams.set('clientId', this.clientId);
       wsUrl.searchParams.set('lsn', this.currentLSN);
-      
-      // Add auth token
-      wsUrl.searchParams.set('auth', authToken);
-      console.log(`SyncManager: Adding JWT auth token to WebSocket URL`);
       
       console.log(`SyncManager: Connecting with LSN: ${this.currentLSN} and clientId: ${this.clientId}`);
       
@@ -1501,23 +1431,11 @@ export class SyncManager {
       // Determine protocol based on current window protocol
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       
-      // Use the API_URL from environment if available, or fall back to default
-      const apiUrl = import.meta.env.VITE_API_URL;
-      
-      if (apiUrl) {
-        // Extract host from API_URL if provided
-        try {
-          const url = new URL(apiUrl);
-          return `${protocol}//${url.host}/api/sync`;
-        } catch (e) {
-          console.warn('SyncManager: Invalid API_URL format:', apiUrl);
-        }
-      }
-      
-      // Fall back to the fixed development server address
-      return `${protocol}//127.0.0.1:8787/api/sync`;
+      // Always use the same origin as the frontend to ensure proxy works
+      // This will allow the Vite proxy to forward the WebSocket connection
+      return `${protocol}//${window.location.host}/api/sync`;
     } catch (e) {
-      // Default fallback
+      // Default fallback if window is not available (e.g., in tests)
       return 'ws://127.0.0.1:8787/api/sync';
     }
   }

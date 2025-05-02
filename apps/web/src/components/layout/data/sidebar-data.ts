@@ -183,6 +183,10 @@ export const sidebarData: SidebarData = {
           icon: IconBug,
           items: [
             {
+              title: 'Auth',
+              url: '/debug/auth',
+            },
+            {
               title: 'Database',
               url: '/debug/database',
             },

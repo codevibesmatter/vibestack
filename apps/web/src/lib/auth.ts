@@ -1,8 +1,12 @@
 import { createAuthClient } from "better-auth/react"; // Use React client
 
 // Define the base URL for the Better Auth server
-// In production, this should come from an environment variable
-const authApiBaseUrl = import.meta.env.VITE_API_URL || "http://127.0.0.1:8787";
+// In local development, we'll use the current origin instead of an empty string
+// This works with Vite's proxy configuration
+const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const authApiBaseUrl = isLocalDev 
+  ? window.location.origin // Use current origin for local development
+  : (import.meta.env.VITE_API_URL || "http://127.0.0.1:8787");
 
 // Create the Better Auth client instance
 export const authClient = createAuthClient({

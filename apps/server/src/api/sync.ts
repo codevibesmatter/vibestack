@@ -8,92 +8,48 @@ const sync = new Hono<{ Bindings: Env }>();
 // WebSocket endpoint for sync
 sync.get('/ws', async (c) => {
   const clientId = c.req.query('clientId');
-  const authToken = c.req.query('auth');
   
   if (!clientId) {
     return c.json({ error: 'Client ID is required' }, 400);
   }
 
-  // Verify authentication if auth token is provided
-  if (authToken) {
-    try {
-      // Initialize auth directly
-      const auth = initializeAuth(c.env);
-      
-      // Use 'any' type to bypass linter errors
-      const authAny = auth as any;
-      
-      if (authAny.jwt && typeof authAny.jwt.verify === 'function') {
-        try {
-          // Verify JWT token with Better Auth
-          const result = await authAny.jwt.verify(authToken);
-          
-          if (!result.valid || !result.payload?.sub) {
-            syncLogger.error('Invalid JWT token for sync connection', {
-              clientId,
-              valid: result.valid,
-              sub: result.payload?.sub
-            });
-            return c.json({ error: 'No valid session found' }, 401);
-          }
-          
-          syncLogger.info('Valid JWT authentication for sync connection', {
-            clientId,
-            userId: result.payload.sub
-          });
-        } catch (jwtError) {
-          syncLogger.error('JWT verification error', {
-            clientId,
-            error: jwtError instanceof Error ? jwtError.message : String(jwtError)
-          });
-          return c.json({ error: 'Authentication error' }, 401);
-        }
-      } else {
-        // Check if we can use the api.getSession method as a fallback
-        try {
-          if (authAny.api && typeof authAny.api.validateJWT === 'function') {
-            const isValid = await authAny.api.validateJWT(authToken);
-            
-            if (!isValid) {
-              syncLogger.error('JWT validation failed', { clientId });
-              return c.json({ error: 'No valid session found' }, 401);
-            }
-            
-            syncLogger.info('JWT validated successfully', { clientId });
-          } else {
-            syncLogger.error('JWT validation not available', { clientId });
-            return c.json({ error: 'Authentication method not available' }, 500);
-          }
-        } catch (apiError) {
-          syncLogger.error('API JWT validation error', {
-            clientId,
-            error: apiError instanceof Error ? apiError.message : String(apiError)
-          });
-          return c.json({ error: 'Authentication error' }, 401);
-        }
-      }
-    } catch (authErr) {
-      syncLogger.error('Auth initialization error', {
-        clientId,
-        error: authErr instanceof Error ? authErr.message : String(authErr)
-      });
-      return c.json({ error: 'Authentication error' }, 401);
-    }
-  } else {
-    syncLogger.warn('No authentication token provided for sync connection', { clientId });
-    return c.json({ error: 'No valid session found' }, 401);
-  }
-
+  // Authenticate using session cookie
   try {
-    const id = c.env.SYNC.idFromName(`client:${clientId}`);
-    const obj = c.env.SYNC.get(id);
-    return obj.fetch(c.req.raw);
-  } catch (err) {
-    syncLogger.error('WebSocket connection failed', {
+    // Initialize auth
+    const auth = initializeAuth(c.env);
+    
+    // Get session data using cookies from the request
+    const sessionData = await auth.api.getSession({ headers: c.req.raw.headers });
+    
+    if (!sessionData || !sessionData.user) {
+      syncLogger.error('No valid session found for sync connection', { clientId });
+      return c.json({ error: 'No valid session found' }, 401);
+    }
+    
+    // Session is valid, proceed with WebSocket connection
+    syncLogger.info('User authenticated for sync connection via session cookie', {
       clientId,
-      error: err instanceof Error ? err.message : String(err)
+      userId: sessionData.user.id
     });
-    return c.json({ error: 'Failed to establish WebSocket connection' }, 500);
+    
+    // Create and return a Durable Object instance for this client
+    try {
+      const id = c.env.SYNC.idFromName(`client:${clientId}`);
+      const obj = c.env.SYNC.get(id);
+      return obj.fetch(c.req.raw);
+    } catch (err) {
+      syncLogger.error('WebSocket connection failed', {
+        clientId,
+        error: err instanceof Error ? err.message : String(err)
+      });
+      return c.json({ error: 'Failed to establish WebSocket connection' }, 500);
+    }
+  } catch (authErr) {
+    syncLogger.error('Authentication error', {
+      clientId,
+      error: authErr instanceof Error ? authErr.message : String(authErr)
+    });
+    return c.json({ error: 'Authentication error' }, 401);
   }
 });
 

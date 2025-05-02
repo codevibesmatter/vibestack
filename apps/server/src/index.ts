@@ -33,13 +33,17 @@ apiApp.use('*', cors({
     // Dynamically allow the specific frontend origin
     // or potentially others in the future
     const allowedOrigins = ['https://127.0.0.1:5173', 'http://127.0.0.1:5173', 'http://localhost:5173'];
-    if (!origin) return allowedOrigins[0]; // Default for non-browser requests
+    if (!origin) {
+      // For requests without origin, we return null to avoid setting the header
+      return null;
+    }
+    
     if (allowedOrigins.includes(origin)) {
-      return origin;
+      return origin; // Return the exact matching origin
     } else {
-      // Return a default allowed origin or null if none match
+      // Log and reject non-matching origins
       console.warn(`[CORS] Rejected origin: ${origin}`);
-      return allowedOrigins[0]; 
+      return null; // Return null to disallow the origin instead of a default
     }
   },
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -109,6 +113,7 @@ const worker = {
       let allowedOrigin = null;
 
       if (origin && allowedOrigins.includes(origin)) {
+        // Only set allowedOrigin if it matches exactly
         allowedOrigin = origin;
       } else if (origin) {
         // Origin is present but not allowed

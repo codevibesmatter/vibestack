@@ -37,6 +37,7 @@ import { Route as AuthenticatedSettingsAppearanceImport } from './routes/_authen
 import { Route as AuthenticatedSettingsAccountImport } from './routes/_authenticated/settings/account'
 import { Route as AuthenticatedDebugSyncImport } from './routes/_authenticated/debug/sync'
 import { Route as AuthenticatedDebugDatabaseImport } from './routes/_authenticated/debug/database'
+import { Route as AuthenticatedDebugAuthImport } from './routes/_authenticated/debug/auth'
 
 // Create/Update Routes
 
@@ -206,6 +207,12 @@ const AuthenticatedDebugDatabaseRoute = AuthenticatedDebugDatabaseImport.update(
   } as any,
 )
 
+const AuthenticatedDebugAuthRoute = AuthenticatedDebugAuthImport.update({
+  id: '/auth',
+  path: '/auth',
+  getParentRoute: () => AuthenticatedDebugRouteRoute,
+} as any)
+
 // Populate the FileRoutesByPath interface
 
 declare module '@tanstack/react-router' {
@@ -308,6 +315,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedIndexImport
       parentRoute: typeof AuthenticatedRouteImport
     }
+    '/_authenticated/debug/auth': {
+      id: '/_authenticated/debug/auth'
+      path: '/auth'
+      fullPath: '/debug/auth'
+      preLoaderRoute: typeof AuthenticatedDebugAuthImport
+      parentRoute: typeof AuthenticatedDebugRouteImport
+    }
     '/_authenticated/debug/database': {
       id: '/_authenticated/debug/database'
       path: '/database'
@@ -398,12 +412,14 @@ declare module '@tanstack/react-router' {
 // Create and export the route tree
 
 interface AuthenticatedDebugRouteRouteChildren {
+  AuthenticatedDebugAuthRoute: typeof AuthenticatedDebugAuthRoute
   AuthenticatedDebugDatabaseRoute: typeof AuthenticatedDebugDatabaseRoute
   AuthenticatedDebugSyncRoute: typeof AuthenticatedDebugSyncRoute
 }
 
 const AuthenticatedDebugRouteRouteChildren: AuthenticatedDebugRouteRouteChildren =
   {
+    AuthenticatedDebugAuthRoute: AuthenticatedDebugAuthRoute,
     AuthenticatedDebugDatabaseRoute: AuthenticatedDebugDatabaseRoute,
     AuthenticatedDebugSyncRoute: AuthenticatedDebugSyncRoute,
   }
@@ -476,6 +492,7 @@ export interface FileRoutesByFullPath {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/': typeof AuthenticatedIndexRoute
+  '/debug/auth': typeof AuthenticatedDebugAuthRoute
   '/debug/database': typeof AuthenticatedDebugDatabaseRoute
   '/debug/sync': typeof AuthenticatedDebugSyncRoute
   '/settings/account': typeof AuthenticatedSettingsAccountRoute
@@ -503,6 +520,7 @@ export interface FileRoutesByTo {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/': typeof AuthenticatedIndexRoute
+  '/debug/auth': typeof AuthenticatedDebugAuthRoute
   '/debug/database': typeof AuthenticatedDebugDatabaseRoute
   '/debug/sync': typeof AuthenticatedDebugSyncRoute
   '/settings/account': typeof AuthenticatedSettingsAccountRoute
@@ -533,6 +551,7 @@ export interface FileRoutesById {
   '/(errors)/500': typeof errors500Route
   '/(errors)/503': typeof errors503Route
   '/_authenticated/': typeof AuthenticatedIndexRoute
+  '/_authenticated/debug/auth': typeof AuthenticatedDebugAuthRoute
   '/_authenticated/debug/database': typeof AuthenticatedDebugDatabaseRoute
   '/_authenticated/debug/sync': typeof AuthenticatedDebugSyncRoute
   '/_authenticated/settings/account': typeof AuthenticatedSettingsAccountRoute
@@ -564,6 +583,7 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/'
+    | '/debug/auth'
     | '/debug/database'
     | '/debug/sync'
     | '/settings/account'
@@ -590,6 +610,7 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/'
+    | '/debug/auth'
     | '/debug/database'
     | '/debug/sync'
     | '/settings/account'
@@ -618,6 +639,7 @@ export interface FileRouteTypes {
     | '/(errors)/500'
     | '/(errors)/503'
     | '/_authenticated/'
+    | '/_authenticated/debug/auth'
     | '/_authenticated/debug/database'
     | '/_authenticated/debug/sync'
     | '/_authenticated/settings/account'
@@ -701,6 +723,7 @@ export const routeTree = rootRoute
       "filePath": "_authenticated/debug/route.tsx",
       "parent": "/_authenticated",
       "children": [
+        "/_authenticated/debug/auth",
         "/_authenticated/debug/database",
         "/_authenticated/debug/sync"
       ]
@@ -749,6 +772,10 @@ export const routeTree = rootRoute
     "/_authenticated/": {
       "filePath": "_authenticated/index.tsx",
       "parent": "/_authenticated"
+    },
+    "/_authenticated/debug/auth": {
+      "filePath": "_authenticated/debug/auth.tsx",
+      "parent": "/_authenticated/debug"
     },
     "/_authenticated/debug/database": {
       "filePath": "_authenticated/debug/database.tsx",

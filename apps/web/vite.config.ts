@@ -88,7 +88,9 @@ export default defineConfig({
         target: 'http://127.0.0.1:8787', // Target is HTTP, matching frontend protocol
         secure: false, // Allow self-signed certificates from the backend (wrangler dev)
         changeOrigin: true, // Needed when switching between HTTP and HTTPS
-        rewrite: (path) => path.replace(/^\/api/, ''), // Optional: remove the /api prefix if needed
+        // Don't rewrite the path - server expects /api prefix
+        // rewrite: (path) => path.replace(/^\/api/, ''), 
+        ws: true // Enable WebSocket proxy
       }
     }
   }
