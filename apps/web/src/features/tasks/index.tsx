@@ -1,106 +1,87 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { ColumnDef } from "@tanstack/react-table";
 import { DataTable } from "./components/data-table";
 import { Checkbox } from "@/components/ui/checkbox";
 import { columns as taskColumns } from './components/columns';
 import { TasksMutateDrawer } from './components/tasks-mutate-drawer';
-import { useTasks } from './context/tasks-context';
+import { useTasks as useTasksUI } from './context/tasks-context';
 import TasksProvider from './context/tasks-context';
 import { Main } from '@/components/layout/main';
 import { Header } from '@/components/layout/header';
 import { TopNav } from '@/components/layout/top-nav';
 import { Button } from '@/components/ui/button';
-import { clientEntities, Task } from '@repo/dataforge/client-entities'; // Corrected path
-import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
+import { Task } from '@repo/dataforge/client-entities'; // Corrected path
 import { Search } from '@/components/search'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { ProfileDropdown } from '@/components/profile-dropdown'
 import { TasksDialogs } from './components/tasks-dialogs'
 import { TasksPrimaryButtons } from './components/tasks-primary-buttons'
 import { SortingState } from '@tanstack/react-table'
-import { useLiveEntity } from '@/db/hooks/useLiveEntity'
-import { SelectQueryBuilder } from 'typeorm'
+// Import the useLiveEntity hook for real-time updates
+import { useLiveEntity } from '@/db/hooks/useLiveEntity';
+import { usePGliteContext } from '@/db/pglite-provider';
+import { useEffect } from 'react';
+import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource';
+import { SelectQueryBuilder } from 'typeorm';
 
 /**
  * Main Tasks Feature Component
  * Responsible for initializing context and rendering the task display.
+ * Uses live queries for real-time updates.
  */
 const Tasks: React.FC = () => {
-  // HMR test comment
-  const [dataSourceReady, setDataSourceReady] = useState(false);
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-
-  // State for DataSource and the QueryBuilder
-  const [dataSource, setDataSource] = useState<NewPGliteDataSource | null>(null);
-  const [queryBuilder, setQueryBuilder] = useState<SelectQueryBuilder<Task> | null>(null);
-  // Add state for sorting
+  // State for sorting
   const [sorting, setSorting] = useState<SortingState>([]);
-  
-  // Remove state variables that will be replaced by the hook's return value
-  // const [tasksData, setTasksData] = useState<Task[]>([]);
-  // const [isLoading, setIsLoading] = useState(true);
-  // const [error, setError] = useState<Error | null>(null);
+  // State for task query builder
+  const [taskQueryBuilder, setTaskQueryBuilder] = useState<SelectQueryBuilder<Task> | null>(null);
+  const { services } = usePGliteContext();
 
-  // Effect to initialize DataSource
+  // Initialize the query builder for tasks
   useEffect(() => {
-    // setIsLoading(true); // Loading state managed by hook
-    // setError(null); // Error state managed by hook
-    const initDataSource = async () => {
+    const initializeQueryBuilder = async () => {
       try {
-        const ds = await getNewPGliteDataSource({
-          database: 'shadadmin_db',
-          synchronize: false,
-          logging: true, // Keep logging for now
-          entities: clientEntities,
-        });
-        setDataSource(ds);
-        console.log("Tasks component: DataSource Initialized.");
-      } catch (err) {
-        console.error('Tasks component: Error initializing DataSource:', err);
-        // If DS fails to init, maybe set an error state for the whole component?
-        // For now, the hook will handle its own error state if QB is null
+        // Get a data source connection
+        const dataSource = await getNewPGliteDataSource();
+        if (!dataSource.isInitialized) {
+          await dataSource.initialize();
+        }
+
+        // Create a query builder for tasks
+        const tasksQB = dataSource.getRepository(Task)
+          .createQueryBuilder("task")
+          .orderBy("task.updatedAt", "DESC");
+
+        console.log('[Tasks Component] Query builder initialized');
+        setTaskQueryBuilder(tasksQB);
+      } catch (error) {
+        console.error('[Tasks Component] Error initializing query builder:', error);
       }
     };
-    initDataSource();
+
+    initializeQueryBuilder();
   }, []);
 
-  // Effect to create QueryBuilder when DataSource is ready
-  useEffect(() => {
-    if (dataSource) {
-      console.log("Tasks component: Creating QueryBuilder for tasks..."); 
-      const taskRepo = dataSource.getRepository(Task);
-      const qb = taskRepo.createQueryBuilder("task")
-        // Explicitly select necessary database columns
-        .select([
-          "task.id",
-          "task.title",
-          "task.status",
-          "task.priority",
-          "task.created_at", // Include for sorting/filtering if needed
-          "task.updated_at"
-        ]); 
-        
-      setQueryBuilder(qb);
-    } else {
-      setQueryBuilder(null); // Clear QB if dataSource is not available
+  // Use live entity hook to get real-time task updates
+  const { 
+    data: tasks, 
+    loading: isLoading, 
+    error 
+  } = useLiveEntity<Task>(
+    taskQueryBuilder,
+    { 
+      enabled: !!taskQueryBuilder,
+      transform: true // Enable transformation from snake_case to camelCase
     }
-  }, [dataSource]);
-
-  // Use the live entity hook with the query builder
-  const { data: liveTasks, loading: liveLoading, error: liveError } = useLiveEntity<Task>(
-    queryBuilder, // Pass the stateful query builder
-    { enabled: !!queryBuilder } // Only enable when QB is ready
   );
 
-  // Remove the manual fetching useEffect
-  /*
+  // Log when live data updates
   useEffect(() => {
-    if (!dataSource) return; 
-    const fetchTasks = async () => { ... };
-    fetchTasks();
-  }, [dataSource]);
-  */
+    if (tasks && tasks.length > 0) {
+      console.log('[Tasks Component] Live tasks updated:', tasks.length);
+      // Log the first task to verify proper transformation
+      console.log('[Tasks Component] First task sample:', tasks[0]);
+    }
+  }, [tasks]);
 
   return (
     <TasksProvider>
@@ -123,13 +104,13 @@ const Tasks: React.FC = () => {
           <TasksPrimaryButtons />
         </div>
         <div className='-mx-4 flex-1 overflow-auto px-4 py-1 lg:flex-row lg:space-y-0 lg:space-x-12'>
-          {/* Use loading/error state from the hook */}
-          {liveLoading && <p>Loading tasks...</p>}
-          {liveError && <p>Error loading tasks: {liveError.message}</p>}
-          {!liveLoading && !liveError && (
+          {/* Display loading, error, or data */}
+          {isLoading && <p>Loading tasks...</p>}
+          {error && <p>Error loading tasks: {error.message}</p>}
+          {!isLoading && !error && (
             // Pass sorting state and handler to DataTable
             <DataTable 
-              data={(liveTasks || []).filter(Boolean)} 
+              data={(tasks || []).filter(Boolean)} 
               columns={taskColumns} 
               sorting={sorting}
               setSorting={setSorting}

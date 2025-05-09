@@ -10,9 +10,9 @@ import { useAuthStore } from '@/stores/authStore'
 export const Route = createFileRoute('/_authenticated')({
   beforeLoad: async ({ location }) => {
     // TEMPORARILY REMOVED to test login navigation
-    // await useAuthStore.getState().ensureAuthInitialized(); 
+    await useAuthStore.getState().ensureAuthInitialized(); 
 
-    // Check the auth state directly
+    // Check the auth state directly after ensuring initialization
     const isAuthenticated = useAuthStore.getState().isAuthenticated;
 
     console.log(`[AUTH] beforeLoad (_authenticated) check: Is Authenticated? ${isAuthenticated}`);

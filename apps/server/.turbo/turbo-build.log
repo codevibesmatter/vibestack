@@ -1,4 +1,0 @@
-
-> @repo/server@0.1.0 build /home/benfreed/dev/tinytest/vibestack/apps/server
-> tsc --noEmit && wrangler deploy --outdir=dist
-

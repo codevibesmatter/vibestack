@@ -18,6 +18,7 @@ import {
   IconUserCog,
   IconUserOff,
   IconUsers,
+  IconFolder,
 } from '@tabler/icons-react'
 import { AudioWaveform, Command, GalleryVerticalEnd } from 'lucide-react'
 import { type SidebarData } from '../types'
@@ -53,6 +54,11 @@ export const sidebarData: SidebarData = {
           title: 'Dashboard',
           url: '/',
           icon: IconLayoutDashboard,
+        },
+        {
+          title: 'Projects',
+          url: '/projects',
+          icon: IconFolder,
         },
         {
           title: 'Tasks',
@@ -191,8 +197,20 @@ export const sidebarData: SidebarData = {
               url: '/debug/database',
             },
             {
+              title: 'Data Table',
+              url: '/debug/data-table',
+            },
+            {
               title: 'Sync',
               url: '/debug/sync',
+            },
+            {
+              title: 'Sync Changes',
+              url: '/debug/sync-changes',
+            },
+            {
+              title: 'Live Query',
+              url: '/debug/live-query',
             },
           ],
         },

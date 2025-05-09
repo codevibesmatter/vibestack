@@ -1,22 +1,45 @@
 import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception'; // Import HTTPException
 import {
   type ApiEnv,
   ServiceErrorType,
   createSuccessResponse,
   createErrorResponse
 } from '../types/api';
-import { getDBClient } from '../lib/db';
-import { projectQueries } from '../domains/projects';
+import { NeonService } from '../lib/neon-orm/neon-service';
+import { Project, ProjectStatus } from "@repo/dataforge/server-entities";
+import { ProjectRepository } from '../domains/projects';
+
+// Re-export enums for convenience
+export { ProjectStatus };
+
+// Input types for API
+export type ProjectCreateInput = Partial<Omit<Project, 'id' | 'createdAt' | 'updatedAt'>>;
+export type ProjectUpdateInput = Partial<ProjectCreateInput>;
 
 // Create projects router
 const projects = new Hono<ApiEnv>();
 
 // List projects
 projects.get('/', async (c) => {
-  const client = getDBClient(c);
+  const user = c.get('user');
+  if (!user) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
   try {
-    await client.connect();
-    const result = await projectQueries.findAll(client);
+    const neonService = new NeonService(c);
+    const projectRepo = new ProjectRepository(neonService);
+    const { status } = c.req.query();
+
+    let result: Project[];
+    if (status && Object.values(ProjectStatus).includes(status as ProjectStatus)) {
+      // Use repository for status filtering
+      result = await projectRepo.findByStatus(status as ProjectStatus);
+    } else {
+      // Use repository for all projects
+      result = await projectRepo.findAll();
+    }
+
     return c.json(createSuccessResponse(result));
   } catch (err) {
     console.error('Error listing projects:', err);
@@ -24,22 +47,27 @@ projects.get('/', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Create project
 projects.post('/', async (c) => {
-  const client = getDBClient(c);
+  const user = c.get('user');
+  if (!user) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
   try {
     const body = await c.req.json();
-    await client.connect();
-    const result = await projectQueries.create(client, body);
+    const neonService = new NeonService(c);
+    const projectRepo = new ProjectRepository(neonService);
+
+    // The repository will handle defaults and validation
+    const result = await projectRepo.create(body);
+
     return c.json(createSuccessResponse(result), 201);
   } catch (err) {
     console.error('Error creating project:', err);
-    if (err instanceof Error && err.message.includes('Validation failed')) {
+    if (err instanceof Error && err.message.includes('validation')) {
       return c.json(
         createErrorResponse(ServiceErrorType.VALIDATION, err.message),
         400
@@ -49,18 +77,22 @@ projects.post('/', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Get project by ID
 projects.get('/:id', async (c) => {
-  const client = getDBClient(c);
+  const user = c.get('user');
+  if (!user) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
   try {
     const id = c.req.param('id');
-    await client.connect();
-    const project = await projectQueries.findById(client, id);
+    const neonService = new NeonService(c);
+    const projectRepo = new ProjectRepository(neonService);
+
+    const project = await projectRepo.findById(id);
+
     if (!project) {
       return c.json(
         createErrorResponse(
@@ -70,6 +102,7 @@ projects.get('/:id', async (c) => {
         404
       );
     }
+
     return c.json(createSuccessResponse(project));
   } catch (err) {
     console.error('Error getting project:', err);
@@ -77,20 +110,24 @@ projects.get('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Update project
 projects.patch('/:id', async (c) => {
-  const client = getDBClient(c);
+  const user = c.get('user');
+  if (!user) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
   try {
     const id = c.req.param('id');
     const body = await c.req.json();
-    await client.connect();
-    const result = await projectQueries.update(client, id, body);
-    if (!result) {
+    const neonService = new NeonService(c);
+    const projectRepo = new ProjectRepository(neonService);
+
+    // Find the project first to ensure it exists
+    const existingProject = await projectRepo.findById(id);
+    if (!existingProject) {
       return c.json(
         createErrorResponse(
           ServiceErrorType.NOT_FOUND,
@@ -99,10 +136,26 @@ projects.patch('/:id', async (c) => {
         404
       );
     }
-    return c.json(createSuccessResponse(result));
+
+    // Update the project with the provided data
+    await projectRepo.update(id, body);
+
+    // Always fetch the updated project to return the most recent state
+    const updatedProject = await projectRepo.findById(id);
+    if (!updatedProject) {
+      return c.json(
+        createErrorResponse(
+          ServiceErrorType.NOT_FOUND,
+          `Project with id ${id} not found after update`
+        ),
+        404
+      );
+    }
+
+    return c.json(createSuccessResponse(updatedProject));
   } catch (err) {
     console.error('Error updating project:', err);
-    if (err instanceof Error && err.message.includes('Validation failed')) {
+    if (err instanceof Error && err.message.includes('validation')) {
       return c.json(
         createErrorResponse(ServiceErrorType.VALIDATION, err.message),
         400
@@ -112,19 +165,23 @@ projects.patch('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Delete project
 projects.delete('/:id', async (c) => {
-  const client = getDBClient(c);
+  const user = c.get('user');
+  if (!user) {
+    throw new HTTPException(401, { message: 'Unauthorized' });
+  }
   try {
     const id = c.req.param('id');
-    await client.connect();
-    const success = await projectQueries.delete(client, id);
-    if (!success) {
+    const neonService = new NeonService(c);
+    const projectRepo = new ProjectRepository(neonService);
+
+    // Find the project first to ensure it exists
+    const existingProject = await projectRepo.findById(id);
+    if (!existingProject) {
       return c.json(
         createErrorResponse(
           ServiceErrorType.NOT_FOUND,
@@ -133,6 +190,20 @@ projects.delete('/:id', async (c) => {
         404
       );
     }
+
+    // Delete the project
+    const deleted = await projectRepo.delete(id);
+
+    if (!deleted) {
+      return c.json(
+        createErrorResponse(
+          ServiceErrorType.NOT_FOUND,
+          `Project with id ${id} could not be deleted`
+        ),
+        500
+      );
+    }
+
     return c.json(createSuccessResponse({ id }));
   } catch (err) {
     console.error('Error deleting project:', err);
@@ -140,8 +211,6 @@ projects.delete('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 

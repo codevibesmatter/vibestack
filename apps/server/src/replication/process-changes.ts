@@ -38,14 +38,12 @@ replicationLogger.info('Replication tracking tables', {
 
 /**
  * Get list of all client IDs from KV
- * Filters out inactive and stale clients (older than 10 minutes)
+ * No longer filters or removes clients as sync clients now handle their own cleanup
  */
 export async function getAllClientIds(env: Env, timeout = 10 * 60 * 1000): Promise<string[]> {
   try {
     const { keys } = await env.CLIENT_REGISTRY.list({ prefix: 'client:' });
     const clientIds: string[] = [];
-    const now = Date.now();
-    let removedCount = 0;
     
     for (const key of keys) {
       const value = await env.CLIENT_REGISTRY.get(key.name);
@@ -54,30 +52,15 @@ export async function getAllClientIds(env: Env, timeout = 10 * 60 * 1000): Promi
       try {
         const state = JSON.parse(value);
         const clientId = key.name.replace('client:', '');
-        const lastSeen = state.lastSeen || 0;
-        const timeSinceLastSeen = now - lastSeen;
         
-        // Only include active, non-stale clients
-        if (state.active && timeSinceLastSeen <= timeout) {
-          clientIds.push(clientId);
-        } else {
-          // Clean up inactive or stale clients
-          await env.CLIENT_REGISTRY.delete(key.name);
-          removedCount++;
-        }
+        // Include all clients regardless of activity or last seen time
+        // Sync clients now handle their own cleanup
+        clientIds.push(clientId);
       } catch (err) {
         replicationLogger.error('Client parse error', {
           key: key.name
         }, MODULE_NAME);
       }
-    }
-    
-    // Log summary instead of individual client details
-    if (removedCount > 0) {
-      replicationLogger.debug('Removed inactive clients', { 
-        count: removedCount,
-        remaining: clientIds.length 
-      }, MODULE_NAME);
     }
     
     return clientIds;

@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import type { ApiEnv } from '../types/api';
 import { fetchDomainTableData, checkDatabaseHealth } from '../lib/db';
 import { NeonService } from '../lib/neon-orm/neon-service';
@@ -114,6 +115,7 @@ db.post('/query-builder', async (c) => {
 
 // Find one record
 db.get('/:tableName/find-one', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   const requestId = c.req.header('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
   const tableName = c.req.param('tableName');
   console.log(`[${requestId}] Route /${tableName}/find-one: START`);
@@ -146,6 +148,7 @@ db.get('/:tableName/find-one', async (c) => {
 
 // Find many records
 db.get('/:tableName/find', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   const requestId = c.req.header('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
   const tableName = c.req.param('tableName');
   console.log(`[${requestId}] Route /${tableName}/find: START`);
@@ -197,6 +200,7 @@ db.get('/:tableName/find', async (c) => {
 
 // Insert record
 db.post('/:tableName/insert', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const tableName = c.req.param('tableName');
     const entityTarget = getEntityTarget(tableName);
@@ -220,6 +224,7 @@ db.post('/:tableName/insert', async (c) => {
 
 // Update record
 db.put('/:tableName/update', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const tableName = c.req.param('tableName');
     const entityTarget = getEntityTarget(tableName);
@@ -248,6 +253,7 @@ db.put('/:tableName/update', async (c) => {
 
 // Delete record
 db.delete('/:tableName/delete', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const tableName = c.req.param('tableName');
     const entityTarget = getEntityTarget(tableName);
@@ -277,6 +283,7 @@ db.delete('/:tableName/delete', async (c) => {
 
 // --- Temporary Debug Route for Raw Query ---
 db.get('/debug/raw-user/:id', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   const userId = c.req.param('id');
   const dbUrl = c.env.DATABASE_URL;
   if (!userId) return c.json({ success: false, error: 'User ID required in path' }, 400);

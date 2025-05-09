@@ -5,11 +5,13 @@ import { getNewPGliteDataSource, NewPGliteDataSource } from '@/db/newtypeorm/New
 import { Task, User, Project, TaskStatus, TaskPriority, UserRole, ProjectStatus } from '@repo/dataforge/client-entities';
 import { DataSource, EntityManager, SelectQueryBuilder, QueryBuilder, In, Between, IsNull, FindOperator, SaveOptions, DeepPartial } from 'typeorm';
 import { clientEntities } from '@repo/dataforge/client-entities';
-import { DBChangeProcessor, Change } from '@/db/DBChangeProcessor';
 import { NewPGliteQueryRunner } from '@/db/newtypeorm/NewPGliteQueryRunner';
 import { useLiveEntity } from '@/db/hooks/useLiveEntity';
 import { v4 as uuidv4 } from 'uuid';
 import { Repository } from 'typeorm';
+import { TaskService } from '@/db/services';
+import { TableChange } from '@repo/sync-types';
+import { usePGliteContext } from '@/db/pglite-provider';
 
 interface TypeORMTestResult {
   success: boolean;
@@ -40,7 +42,7 @@ export function TypeORMTest() {
           database: 'shadadmin_db',
           synchronize: false,
           logging: true,
-          entities: clientEntities
+          entities: clientEntities as any // Use type assertion to bypass TypeORM version mismatch
         });
         setDataSource(ds);
         console.log("DataSource Initialized. Options:", ds.options);
@@ -190,78 +192,6 @@ export function TypeORMTest() {
     } finally {
       setIsLoading(false);
     }
-  }
-
-  async function runChangeProcessorTests() {
-    if (!dataSource) {
-        setResults(prev => [{ success: false, message: "DataSource not available for Change Processor" }, ...prev]);
-        return;
-    }
-    setIsLoading(true);
-    try {
-      const queryRunner = dataSource.createQueryRunner() as NewPGliteQueryRunner;
-      
-      const taskRepoInstance = getTaskRepository();
-
-      const getRepositorySyncFactory = (entityName: string) => {
-        if (entityName === 'tasks') return taskRepoInstance;
-        throw new Error(`Sync Repository factory not implemented for ${entityName}`);
-      };
-      const getQueryBuilderSyncFactory = (entityName: string) => {
-        const repo = getRepositorySyncFactory(entityName);
-        return repo.createQueryBuilder(entityName);
-      };
-
-      // Pass NewPGliteQueryRunner - Use 'as any' temporarily to bypass type mismatch
-      // Pass factories with 'as any' temporarily
-      const changeProcessor = new DBChangeProcessor(queryRunner as any, getRepositorySyncFactory as any, getQueryBuilderSyncFactory as any);
-
-      // --- Tests using taskRepoInstance --- 
-      const newTaskId = uuidv4();
-      // Use new Task() and Object.assign()
-      const newTask = new Task();
-      Object.assign(newTask, {
-        title: 'Test Task ChangeProc', 
-        status: TaskStatus.OPEN, 
-        description: 'Created by DBChangeProcessor test'
-      });
-      newTask.id = newTaskId; // Assign ID before saving
-      const insertedTask: Task | undefined = await taskRepoInstance.save(newTask);
-      // Check if insertedTask is correctly typed (should be Task, not Task[])
-      if (!insertedTask?.id || insertedTask.id !== newTaskId) {
-          throw new Error('Task insert failed or ID mismatch');
-      }
-      console.log("Inserted Task ID:", insertedTask.id);
-
-      const updateChange: Change = { type: 'UPDATE', entity: 'tasks', data: { id: insertedTask.id, status: TaskStatus.IN_PROGRESS } };
-      await changeProcessor.processChange(updateChange);
-      console.log("Processed UPDATE change");
-
-      const batchChanges: Change[] = [
-        { type: 'INSERT', entity: 'tasks', data: { id: uuidv4(), title: 'Batch Task CP 1', status: TaskStatus.OPEN } },
-        { type: 'INSERT', entity: 'tasks', data: { id: uuidv4(), title: 'Batch Task CP 2', status: TaskStatus.OPEN } }
-      ];
-      await changeProcessor.processBatch(batchChanges);
-      console.log("Processed BATCH INSERT changes");
-
-      const deleteChange: Change = { type: 'DELETE', entity: 'tasks', data: { id: insertedTask.id } };
-      await changeProcessor.processChange(deleteChange);
-      console.log("Processed DELETE change");
-
-      const finalTasks = await taskRepoInstance.find();
-      console.log("Final tasks after Change Processor tests:", finalTasks);
-
-      setResults(prev => [
-        { success: true, message: `Successfully ran DBChangeProcessor tests.`, data: { tasks: finalTasks } },
-        ...prev
-      ]);
-    } catch (error) {
-      console.error('Error running change processor tests:', error);
-      setResults(prev => [
-        { success: false, message: `Error running change processor tests: ${error instanceof Error ? error.message : String(error)}` },
-        ...prev
-      ]);
-    } finally { setIsLoading(false); }
   }
 
   async function runLiveQueryTest() {
@@ -1010,6 +940,119 @@ export function TypeORMTest() {
       }
   }
 
+  async function runServiceLayerTests() {
+    setIsLoading(true);
+    try {
+      console.log('=== Service Layer and Sync Adapter Tests ===');
+      
+      // Get services from the PGlite context
+      const { services } = usePGliteContext();
+      
+      if (!services?.tasks) {
+        throw new Error("Task service is not available");
+      }
+      
+      const taskService = services.tasks;
+      
+      // Test creating a task through UI path
+      const taskTitle = `Service Layer Test ${Date.now()}`;
+      console.log(`Creating task: ${taskTitle}`);
+      const newTask = await taskService.createTask({
+        title: taskTitle,
+        status: TaskStatus.OPEN,
+        description: 'Created by Service Layer test',
+        projectId: '' // Empty string instead of null
+      });
+      console.log("Created task ID:", newTask.id);
+      
+      // Test updating task through sync path (simulating a sync change)
+      const syncUpdateChange: TableChange = {
+        table: 'tasks',
+        operation: 'update',
+        data: {
+          id: newTask.id,
+          status: TaskStatus.IN_PROGRESS,
+          description: 'Updated by Sync Adapter test'
+        },
+        updated_at: new Date().toISOString()
+      };
+      console.log("Processing sync update change");
+      await taskService.processSync(syncUpdateChange);
+      
+      // Verify task was updated
+      const updatedTask = await taskService.get(newTask.id);
+      console.log("Updated task:", updatedTask);
+      
+      // Test batch changes through sync path
+      const batchChanges: TableChange[] = [
+        {
+          table: 'tasks',
+          operation: 'insert',
+          data: {
+            id: uuidv4(),
+            title: 'Batch Task Service 1',
+            status: TaskStatus.OPEN
+          },
+          updated_at: new Date().toISOString()
+        },
+        {
+          table: 'tasks',
+          operation: 'insert',
+          data: {
+            id: uuidv4(),
+            title: 'Batch Task Service 2',
+            status: TaskStatus.OPEN
+          },
+          updated_at: new Date().toISOString()
+        }
+      ];
+      console.log("Processing batch sync insert changes");
+      await Promise.all(batchChanges.map(change => taskService.processSync(change)));
+      
+      // Test delete through sync path
+      const syncDeleteChange: TableChange = {
+        table: 'tasks',
+        operation: 'delete',
+        data: {
+          id: newTask.id
+        },
+        updated_at: new Date().toISOString()
+      };
+      console.log("Processing sync delete change");
+      await taskService.processSync(syncDeleteChange);
+      
+      // Verify task was deleted
+      const deletedTask = await taskService.get(newTask.id);
+      if (!deletedTask) {
+        console.log("Task deleted successfully");
+      } else {
+        console.log("Task deletion failed");
+      }
+      
+      // Get final list of tasks
+      const finalTasks = await taskService.getAll();
+      
+      setResults(prev => [
+        {
+          success: true,
+          message: `Successfully ran Service Layer and Sync Adapter tests. Found ${finalTasks.length} tasks.`,
+          data: { tasks: finalTasks }
+        },
+        ...prev
+      ]);
+    } catch (error) {
+      console.error('Error running service layer tests:', error);
+      setResults(prev => [
+        {
+          success: false,
+          message: `Error running service layer tests: ${error instanceof Error ? error.message : String(error)}`
+        },
+        ...prev
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  }
 
   // --- END NEW TEST FUNCTIONS ---
 
@@ -1048,14 +1091,6 @@ export function TypeORMTest() {
             >
               Custom SQL
             </Button>
-
-            <Button 
-              onClick={runChangeProcessorTests} 
-              disabled={isLoading}
-              variant="outline"
-            >
-              Change Processor
-            </Button>
             
             <Button 
               onClick={runLiveQueryTest} 
@@ -1071,6 +1106,15 @@ export function TypeORMTest() {
               variant="outline"
             >
               Update Live Task
+            </Button>
+
+            <Button
+              onClick={runServiceLayerTests}
+              disabled={isLoading}
+              variant="outline"
+              className="bg-green-100 hover:bg-green-200"
+            >
+              Service Layer Tests
             </Button>
 
             {/* --- START NEW BUTTONS --- */}

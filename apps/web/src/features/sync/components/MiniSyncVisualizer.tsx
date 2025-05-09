@@ -1,12 +1,38 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { SyncVisualizationCore } from './SyncVisualizationCore';
 
 export function MiniSyncVisualizer() {
-  // Optional: Conditionally render based on environment or feature flag
-  // if (process.env.NODE_ENV !== 'development') {
-  //   return null;
-  // }
+  const [isAuthPage, setIsAuthPage] = useState(false);
+  
+  useEffect(() => {
+    // Check if on auth page using the window.location object
+    const checkIfAuthPage = () => {
+      const path = window.location.pathname;
+      const authPaths = ['/sign-in', '/sign-up', '/sign-in-2', '/forgot-password', '/otp'];
+      setIsAuthPage(authPaths.some(authPath => path.startsWith(authPath)));
+    };
+
+    // Initial check
+    checkIfAuthPage();
+
+    // Set up listener for location changes
+    const handleLocationChange = () => {
+      checkIfAuthPage();
+    };
+
+    // Modern approach for listening to location changes
+    window.addEventListener('popstate', handleLocationChange);
+    
+    return () => {
+      window.removeEventListener('popstate', handleLocationChange);
+    };
+  }, []);
+
+  // Don't render on auth pages
+  if (isAuthPage) {
+    return null;
+  }
 
   return (
     <motion.div

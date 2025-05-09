@@ -18,13 +18,14 @@ import { FontProvider } from './context/font-context'
 import { ThemeProvider } from './context/theme-context'
 import { SyncProvider } from './sync/SyncContext'
 import { VibestackPGliteProvider } from './db/pglite-provider'
+import { useEffect } from 'react'
 import './index.css'
 // Generated Routes
 import { routeTree } from './routeTree.gen'
 // Import the Mini Sync Visualizer
 import { MiniSyncVisualizer } from './features/sync/components/MiniSyncVisualizer';
 
-// Import the database functions\
+// Import the database functions
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -60,8 +61,16 @@ const queryClient = new QueryClient({
     onError: (error) => {
       if (error instanceof AxiosError) {
         if (error.response?.status === 401) {
-          toast.error('Session expired! Please log in again.');
-          useAuthStore.getState().setUnauthenticated();
+          const authState = useAuthStore.getState();
+          // Check if offline and if there's a valid persisted session
+          if (!navigator.onLine && authState.isAuthenticated && !authState.isSessionExpired()) {
+            console.warn("[QueryCache] Received 401 while offline, but cached session is valid. Suppressing logout.");
+            // Optionally, you could inform the user that some actions might be limited
+            // toast.info("Offline: Some operations may be limited.");
+          } else {
+            toast.error('Session expired! Please log in again.');
+            authState.setUnauthenticated();
+          }
         }
         if (error.response?.status === 500) {
           toast.error('Internal Server Error!')
@@ -90,6 +99,27 @@ declare module '@tanstack/react-router' {
   }
 }
 
+// Auth-aware wrapper component for database and sync services
+function AuthAwareProviders({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAuthStore()
+  
+  // For authenticated users, initialize database and sync
+  if (isAuthenticated) {
+    return (
+      <VibestackPGliteProvider>
+        <SyncProvider autoConnect={true}>
+          {children}
+          <MiniSyncVisualizer />
+        </SyncProvider>
+      </VibestackPGliteProvider>
+    )
+  }
+  
+  // For unauthenticated users, just render the children
+  // This allows the auth flow to work normally
+  return children
+}
+
 // Render the app
 const rootElement = document.getElementById('root')!
 if (!rootElement.innerHTML) {
@@ -98,12 +128,9 @@ if (!rootElement.innerHTML) {
     <QueryClientProvider client={queryClient}>
       <ThemeProvider defaultTheme='light' storageKey='vite-ui-theme'>
         <FontProvider>
-          <VibestackPGliteProvider>
-            <SyncProvider autoConnect={true}>
-              <RouterProvider router={router} />
-              <MiniSyncVisualizer />
-            </SyncProvider>
-          </VibestackPGliteProvider>
+          <AuthAwareProviders>
+            <RouterProvider router={router} />
+          </AuthAwareProviders>
         </FontProvider>
       </ThemeProvider>
     </QueryClientProvider>

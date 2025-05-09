@@ -48,6 +48,8 @@ export class ClientManager {
 
   /**
    * Perform a full cleanup of the client registry
+   * NOTE: This method is no longer actively used since sync clients now handle their own cleanup.
+   * It's retained for backward compatibility and manual administrative cleanup if needed.
    */
   public async purgeStaleClients(): Promise<number> {
     try {
@@ -110,14 +112,11 @@ export class ClientManager {
 
   /**
    * Check if there are any active clients
+   * No longer performs cleanup as sync clients now handle their own cleanup
    */
   public async hasActiveClients(): Promise<boolean> {
     try {
-      // Check if we should do a full cleanup
-      const now = Date.now();
-      if (now - this.lastFullCleanupTime > this.FULL_CLEANUP_INTERVAL) {
-        await this.purgeStaleClients();
-      }
+      // Remove the full cleanup check since sync clients handle their own cleanup
       
       const { keys } = await this.env.CLIENT_REGISTRY.list({ prefix: 'client:' });
       
@@ -132,38 +131,19 @@ export class ClientManager {
       
       let hasActive = false;
       
-      // Check each client's state and clean up inactive or stale ones
+      // Check each client's state but don't clean up
       for (const key of keys) {
         const value = await this.env.CLIENT_REGISTRY.get(key.name);
         
         if (!value) {
-          replicationLogger.warn('Empty client record', { 
-            clientKey: key.name 
-          }, MODULE_NAME);
-          // Clean up empty key
-          await this.env.CLIENT_REGISTRY.delete(key.name);
           continue;
         }
 
         try {
           const state = JSON.parse(value);
-          const lastSeen = state.lastSeen || 0;
-          const timeSinceLastSeen = now - lastSeen;
-          const clientId = key.name.replace('client:', '');
           
-          // Should remove client if:
-          // 1. It's explicitly marked as inactive, or
-          // 2. It hasn't been seen recently (stale)
-          if (!state.active || timeSinceLastSeen > ClientManager.CLIENT_TIMEOUT) {
-            const reason = !state.active ? 'inactive' : 'stale';
-            replicationLogger.info('Removing client', {
-              clientId,
-              reason,
-              idleSecs: Math.round(timeSinceLastSeen / 1000)
-            }, MODULE_NAME);
-            await this.env.CLIENT_REGISTRY.delete(key.name);
-          } else {
-            // Client is active and was seen recently
+          // Only check if active, don't consider lastSeen or timeout
+          if (state.active) {
             hasActive = true;
           }
         } catch (err) {
@@ -171,8 +151,6 @@ export class ClientManager {
             key: key.name,
             error: err instanceof Error ? err.message : String(err)
           }, MODULE_NAME);
-          // Remove invalid entry
-          await this.env.CLIENT_REGISTRY.delete(key.name);
         }
       }
       
@@ -382,6 +360,7 @@ export class ClientManager {
 
   /**
    * Attempt to wake a client via its DO
+   * No longer checks for staleness as sync clients handle their own lifecycle
    */
   async wakeClient(clientId: string): Promise<boolean> {
     try {
@@ -392,8 +371,8 @@ export class ClientManager {
         return false;
       }
       
-      // Check if the client is still active
-      if (!client.lastSeen || Date.now() - client.lastSeen > 300000) { // 5 minutes
+      // Check only if client is active, ignoring last seen time
+      if (!client.active) {
         replicationLogger.debug('Skipping inactive client', { clientId }, MODULE_NAME);
         return false;
       }

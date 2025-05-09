@@ -56,6 +56,9 @@ export function createErrorResponse(type: ServiceErrorType, message: string): Er
 /**
  * API environment type for Hono routes
  */
-export type ApiEnv = {
-  Bindings: Env;
-}; 
+import type { AppBindings } from './hono'; // Import AppBindings
+
+/**
+ * API environment type for Hono routes
+ */
+export type ApiEnv = AppBindings;

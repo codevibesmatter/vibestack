@@ -323,63 +323,39 @@ export class NeonDriver implements Driver {
         if (!nativeParameters || Object.keys(nativeParameters).length === 0) {
             // If nativeParameters is empty, check the other 'parameters' argument
             if (parameters && Object.keys(parameters).length > 0) {
-                // This is where the "ERROR" log happens
-                // console.error(`[${requestId}] NeonDriver.escapeQueryWithParameters: Native parameters empty, falling back to using 'parameters' argument.`);
-                // Need to extract values from the 'parameters' object.
-                // CRITICAL: The order might not match the SQL parameter placeholders ($1, $2)
-                // This fallback is potentially unsafe if the order isn't guaranteed.
                 paramsToUse = parameters;
                 sourceUsed = "parameters";
             } else {
-                 // If both are empty, return original SQL
-                 console.log("NeonDriver.escapeQueryWithParameters: Both native and regular parameters empty, returning original SQL.");
-                 return [sql, []];
+                // If both are empty, return original SQL
+                console.log("NeonDriver.escapeQueryWithParameters: Both native and regular parameters empty, returning original SQL.");
+                return [sql, []];
             }
         }
         
         console.log(`NeonDriver.escapeQueryWithParameters: Using parameters from: ${sourceUsed}`);
 
-        // Extract parameter values in the correct order based on the keys of the chosen source
+        // CRITICAL FIX: 
+        // Instead of sorting by key name and creating ordered params first,
+        // we'll create a parameter lookup table and process parameters in the order they appear in SQL
+        const paramLookup: {[key: string]: any} = {};
+        
+        // Fill the parameter lookup table
+        Object.keys(paramsToUse).forEach(key => {
+            paramLookup[key] = paramsToUse[key];
+        });
+        
+        // Create an array to hold parameters in the order they appear in SQL
         const orderedParams: any[] = [];
-        // Sort keys numerically based on the index suffix (assuming orm_param_N format if native, or simple order if fallback)
-        const paramKeys = Object.keys(paramsToUse).sort((a, b) => {
-            // Adjust sorting logic slightly depending on source
-            if (sourceUsed === "nativeParameters") {
-                const idxA = parseInt(a.substring(a.lastIndexOf('_') + 1), 10);
-                const idxB = parseInt(b.substring(b.lastIndexOf('_') + 1), 10);
-                if (isNaN(idxA) || isNaN(idxB)) {
-                    console.warn(`Could not parse indices for native parameters: ${a}, ${b}`);
-                    return 0; 
-                }
-                return idxA - idxB;
-            } else {
-                 // For fallback 'parameters', assume simple keys or rely on insertion order (less reliable)
-                 // A more robust fallback might need specific key mapping if keys aren't just 0, 1, 2...
-                 // For now, let's try basic numeric sort if keys are numbers, otherwise default sort.
-                 const numA = Number(a);
-                 const numB = Number(b);
-                 if (!isNaN(numA) && !isNaN(numB)) {
-                     return numA - numB;
-                 }
-                 return a.localeCompare(b); // Default string sort for non-numeric keys
+        
+        // Replace named parameters (:orm_param_N) with positional parameters ($N)
+        // and build the ordered parameter array as we go
+        const transformedSql = sql.replace(/:([a-zA-Z0-9_]+)/g, (match, key) => {
+            if (paramLookup.hasOwnProperty(key)) {
+                orderedParams.push(paramLookup[key]);
+                return driver.createParameter("", orderedParams.length - 1);
             }
+            return match; // If param not found, leave as is
         });
-
-        paramKeys.forEach(key => {
-            orderedParams.push(paramsToUse[key]);
-        });
-
-        // Replace named parameters (:orm_param_N) with positional parameters ($N+1)
-        let paramIndex = 0;
-        const transformedSql = sql.replace(/:orm_param_\d+/g, () => {
-            paramIndex++;
-            return driver.createParameter("", paramIndex - 1); 
-        });
-
-        // Basic validation
-        if (paramKeys.length !== paramIndex) {
-            console.error(`Parameter count mismatch in escapeQueryWithParameters: Expected ${paramKeys.length} from ${sourceUsed}, replaced ${paramIndex}. SQL: ${sql}`, paramsToUse);
-        }
         
         console.log("NeonDriver.escapeQueryWithParameters: FINISHED. Transformed SQL:", transformedSql, "Ordered Params:", orderedParams);
         return [transformedSql, orderedParams];

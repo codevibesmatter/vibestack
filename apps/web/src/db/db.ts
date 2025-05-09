@@ -20,6 +20,10 @@ import { live } from '@electric-sql/pglite/live';
 // import { validateDatabaseSchema } from './schema-validator';
 import { checkAndApplyMigrations } from './migration-manager';
 
+// Export the database name as a constant for use in other modules
+// IMPORTANT: Must match the value in worker.ts exactly 
+export const DB_NAME = 'vibestack-db';
+
 // Properly type PGlite results
 // Based on PGlite's typical result structure
 export interface Results<T = any> {
@@ -242,8 +246,7 @@ export async function clearDatabaseStorage(): Promise<boolean> {
 async function clearIndexedDBStorage(): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
-      // Use the correct DB name defined in worker.ts
-      const DB_NAME = 'vibestack-admin-db'; 
+      // Use the exported DB_NAME constant
       const req = indexedDB.deleteDatabase(DB_NAME);
       req.onsuccess = () => {
         console.log(`Successfully deleted ${DB_NAME} database from IndexedDB`);

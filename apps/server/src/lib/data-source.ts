@@ -10,6 +10,7 @@ import { NeonDriverOptions } from './neon-orm/NeonDriver'; // Keep NeonDriverOpt
 import * as ServerEntities from '@repo/dataforge/server-entities'; // Import all entities
 import type { Context } from 'hono'; // Import Hono context
 import type { Env } from '../types/env'; // Import Env type
+import type { AppBindings } from '../types/hono'; // Import AppBindings
 import { addConnectTimeout } from './db'; // Import helper from db.ts
 
 // Change the singleton instance type
@@ -19,7 +20,7 @@ let initPromise: Promise<NeonDataSource> | null = null; // Promise to track ongo
 /**
  * Initializes and returns the singleton NeonDataSource instance using context.
  */
-export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<NeonDataSource> => {
+export const getDataSource = async (c: Context<AppBindings>): Promise<NeonDataSource> => { // Update context type
     const requestId = c.req.header('cf-request-id') || `local-${Date.now()}-${Math.random().toString(36).substring(7)}`;
     console.log(`[${requestId}] getDataSource: Called.`);
 
@@ -47,12 +48,12 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
 
     // Start new initialization
     console.log(`[${requestId}] getDataSource: No instance or ongoing initialization. Starting new initialization.`);
-    
+
     // Create a promise to track this initialization attempt
     initPromise = (async () => {
         console.log(`[${requestId}] getDataSource: Creating new NeonDataSource instance from context...`);
-        
-        // --- Configuration --- 
+
+        // --- Configuration ---
         const dbUrl = c.env.DATABASE_URL;
         if (!dbUrl) {
             throw new Error('DATABASE_URL not found in Hono context environment.');
@@ -68,18 +69,18 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
             ) as EntitySchema<any>[], // Cast the result
             synchronize: c.env.NODE_ENV !== 'production',
             // Explicitly enable ALL logging for debugging
-            logging: "all", 
+            logging: "all",
             // Pass other options like namingStrategy if needed
         };
 
         // Use the factory function
         const ds = createNeonDataSource(neonDataSourceOptions);
         // Assign immediately AFTER creation, BEFORE initialize()
-        appDataSource = ds; 
+        appDataSource = ds;
 
         try {
             console.log(`[${requestId}] getDataSource: Calling ds.initialize()...`);
-            await ds.initialize(); 
+            await ds.initialize();
             console.log(`[${requestId}] getDataSource: ds.initialize() successful.`);
             return ds;
         } catch (error) {
@@ -88,7 +89,7 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
             initPromise = null;  // Clear the promise if initialization fails
             throw error; // Rethrow to reject the initPromise
         }
-    })();
+    })(); // Immediately invoke the async function to get the promise
 
     try {
         // Await the promise we just created
@@ -102,8 +103,8 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
          appDataSource = null; // Ensure appDataSource is also cleared
          throw error; // Rethrow the error
     } finally {
-         // Regardless of success or failure of this specific call's initialization attempt, 
-         // clear the promise *if* it's the one we created. 
+         // Regardless of success or failure of this specific call's initialization attempt,
+         // clear the promise *if* it's the one we created.
          // This allows subsequent calls to potentially retry initialization if the first one failed.
          // We only clear if the current initPromise is the one we created in this execution context.
          // This simple check might not be perfectly robust in highly concurrent scenarios without more complex locking,
@@ -114,4 +115,4 @@ export const getDataSource = async (c: Context<{ Bindings: Env }>): Promise<Neon
          // initPromise = null; // Temporarily removing this to see if it causes issues. Let the success path handle keeping it.
          console.log(`[${requestId}] getDataSource: Exiting.`);
     }
-}; 
+};

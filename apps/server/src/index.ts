@@ -248,6 +248,62 @@ const worker = {
     // No route matched
     // serverLogger.debug('No route matched, returning 404'); // Keep debug log potentially
     return new Response('Not Found', { status: 404 });
+  },
+
+  /**
+   * Scheduled handler that runs on cron triggers
+   * Used to keep the Replication Durable Object from hibernating
+   * 
+   * @param event - The scheduled event
+   * @param env - Environment variables and bindings
+   * @param ctx - Execution context
+   */
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<Response> {
+    serverLogger.info('Running scheduled task to keep replication DO active', {
+      cron: event.cron,
+      scheduledTime: new Date(event.scheduledTime).toISOString()
+    });
+
+    try {
+      // Get a reference to the replication DO
+      const doId = env.REPLICATION.idFromName("replication");
+      const replicationDO = env.REPLICATION.get(doId);
+      
+      // Call the init endpoint to ensure polling is active
+      const doResponse = await replicationDO.fetch("https://dummy-url/api/replication/init");
+      
+      // Define response type
+      interface ReplicationInitResponse {
+        success: boolean;
+        alreadyInitialized?: boolean;
+        pollingStarted?: boolean;
+      }
+      
+      // Parse the response
+      const result = await doResponse.json() as ReplicationInitResponse;
+      
+      serverLogger.info('Replication heartbeat completed', {
+        success: result.success,
+        alreadyInitialized: result.alreadyInitialized || false,
+        pollingStarted: result.pollingStarted || false
+      });
+
+      // Return the JSON response from the DO
+      return new Response(JSON.stringify(result), {
+        headers: { 'Content-Type': 'application/json' },
+        status: doResponse.status // Propagate status from DO
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      serverLogger.error('Failed to send heartbeat to replication DO', {
+        error: errorMessage
+      });
+      // Return an error response
+      return new Response(JSON.stringify({ success: false, error: errorMessage }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
   }
 };
 

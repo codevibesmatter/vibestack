@@ -1,0 +1,1342 @@
+import { getNewPGliteDataSource, NewPGliteDataSource } from '../db/newtypeorm/NewDataSource'; // Import new TypeORM service
+import { DataSource, EntityManager, EntityTarget, In, ObjectLiteral } from 'typeorm'; // Import necessary TypeORM types
+import { v4 as uuidv4 } from 'uuid';
+// Import the shared types from our packages
+// Also import the canonical list of client entities
+import {
+  clientEntities, // Import the array
+  Comment,
+  LocalChanges,
+  Project,
+  Task,
+  TaskPriority, // Restored import
+  TaskStatus, // Restored import
+  User
+} from '@repo/dataforge/client-entities';
+import type { TableChange } from '@repo/sync-types';
+import { SyncEventEmitter } from './SyncEventEmitter';
+import { SyncManager } from './SyncManager';
+
+// Constants for batch processing
+// MOVED TO OutgoingChangeProcessor.ts
+// const BATCH_DELAY = 50; // ms to wait before processing to allow batching
+// const MAX_CHANGES_PER_BATCH = 50; // max changes to include in a single message
+// const CHANGE_TIMEOUT = 300000; // 5 minutes timeout for a change before considering it lost
+
+/**
+ * SyncChangeManager
+ *
+ * A simplified change processing system that:
+ * 1. Tracks and processes outgoing local changes
+ * 2. Processes incoming changes from the server
+ * 3. Handles acknowledgments and error states
+ *
+ * This replaces ChangeProcessor.ts and TableChangeProcessor.ts with a simpler implementation
+ */
+export class SyncChangeManager {
+  // Singleton instance
+  private static instance: SyncChangeManager | null = null;
+
+  // TypeORM DataSource instance (use the new type)
+  private dataSource: NewPGliteDataSource | null = null;
+
+  // Core dependencies
+  private syncManager: SyncManager;
+  private events: SyncEventEmitter;
+
+  // Change tracking
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private changeQueue: Set<string> = new Set(); // Set of change IDs to process
+  private isProcessing: boolean = false;
+  private processTimer: number | null = null;
+  private sentChanges: Map<string, number> = new Map(); // Map of changeId -> timestamp
+  private pendingChangesCount: number = 0;
+  */
+
+  /**
+   * Private constructor - use getInstance() instead
+   */
+  private constructor() {
+    console.log('SyncChangeManager: Initializing instance');
+    this.syncManager = SyncManager.getInstance();
+    this.events = this.syncManager.events; // Get shared emitter instance
+
+    // Initialize event listeners
+    this.initializeEventListeners();
+
+    // Initialize TypeORM DataSource and load changes
+    // TODO: Replace this direct call with dependency injection or a service locator
+    // For now, we assume DatabaseInitializer is handled elsewhere and we get the dataSource
+    this.initializeDataSourceAndLoadChanges(); // Keep this for now, but it needs refactoring
+  }
+
+  /**
+   * Get the singleton instance
+   */
+  public static getInstance(): SyncChangeManager {
+    if (!SyncChangeManager.instance) {
+      SyncChangeManager.instance = new SyncChangeManager();
+    }
+    return SyncChangeManager.instance;
+  }
+
+  /**
+   * Initialize TypeORM DataSource and load pending changes count
+   */
+  // MOVED TO DatabaseInitializer.ts
+  /*
+  private async initializeDataSourceAndLoadChanges(): Promise<void> {
+    if (this.dataSource && this.dataSource.isInitialized) { // Check if already initialized
+      console.log('SyncChangeManager: DataSource already initialized.');
+      return this.loadPendingChangesCount(); // Load count if DS already exists and is initialized
+    }
+
+    // Check if already initializing to prevent race conditions
+    if (this.dataSource && !this.dataSource.isInitialized) {
+        console.log('SyncChangeManager: DataSource is initializing, waiting...');
+        // Optionally, wait for the existing initialization to complete
+        // This might require a more complex promise-based mechanism
+        // For now, we'll let the existing process handle it or retry later
+        return;
+    }
+
+    try {
+      console.log('SyncChangeManager: Initializing New PGLite DataSource...');
+      // Use the new factory function
+      this.dataSource = await getNewPGliteDataSource({
+        database: 'shadadmin_db', // Or your actual DB name
+        synchronize: false, // Ensure this is false for production/stable schema
+        logging: false, // Set logging as needed (e.g., true for development)
+        // Use the imported clientEntities array
+        entities: clientEntities as any[] // Cast to any[] to bypass complex type mismatch
+      });
+
+      if (!this.dataSource) {
+        throw new Error('Failed to get New PGLite DataSource instance.');
+      }
+
+      // Explicitly initialize the DataSource and wait for it
+      console.log('SyncChangeManager: Awaiting DataSource initialization...');
+      await this.dataSource.initialize();
+
+      // Check if initialization was successful AFTER awaiting initialize()
+      if (!this.dataSource.isInitialized) {
+        throw new Error('New PGLite DataSource failed to initialize correctly.');
+      }
+
+      console.log('SyncChangeManager: New PGLite DataSource initialized successfully, scheduling change load.');
+
+      // Introduce a minimal delay before loading changes
+      await new Promise(resolve => setTimeout(resolve, 0)); // Yield to event loop
+
+      await this.loadPendingChangesCount(); // Load count after successful initialization and delay
+
+    } catch (error) {
+      console.error('SyncChangeManager: Failed to initialize New PGLite DataSource or load changes:', error);
+      // Clear the potentially partially initialized dataSource on failure
+      this.dataSource = null;
+      // Retry initialization after a delay
+      setTimeout(() => this.initializeDataSourceAndLoadChanges(), 5000);
+    }
+  }
+  */
+  // Placeholder for initialization logic - replace with proper dependency injection
+  private async initializeDataSourceAndLoadChanges(): Promise<void> {
+      console.warn("SyncChangeManager: initializeDataSourceAndLoadChanges needs refactoring for dependency injection.");
+      // Attempt to get dataSource if not already set
+      if (!this.dataSource) {
+          try {
+              // This assumes DatabaseInitializer is available somehow, which is not ideal.
+              // This should be injected or obtained via a service locator pattern.
+              // For now, just try getting it directly.
+              this.dataSource = await getNewPGliteDataSource(); // Assuming default options
+              if (!this.dataSource.isInitialized) {
+                  await this.dataSource.initialize();
+              }
+              console.log("SyncChangeManager: DataSource obtained/initialized (placeholder).");
+          } catch (error) {
+              console.error("SyncChangeManager: Failed to get/initialize DataSource in placeholder:", error);
+              // Retry or handle error state
+              setTimeout(() => this.initializeDataSourceAndLoadChanges(), 5000);
+          }
+      }
+  }
+
+
+  /**
+   * Load the count of pending changes using TypeORM
+   */
+  // MOVED TO DatabaseInitializer.ts (related logic) and OutgoingChangeProcessor (for pendingChangesCount property)
+  /*
+  private async loadPendingChangesCount(): Promise<void> {
+    if (!this.dataSource) {
+      console.error("SyncChangeManager: Cannot load pending changes count, DataSource not initialized.");
+      // Optionally trigger re-initialization or handle error
+      // setTimeout(() => this.initializeDataSourceAndLoadChanges(), 1000); // Example retry
+      return;
+    }
+
+    try {
+      // Get repository using the EntityManager from the DataSource
+      const localChangesRepo = this.dataSource.manager.getRepository(LocalChanges);
+
+      // Use Query Builder's getCount() method - should work now
+      const count = await localChangesRepo.createQueryBuilder("local_changes") // Alias is needed here
+          .where("local_changes.processedSync = :status", { status: 0 }) // Use integer 0 instead of boolean false
+          .getCount();
+
+      this.pendingChangesCount = count;
+
+      // Update the sync manager
+      this.syncManager.updatePendingChangesCount(count);
+
+      if (count > 0) {
+        console.log(`SyncChangeManager: Found ${count} pending changes to process (TypeORM)`);
+      } else {
+        console.debug('SyncChangeManager: No pending changes found (TypeORM)');
+      }
+
+    } catch (error) {
+      console.error('SyncChangeManager: Failed to load pending changes count using TypeORM:', error);
+
+      // Default to zero pending changes in case of error
+      this.pendingChangesCount = 0;
+      this.syncManager.updatePendingChangesCount(0);
+
+      // Schedule a retry using the same method
+      setTimeout(() => this.loadPendingChangesCount(), 2000);
+    }
+  }
+  */
+
+  /**
+   * Create a change record for a local data change using TypeORM
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  public async trackChange(
+    table: string,
+    operation: 'insert' | 'update' | 'delete',
+    data: Record<string, any>,
+    originalData?: Record<string, any> // Add original data for comparison
+  ): Promise<string> {
+    const changeId = uuidv4();
+
+    if (!this.dataSource) {
+      console.error("SyncChangeManager: Cannot track change, DataSource not initialized.");
+      // Handle error appropriately - maybe queue the change attempt?
+      throw new Error("DataSource not available for trackChange");
+    }
+
+    try {
+      // Get repository
+      const localChangesRepo = this.dataSource.manager.getRepository(LocalChanges);
+
+      // For updates, only include modified fields
+      let changeData = data;
+      if (operation === 'update' && originalData) {
+        changeData = {};
+        for (const [key, value] of Object.entries(data)) {
+          // Simple comparison, might need deep comparison for complex objects
+          if (JSON.stringify(value) !== JSON.stringify(originalData[key])) {
+            changeData[key] = value;
+          }
+        }
+        // If no fields were actually changed, maybe skip tracking?
+        if (Object.keys(changeData).length === 0 && data.id) {
+            console.log(`SyncChangeManager: Skipping tracking update for ${table}:${data.id} as no data changed.`);
+            // Return the entity id even if no change was tracked
+            // Or perhaps return a specific indicator like null or undefined?
+            return data.id;
+        }
+      }
+
+      // Convert data to JSON string
+      const dataJson = JSON.stringify(changeData);
+      const currentLsn = this.syncManager.getLSN(); // Assuming this remains valid
+      const now = new Date(); // Use Date object directly if column type supports it
+
+      // Create and save the new LocalChanges entity
+      const newChange = localChangesRepo.create({
+        id: changeId,
+        table: table,
+        operation: operation,
+        data: changeData,
+        lsn: currentLsn,
+        updatedAt: now, // TypeORM handles Date objects
+        processedSync: 0 // Use 0 based on previous findings
+      });
+
+      await localChangesRepo.save(newChange);
+
+      // Queue the change for processing
+      this.changeQueue.add(changeId);
+      console.log(`SyncChangeManager: Tracked change ${changeId} for ${operation} on ${table} (TypeORM)`);
+
+      // Schedule processing
+      this.scheduleProcessing();
+
+      // Emit event
+      this.events.emit('change_created', { changeId, table, operation });
+
+      // Increment in-memory count and trigger debounced update
+      this.pendingChangesCount++;
+      this.debouncedUpdatePendingChangesCount();
+
+      return changeId;
+    } catch (error) {
+      console.error('SyncChangeManager: Error tracking change using TypeORM:', error);
+      // Re-throw or handle as appropriate
+      throw error;
+    }
+  }
+  */
+
+  /**
+   * Debounced function to update the pending changes count
+   * This prevents excessive metadata saves
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private debouncedUpdatePendingChangesCount = (() => {
+    let timeoutId: any = null;
+    let lastUpdateTime = 0;
+    const MIN_UPDATE_INTERVAL = 3000; // Only update at most once every 3 seconds
+
+    return () => {
+      // Check if we've updated recently
+      const now = Date.now();
+      if (now - lastUpdateTime < MIN_UPDATE_INTERVAL) {
+        // If existing timeout, just let it handle the update
+        if (timeoutId) return;
+
+        // Otherwise set a new timeout for the minimum interval
+        timeoutId = setTimeout(() => {
+          lastUpdateTime = Date.now();
+          this.syncManager.updatePendingChangesCount(this.pendingChangesCount);
+          timeoutId = null;
+        }, MIN_UPDATE_INTERVAL - (now - lastUpdateTime));
+        return;
+      }
+
+      // Clear any existing timeout
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      // Set a new timeout with a longer delay
+      timeoutId = setTimeout(() => {
+        lastUpdateTime = Date.now();
+        this.syncManager.updatePendingChangesCount(this.pendingChangesCount);
+        timeoutId = null;
+      }, 1000); // Update at most once per second
+    };
+  })();
+  */
+
+  /**
+   * Schedule processing of changes (with debounce)
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private scheduleProcessing(): void {
+    // If already scheduled, do nothing
+    if (this.processTimer !== null) return;
+
+    // If changes are being processed, do nothing
+    if (this.isProcessing) return;
+
+    // Schedule processing after a short delay to batch changes
+    this.processTimer = window.setTimeout(() => {
+      this.processTimer = null;
+      this.processChanges().catch(error => {
+        console.error('Error processing changes:', error);
+      });
+    }, BATCH_DELAY);
+  }
+  */
+
+  /**
+   * Process queued changes
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private async processChanges(): Promise<void> {
+    // If already processing or no changes to process, return
+    if (this.isProcessing || this.changeQueue.size === 0) return;
+
+    // Check DataSource initialization
+    if (!this.dataSource) {
+      console.error("SyncChangeManager: Cannot process changes, DataSource not initialized.");
+      // Optionally trigger re-initialization
+      // setTimeout(() => this.initializeDataSourceAndLoadChanges(), 1000);
+      return;
+    }
+
+    // Check connection status via SyncManager
+    const isConnected = this.syncManager.isConnected();
+    const currentState = this.syncManager.getState();
+
+    if (!isConnected) {
+      console.log('Not processing changes - not connected to server');
+      this.syncManager.on('websocket:open', () => { // Revert back to 'on'
+        setTimeout(() => this.scheduleProcessing(), 1000);
+      });
+      return;
+    }
+
+    if (currentState !== 'live') {
+      console.log(`Not processing changes - current state is ${currentState}, waiting for 'live' state`);
+      setTimeout(() => this.scheduleProcessing(), 5000);
+      return;
+    }
+
+    this.isProcessing = true;
+
+    try {
+      // Convert queue to array for processing
+      const changeIds = Array.from(this.changeQueue).slice(0, MAX_CHANGES_PER_BATCH);
+
+      // Clear these IDs from the queue *before* processing to prevent race conditions
+      changeIds.forEach(id => this.changeQueue.delete(id));
+
+      // Load the changes from the database using TypeORM
+      const localChangesRepo = this.dataSource.manager.getRepository(LocalChanges);
+      const changes = await localChangesRepo.find({
+        where: { id: In(changeIds) } // Use TypeORM's In operator
+      });
+
+      if (changes.length === 0) {
+        console.log('No changes found in DB for the selected IDs, processing skipped.');
+        this.isProcessing = false;
+        // If there are more changes in the queue, schedule next batch
+        if (this.changeQueue.size > 0) {
+          this.scheduleProcessing();
+        }
+        return;
+      }
+
+      console.log(`Processing ${changes.length} outgoing changes (TypeORM)`);
+
+      // Optimize outgoing changes (this method likely needs refactoring too if it accesses DB)
+      const optimizedChanges = await this.optimizeOutgoingChanges(changes);
+      console.log(`Optimized ${changes.length} changes to ${optimizedChanges.length}`);
+
+      if (optimizedChanges.length === 0) {
+          console.log('All changes were optimized out, nothing to send.');
+          this.isProcessing = false;
+          if (this.changeQueue.size > 0) {
+            this.scheduleProcessing();
+          }
+          return;
+      }
+
+      // Convert changes to the format expected by the server
+      const clientId = this.syncManager.getClientId();
+      const tableChanges = optimizedChanges.map(change => {
+        // Assuming change.data is already an object from TypeORM entity
+        const changeDataSnake = this.convertKeysToSnakeCase(change.data);
+        return {
+          table: change.table,
+          operation: change.operation as 'insert' | 'update' | 'delete', // Cast if necessary
+          data: {
+            ...changeDataSnake,
+            client_id: clientId
+          }
+        };
+      });
+
+      // Send changes to the server
+      const success = this.syncManager.send({
+        type: 'clt_send_changes',
+        clientId: this.syncManager.getClientId(),
+        messageId: `changes_${Date.now()}`,
+        timestamp: Date.now(),
+        changes: tableChanges
+      });
+
+      if (success) {
+        // Record sent time for each change ID that was *attempted*
+        const now = Date.now();
+        // Use the original changeIds array from the queue for tracking sent attempts
+        changeIds.forEach(id => this.sentChanges.set(id, now));
+
+        // Emit event with the original changeIds
+        this.events.emit('changes_sent', {
+          changeIds, // Use original IDs from queue
+          messageId: `changes_${now}`
+        });
+        console.log(`Sent ${tableChanges.length} changes to server (orig IDs: ${changeIds.length})`);
+      } else {
+        console.warn('Failed to send changes, putting IDs back in queue');
+        // Put changes back in the queue for retry
+        changeIds.forEach(id => this.changeQueue.add(id));
+        // No need to schedule processing here, rely on connection events or manual trigger
+      }
+    } catch (error) {
+      console.error('SyncChangeManager: Error processing changes using TypeORM:', error);
+      // Re-queue the failed batch IDs if an error occurs during DB load or processing
+      const changeIds = Array.from(this.changeQueue).slice(0, MAX_CHANGES_PER_BATCH);
+      changeIds.forEach(id => this.changeQueue.add(id));
+
+      // Re-enable processing after a delay
+      setTimeout(() => {
+        this.isProcessing = false;
+        // Maybe schedule processing here if appropriate for the error type
+        // this.scheduleProcessing();
+      }, 5000);
+
+      return;
+    } finally {
+        // Always release processing lock in finally block
+        this.isProcessing = false;
+        // If there are more changes, schedule next batch
+        if (this.changeQueue.size > 0) {
+          this.scheduleProcessing();
+        }
+    }
+  }
+  */
+
+  /**
+   * Optimize outgoing changes to reduce network traffic and improve efficiency
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private async optimizeOutgoingChanges(changes: LocalChanges[]): Promise<LocalChanges[]> {
+    // Group changes by entity (table + id) to find operations on the same entity
+    const entitiesMap = new Map<string, LocalChanges[]>();
+
+    // First, group all changes by entity
+    for (const change of changes) {
+      if (!change.data || typeof change.data !== 'object') continue;
+
+      const id = (change.data as any).id;
+      if (!id) continue;
+
+      const key = `${change.table}:${id}`;
+      if (!entitiesMap.has(key)) {
+        entitiesMap.set(key, []);
+      }
+      entitiesMap.get(key)!.push(change);
+    }
+
+    // Optimize changes for each entity
+    const optimizedChanges: LocalChanges[] = [];
+
+    for (const [key, entityChanges] of entitiesMap.entries()) {
+      // Sort changes by update time to ensure correct order
+      entityChanges.sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
+
+      // Check if there's a delete operation
+      const hasDelete = entityChanges.some(c => c.operation === 'delete');
+
+      if (hasDelete) {
+        // If entity is eventually deleted, just send the delete operation
+        // Find the latest delete operation
+        const deleteOp = entityChanges
+          .filter(c => c.operation === 'delete')
+          .reduce((latest, current) =>
+            latest.updatedAt.getTime() > current.updatedAt.getTime() ? latest : current
+          );
+
+        optimizedChanges.push(deleteOp);
+      } else {
+        // For inserts and updates, only the latest one matters
+        const latestChange = entityChanges.reduce((latest, current) =>
+          latest.updatedAt.getTime() > current.updatedAt.getTime() ? latest : current
+        );
+
+        // If there's an insert followed by updates, convert to a single insert
+        if (entityChanges.some(c => c.operation === 'insert')) {
+          // Use the data from the latest change, but ensure it's an insert operation
+          latestChange.operation = 'insert';
+        }
+
+        optimizedChanges.push(latestChange);
+      }
+    }
+
+    // Filter out any changes that have no real effect (e.g., update with no changed fields)
+    return optimizedChanges;
+  }
+  */
+
+  /**
+   * Check for changes that were sent but not acknowledged
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private checkSentChanges(): void {
+    const now = Date.now();
+    let timedOut = 0;
+
+    // Check for changes that timed out
+    this.sentChanges.forEach((timestamp, changeId) => {
+      if (now - timestamp > CHANGE_TIMEOUT) {
+        // Change timed out - might not have been received by server
+        console.log(`Change ${changeId} timed out waiting for acknowledgment`);
+
+        // Mark as processed to prevent endless loop
+        this.markChangesAsProcessed([changeId], false)
+          .catch(error => console.error('Error marking timed-out change as processed:', error));
+
+        // Remove from sent changes tracking
+        this.sentChanges.delete(changeId);
+
+        // Increment timed out counter
+        timedOut++;
+      }
+    });
+
+    if (timedOut > 0) {
+      console.log(`Marked ${timedOut} timed-out changes as processed to prevent infinite loop`);
+    }
+  }
+  */
+
+  /**
+   * Handle acknowledgment from server that changes were received
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private handleChangesReceived(message: any): void {
+    const { changeIds } = message;
+
+    if (!changeIds || !Array.isArray(changeIds)) {
+      console.warn('SyncChangeManager: Received srv_changes_received without valid changeIds', message);
+      return;
+    }
+
+    console.log(`Server acknowledged receipt of ${changeIds.length} changes`);
+
+    // Emit event for other components (e.g., UI)
+    this.events.emit('changes_acknowledged', {
+      changeIds,
+      messageId: message.messageId // Include original message ID if available
+    });
+  }
+  */
+
+  /**
+   * Handle confirmation from server that changes were applied
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private handleChangesApplied(message: any): void {
+    console.log('Received srv_changes_applied message', message);
+
+    // Extract applied change IDs (server might send entity IDs or LocalChanges IDs)
+    const appliedChangeIds = message.appliedChanges || message.changeIds;
+    const messageId = message.messageId; // Original message ID if available
+
+    if (!appliedChangeIds || !Array.isArray(appliedChangeIds) || appliedChangeIds.length === 0) {
+      console.warn('SyncChangeManager: Received srv_changes_applied without valid appliedChangeIds', message);
+      return;
+    }
+
+    console.log(`Server applied ${appliedChangeIds.length} changes`);
+
+    // Remove from sent changes tracking
+    appliedChangeIds.forEach((id: string) => this.sentChanges.delete(id));
+
+    // Mark these changes as processed in the LocalChanges table
+    // IMPORTANT: This assumes `appliedChangeIds` are the `LocalChanges.id` values.
+    // If they are entity IDs, a lookup will be needed.
+    // For this refactor, we assume the server ACKs with LocalChanges.id
+    // The original `markChangesAsProcessed` was designed for entity IDs from incoming changes.
+    // We need to adapt or ensure server sends LocalChanges IDs for outgoing ACKs.
+
+    // For now, let's assume `appliedChangeIds` are `LocalChanges.id`
+    const appliedEntityIds = appliedChangeIds; // If they are indeed LocalChanges IDs
+
+    this.markChangesAsProcessed(appliedEntityIds, true)
+      .then(() => {
+        console.log(`Successfully marked ${appliedEntityIds.length} LocalChanges as processed based on server ACK.`);
+        // After marking, try to load more unprocessed changes if the queue is empty
+        // This helps ensure continuous processing if more changes were tracked while this batch was in flight.
+        if (this.changeQueue.size === 0) {
+            this.loadUnprocessedChanges().catch((err: Error) =>
+                console.error("Error loading unprocessed changes after applying server changes:", err)
+            );
+        }
+      })
+      .catch(error => console.error('Error marking changes as processed:', error));
+
+    // Emit event
+    this.events.emit('changes_applied', {
+      appliedChangeIds,
+      messageId // Include original message ID if available
+    });
+  }
+  */
+
+  /**
+   * Handle error messages from the server
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private handleServerError(message: any): void {
+    const { error, changeIds } = message;
+
+    console.error('Received error from server:', error);
+
+    // If change IDs are provided, re-queue them
+    if (changeIds && Array.isArray(changeIds)) {
+      console.log(`Re-queueing ${changeIds.length} changes that failed on server`);
+
+      // Remove from sent changes and add back to queue
+      changeIds.forEach(id => this.sentChanges.delete(id));
+
+      // Add back to queue for retry
+      changeIds.forEach(id => this.changeQueue.add(id));
+
+      // Schedule processing for re-queued changes
+      this.scheduleProcessing();
+    }
+
+    // Emit event
+    this.events.emit('sync_error', {
+      error,
+      messageId: message.messageId, // Include original message ID if available
+      changeIds // Include change IDs if available
+    });
+  }
+  */
+
+  /**
+   * Mark changes as processed in the LocalChanges table based on entity IDs
+   * This was originally for incoming changes, needs adaptation for outgoing ACKs.
+   * @param entityIds Array of entity IDs (e.g., Comment.id, Task.id)
+   * @param success Whether the operation was successful
+   */
+  /**
+   * Handle connection state changes from SyncManager
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  // // MOVED TO OutgoingChangeProcessor.ts
+  // // private handleConnectionStateChange(state: string): void {
+  // //   // If connection becomes live, try processing any queued changes
+  // //   if (state === 'live') {
+  // //     console.log(`Connection state changed to ${state}, checking for unprocessed changes`);
+  // //     // Add a small delay to allow other initializations if necessary
+  // //     setTimeout(() => {
+  // //       // Ensure we are still live before processing
+  // //       if (this.syncManager.getState() === 'live') {
+  // //     this.loadUnprocessedChanges().then(() => {
+  // //       if (this.changeQueue.size > 0) {
+  // //         console.log(`Found ${this.changeQueue.size} changes to process after state change to live`);
+  // //         this.scheduleProcessing();
+  // //       }
+  // //     }).catch(error => {
+  // //       console.error('Error loading unprocessed changes on connection state change:', error);
+  // //     });
+  // //       }
+  // //     }, 1000);
+  // //   }
+  // // }
+  */
+
+  /**
+   * Handle WebSocket open event
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private handleWebSocketOpen(): void {
+    // When WebSocket opens, check if we are in a live state and process changes
+    if (this.syncManager.getState() === 'live') {
+      console.log('WebSocket opened and state is live, checking for unprocessed changes');
+      // Add a small delay
+      setTimeout(() => {
+        // Ensure we are still connected and live
+        if (this.syncManager.isConnected() && this.syncManager.getState() === 'live') {
+      this.loadUnprocessedChanges().then(() => {
+        if (this.changeQueue.size > 0) {
+          console.log(`Found ${this.changeQueue.size} changes to process after WebSocket connected`);
+          this.scheduleProcessing();
+        }
+      }).catch(error => {
+        console.error('Error loading unprocessed changes on WebSocket open:', error);
+      });
+        }
+      }, 1000);
+    }
+  }
+  */
+
+  /**
+   * Load unprocessed changes from the database and add them to the queue
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private async loadUnprocessedChanges(): Promise<void> {
+    if (!this.dataSource) {
+      console.warn('SyncChangeManager: Cannot load unprocessed changes, DataSource not initialized.');
+      return;
+    }
+
+    try {
+      console.log('SyncChangeManager: Loading unprocessed changes from DB...');
+      const localChangesRepo = this.dataSource.manager.getRepository(LocalChanges);
+
+      // Find changes not yet processed
+      const unprocessedChanges = await localChangesRepo.find({
+        where: { processedSync: 0 },
+        order: { updatedAt: 'ASC' } // Process oldest first
+      });
+
+      let newChangesAddedToQueue = 0;
+      unprocessedChanges.forEach((change) => {
+        this.changeQueue.add(change.id);
+        newChangesAddedToQueue++;
+      });
+
+      // Update pending count based on DB query for accuracy
+      const newCount = await localChangesRepo.count({ where: { processedSync: 0 } });
+      if (this.pendingChangesCount !== newCount) {
+        this.pendingChangesCount = newCount;
+        this.debouncedUpdatePendingChangesCount();
+      }
+
+      if (newChangesAddedToQueue > 0) {
+        console.log(`SyncChangeManager: Loaded ${newChangesAddedToQueue} unprocessed changes into the queue. Total pending: ${newCount}`);
+        // Schedule processing if changes were loaded
+        this.scheduleProcessing();
+      } else {
+        console.log('SyncChangeManager: No unprocessed changes found.');
+      }
+
+    } catch (error) {
+      console.error('SyncChangeManager: Error loading unprocessed changes:', error);
+      // Schedule a retry?
+      setTimeout(() => this.loadUnprocessedChanges(), 5000);
+    }
+  }
+  */
+
+  /**
+   * Get the client ID
+   */
+  public getClientId(): string {
+    return this.syncManager.getClientId();
+  }
+
+  /**
+   * Manually trigger processing of queued changes
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  public async processQueuedChanges(): Promise<void> {
+    console.log('[SyncChangeManager] Manually triggered change processing');
+
+    // Ensure connected before processing
+    if (!this.syncManager.isConnected()) {
+      console.log('[SyncChangeManager] Not connected, cannot process changes');
+      return;
+    }
+
+    // Load any unprocessed changes first
+    await this.loadUnprocessedChanges();
+
+    // Check if processing is already running
+    if (this.isProcessing) {
+      console.log('[SyncChangeManager] Already processing, request ignored');
+      return;
+    }
+
+    // Use a promise to wait for processing completion
+    return new Promise(resolve => {
+      const checkDone = () => {
+        if (!this.isProcessing && this.changeQueue.size === 0) {
+          console.log('[SyncChangeManager] Manual processing complete');
+          resolve();
+        } else {
+          // Re-check after a short delay
+          setTimeout(checkDone, 100);
+        }
+      };
+
+      // Start processing if there are changes
+      if (this.changeQueue.size > 0) {
+        this.processChanges()
+          .then(checkDone) // Check completion after processing attempt
+          .catch(error => {
+            console.error('[SyncChangeManager] Error during manual processing:', error);
+            resolve(); // Resolve even on error to avoid hanging
+          });
+      } else {
+        console.log('[SyncChangeManager] No changes to process');
+        resolve(); // Resolve immediately if no changes
+      }
+    });
+  }
+  */
+
+  /**
+   * Format values for SQL insertion/update, handling specific types
+   * @param column Column name
+   * @param value Value to format
+   * @param table Table name (optional, for context)
+   * @returns Formatted string suitable for SQL
+   */
+  private formatValueForSQL(column: string, value: any, table: string): string {
+    // Handle null/undefined
+    if (value === null || value === undefined) {
+      return 'NULL';
+    }
+
+    // Handle specific types based on column name or type inspection (if possible)
+    // Example for Task entity enums
+    if (table === 'tasks') {
+      // Handle TaskStatus enum
+      if (column === 'status' && typeof value === 'string') {
+        // Validate against enum values if necessary
+        const validStatuses = Object.values(TaskStatus);
+        if (validStatuses.includes(value as TaskStatus)) {
+          return `'${value.replace(/'/g, "''")}'`; // Escape single quotes
+        } else {
+          console.warn(`Invalid TaskStatus value: ${value}`);
+          return 'NULL'; // Or throw error, or use default
+        }
+      }
+      // Handle TaskPriority enum
+      if (column === 'priority' && typeof value === 'string') {
+        const validPriorities = Object.values(TaskPriority);
+        if (validPriorities.includes(value as TaskPriority)) {
+          return `'${value.replace(/'/g, "''")}'`;
+        } else {
+          console.warn(`Invalid TaskPriority value: ${value}`);
+          return `'medium'`; // Default priority
+        }
+      }
+      // Handle Date types (dueDate, completedAt)
+      if (column === 'dueDate' || column === 'due_date' || column === 'completedAt' || column === 'completed_at') {
+        // Check if it's already an ISO string
+        if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}T/)) {
+          return `'${value.replace(/'/g, "''")}'`;
+        }
+        if (value instanceof Date) {
+          return `'${value.toISOString().replace(/'/g, "''")}'`;
+        }
+        // Attempt to parse if it's a different string format (add more robust parsing if needed)
+        try { return `'${new Date(value).toISOString().replace(/'/g, "''")}'`; } catch (e) { return 'NULL'; }
+      }
+      // Handle tsrange (timeRange) - requires specific formatting '[start, end)'
+      if (column === 'timeRange' || column === 'time_range') {
+        // Assuming value is { from: Date | string, to: Date | string }
+        if (typeof value === 'string') {
+          // Basic check if it looks like a range string already
+          if (value.startsWith('[') && value.endsWith(')')) return `'${value.replace(/'/g, "''")}'`;
+          return 'NULL'; // Cannot parse unknown string format
+        }
+        if (typeof value === 'object' && value.from && value.to) {
+          const from = value.from instanceof Date ? value.from.toISOString() : value.from;
+          const to = value.to instanceof Date ? value.to.toISOString() : value.to;
+          return `'[${from}, ${to})'`;
+        }
+        return 'NULL';
+      }
+      // Handle interval (estimatedDuration) - e.g., '1 hour', '2 days'
+      if (column === 'estimatedDuration' || column === 'estimated_duration') {
+        if (typeof value === 'string') {
+          // Basic interval format check (this is simplified)
+          if (value.match(/^\d+\s+(hour|day|week|month)s?$/)) {
+            return `'${value.replace(/'/g, "''")}'`;
+          }
+        }
+        // Add more robust interval parsing/formatting if needed
+        return 'NULL';
+      }
+      // Handle text array (tags)
+      if (column === 'tags' && Array.isArray(value)) {
+        // Format as '{ "tag1", "tag2" }'
+        const arrayStr = value.map(item => `"${String(item).replace(/"/g, '\\"')}"`).join(',');
+        return `'{${arrayStr}}'`;
+      }
+    }
+
+    // Handle general types
+    if (typeof value === 'string') {
+      // Escape single quotes for SQL strings
+      return `'${value.replace(/'/g, "''")}'`;
+    }
+    if (value instanceof Date) {
+      // Format dates as ISO strings
+      return `'${value.toISOString()}'`;
+    }
+    if (typeof value === 'boolean') {
+      // Convert booleans to true/false literals
+      return value ? 'true' : 'false';
+    }
+    if (typeof value === 'number') {
+      // Numbers are used directly
+      return String(value);
+    }
+    if (typeof value === 'object') {
+      // Stringify JSON objects/arrays
+      try {
+        return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+      } catch (e) {
+        console.error(`Error stringifying object for column ${column}:`, value, e);
+        return 'NULL';
+      }
+    }
+
+    // Fallback for unknown types
+    console.warn(`Unhandled type for column ${column}: ${typeof value}`);
+    return `'${String(value).replace(/'/g, "''")}'`;
+  }
+
+  /**
+   * Initialize event listeners for messages from SyncManager
+   */
+  private initializeEventListeners(): void {
+    // Listen for connection state changes (relevant for outgoing processing)
+    // this.syncManager.on('stateChange', this.handleConnectionStateChange.bind(this)); // MOVED or to be refactored
+    // this.syncManager.on('websocket:open', this.handleWebSocketOpen.bind(this)); // MOVED or to be refactored
+
+    // Listen for server messages related to outgoing changes
+    // this.syncManager.on('srv_changes_received', this.handleChangesReceived.bind(this)); // MOVED or to be refactored
+    // this.syncManager.on('srv_changes_applied', this.handleChangesApplied.bind(this)); // MOVED or to be refactored
+    // this.syncManager.on('srv_error', this.handleServerError.bind(this)); // MOVED or to be refactored
+
+    // Listen for incoming changes to process
+    // The 'process_changes' event should carry the changes and a callback
+    // this.syncManager.on('process_changes', this.handleProcessChanges.bind(this)); // MOVED to be handled by IncomingChangeProcessor logic
+
+    // Listen for explicit request to process all changes (e.g., after manual sync trigger)
+    this.syncManager.on('process_all_changes', (event: any) => {
+      console.log('[SyncChangeManager] Received process_all_changes event.');
+      // MOVED TO OutgoingChangeProcessor.ts
+      /*
+      this.loadUnprocessedChanges().then(() => {
+        if (this.changeQueue.size > 0) {
+          console.log(`[SyncChangeManager] Processing ${this.changeQueue.size} changes after explicit request`);
+          this.scheduleProcessing();
+        }
+      }).catch(error => {
+        console.error('[SyncChangeManager] Error processing all changes event:', error);
+      });
+      */
+    });
+
+    // Periodically check for timed-out sent changes
+    // MOVED TO OutgoingChangeProcessor.ts
+    // setInterval(this.checkSentChanges.bind(this), 5000);
+  }
+
+  /**
+   * Convert object keys from camelCase to snake_case for server compatibility
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  private convertKeysToSnakeCase(obj: any): any {
+    // Helper function to convert camelCase to snake_case
+    const convert = (str: string) => str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+
+    if (!obj || typeof obj !== 'object') return obj;
+    if (obj instanceof Date) return obj.toISOString();
+    if (Array.isArray(obj)) return obj.map(item => this.convertKeysToSnakeCase(item));
+
+    const result: Record<string, any> = {};
+    Object.entries(obj).forEach(([key, value]) => {
+      result[convert(key)] = this.convertKeysToSnakeCase(value);
+    });
+    return result;
+  }
+  */
+
+  /**
+   * Process incoming changes from the server using TypeORM
+   * @param changes Array of TableChange objects
+   * @returns Promise<boolean> indicating success
+   */
+  // MOVED TO db/change-processor.ts via IncomingChangeProcessor bridge
+  /*
+  public async processIncomingChanges(changes: TableChange[]): Promise<boolean> {
+    if (!this.dataSource) {
+      console.error("SyncChangeManager: DataSource not initialized for processing incoming changes.");
+      await this.initializeIfNeeded(); // Attempt to initialize
+      if (!this.dataSource) return false; // Return false if still not initialized
+    }
+    if (changes.length === 0) {
+      console.log('SyncChangeManager: No incoming changes to process.');
+      return true; // No changes means success
+    }
+
+    console.log(`SyncChangeManager: Processing ${changes.length} incoming changes from server (TypeORM)`);
+
+    // Group changes by table for batch processing
+    const changesByTable: Record<string, { inserts: any[], updates: any[], deletes: string[] }> = {};
+
+    for (const change of changes) {
+      // Basic validation
+      if (!change || !change.table || !change.operation || !change.data) {
+        console.warn('SyncChangeManager: Skipping invalid incoming change:', change);
+        continue;
+      }
+      // Validate table name against known entities
+      if (!this.isValidTable(change.table)) {
+          console.warn(`SyncChangeManager: Skipping change for unknown or unsupported table: ${change.table}`);
+          continue;
+      }
+
+      const tableName = change.table; // Use conceptual table name
+      if (!changesByTable[tableName]) {
+        changesByTable[tableName] = { inserts: [], updates: [], deletes: [] };
+      }
+
+      // Map incoming data (snake_case) to entity properties (camelCase)
+      // This mapping needs to be specific per entity type
+      // For now, assume a generic mapping or direct use if properties match
+      const entityData = this.mapIncomingDataToEntityProperties(change.data); // Use mapping function
+
+      switch (change.operation) {
+        case 'insert':
+          changesByTable[tableName].inserts.push(entityData);
+          break;
+        case 'update':
+          // Ensure ID is present for updates
+          if (!entityData.id) {
+            console.warn(`SyncChangeManager: Skipping update for table ${tableName} due to missing ID:`, entityData);
+            continue;
+          }
+          changesByTable[tableName].updates.push(entityData);
+          break;
+        case 'delete':
+          // Ensure ID is present for deletes
+          const entityId = change.data.id as string;
+          if (!entityId) {
+            console.warn(`SyncChangeManager: Skipping delete for table ${tableName} due to missing ID:`, change.data);
+            continue;
+          }
+          changesByTable[tableName].deletes.push(entityId);
+          break;
+        default:
+          console.warn(`SyncChangeManager: Skipping change with unknown operation: ${change.operation}`);
+      }
+    }
+
+    // Process changes within a transaction
+    let success = true;
+    try {
+      await this.dataSource.manager.transaction(async (transactionalEntityManager: EntityManager) => {
+        for (const tableName of Object.keys(changesByTable)) {
+          const { inserts, updates, deletes } = changesByTable[tableName];
+          const repository = this.getEntityRepository(transactionalEntityManager, tableName);
+
+          if (!repository) {
+            console.error(`SyncChangeManager: No repository found for table ${tableName}. Skipping changes.`);
+            continue; // Skip this table if no repository
+          }
+
+          // Process deletes first
+          if (deletes.length > 0) {
+            console.log(`SyncChangeManager: Deleting ${deletes.length} records from ${tableName}`);
+            await repository.delete(deletes);
+          }
+
+          // Process inserts/updates (use save for both insert and update)
+          const recordsToSave = [...inserts, ...updates];
+          if (recordsToSave.length > 0) {
+            console.log(`SyncChangeManager: Saving ${recordsToSave.length} records (inserts/updates) to ${tableName}`);
+            // Special handling for comments due to potential parent dependencies
+            if (tableName === 'comments') {
+                await this._processCommentChanges(
+                    transactionalEntityManager,
+                    inserts as Comment[], // Cast needed here
+                    updates as Comment[]  // Cast needed here
+                );
+            } else {
+                // Use save without chunking option
+                await repository.save(recordsToSave as any); // Use 'as any' to bypass complex overload issue for now
+            }
+          }
+        }
+      });
+      console.log('SyncChangeManager: Successfully processed incoming changes batch.');
+    } catch (error) {
+      console.error('SyncChangeManager: Error processing incoming changes batch:', error);
+      success = false;
+      // TODO: Implement more robust error handling (e.g., retry logic, specific error types)
+    }
+
+    return success;
+  }
+  */
+
+  /**
+   * Handles the 'process_changes' event emitted by SyncManager
+   */
+  // MOVED: This logic is being superseded by IncomingChangeProcessor and its integration.
+  /*
+  private handleProcessChanges(event: { type: string; changes: TableChange[]; callback: (success: boolean) => void }): void {
+    const { type, changes, callback } = event;
+    // Basic validation
+    console.log(`[SyncChangeManager] 🛠️ Starting handleProcessChanges for ${type} with ${changes?.length} changes`);
+
+    if (!changes || !Array.isArray(changes)) {
+      console.error(`[SyncChangeManager] Invalid changes array received for ${type}`);
+      if (callback && typeof callback === 'function') callback(false); // Call callback if provided
+      return;
+    }
+
+    const startTime = performance.now();
+    console.log(`[SyncChangeManager] 📥 Processing ${changes.length} changes (${type})`);
+
+    // Ensure dataSource is initialized before processing
+    this.initializeIfNeeded()
+      // .then(() => this.processIncomingChanges(changes)) // This was the problematic call
+      .then((success: boolean) => {
+        const endTime = performance.now();
+        const processingTime = (endTime - startTime).toFixed(2);
+        if (success) {
+          console.log(`[SyncChangeManager] ✅ Processed ${changes.length} changes (${type}) in ${processingTime}ms`);
+          // Emit event or update state as needed
+          this.events.emit('incoming_changes_processed', {
+            success: true,
+            count: changes.length,
+            type // e.g., 'initial', 'catchup', 'live'
+          });
+          // Call the callback provided by SyncManager
+          if (callback && typeof callback === 'function') callback(true);
+        } else {
+          console.error(`[SyncChangeManager] ❌ Failed to process some changes from ${type} (took ${processingTime}ms)`);
+          // Emit event or update state as needed
+          this.events.emit('incoming_changes_processed', {
+            success: false,
+            error: `Failed to process some changes from ${type}`,
+            count: changes.length,
+            type
+          });
+          // Call the callback provided by SyncManager
+          if (callback && typeof callback === 'function') callback(false);
+        }
+      })
+      .catch((error: Error) => {
+        const endTime = performance.now();
+        const processingTime = (endTime - startTime).toFixed(2);
+        console.error(`[SyncChangeManager] ❌ Error handling ${type} changes (took ${processingTime}ms):`, error);
+        // Emit event or update state as needed
+        this.events.emit('incoming_changes_processed', {
+          success: false,
+          error: error instanceof Error ? error.message : `Error processing ${type} changes`,
+          count: changes.length,
+          type
+        });
+        // Call the callback provided by SyncManager
+        if (callback && typeof callback === 'function') callback(false);
+      });
+  }
+  */
+
+
+  /**
+   * Get the current size of the outgoing change queue
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  public getQueueSize(): number {
+    return this.pendingChangesCount;
+  }
+  */
+
+  /**
+   * Allow external components to subscribe to events
+   */
+  public on(event: string, listener: (...args: any[]) => void): void {
+    this.events.on(event, listener);
+  }
+
+  /**
+   * Allow external components to unsubscribe from events
+   */
+  public off(event: string, listener: (...args: any[]) => void): void {
+    this.events.off(event, listener);
+  }
+
+  // mapIncomingDataToEntityProperties was moved to apps/web/src/db/sync-adapters.ts (CommentSyncAdapter)
+  // _processCommentChanges was moved to apps/web/src/db/sync-adapters.ts (CommentSyncAdapter)
+
+
+  /**
+   * Ensure the DataSource is initialized before performing operations
+   */
+  private async initializeIfNeeded(): Promise<void> {
+    if (!this.dataSource || !this.dataSource.isInitialized) {
+      console.log("SyncChangeManager: DataSource not initialized, attempting initialization...");
+      await this.initializeDataSourceAndLoadChanges();
+    }
+  }
+
+  /**
+   * Get pending changes (for debugging or status display)
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  public async getPendingChanges(): Promise<TableChange[]> {
+    try {
+      await this.initializeIfNeeded();
+
+      if (!this.dataSource) {
+        console.error("SyncChangeManager: DataSource not initialized for getPendingChanges.");
+        return [];
+      }
+
+      const changeRepo = this.dataSource.getRepository(LocalChanges);
+      const pendingChanges = await changeRepo.find({
+        where: { processedSync: 0 },
+        order: { updatedAt: 'ASC' }
+      });
+
+      // Convert LocalChanges entities to TableChange format if needed
+      return pendingChanges.map(change => ({
+        table: change.table,
+        operation: change.operation as 'insert' | 'update' | 'delete',
+        data: change.data, // Assuming data is already in the correct format
+        updated_at: change.updatedAt.toISOString() // Ensure ISO string format
+      }));
+
+    } catch (error) {
+      console.error('SyncChangeManager: Error getting pending changes:', error);
+      return [];
+    }
+  }
+  */
+
+  /**
+   * Clear all unprocessed changes from the LocalChanges table
+   */
+  // MOVED TO OutgoingChangeProcessor.ts
+  /*
+  public async clearUnprocessedChanges(): Promise<void> {
+    try {
+      await this.initializeIfNeeded();
+
+      if (!this.dataSource) {
+        console.error("SyncChangeManager: DataSource not initialized for clearUnprocessedChanges.");
+        return;
+      }
+
+      console.log('SyncChangeManager: Clearing all unprocessed local changes...');
+      const changeRepo = this.dataSource.getRepository(LocalChanges);
+      const deleteResult = await changeRepo.delete({ processedSync: 0 });
+
+      console.log(`SyncChangeManager: Cleared ${deleteResult.affected || 0} unprocessed changes.`);
+
+      // Reset queue and counts
+      this.changeQueue.clear();
+      this.sentChanges.clear();
+      this.pendingChangesCount = await changeRepo.count({ where: { processedSync: 0 } });
+
+      // Notify SyncManager
+      this.events.emit('sync:pendingChangesUpdated', this.pendingChangesCount);
+
+    } catch (error) {
+      console.error('SyncChangeManager: Error clearing unprocessed changes:', error);
+    }
+  }
+  */
+}

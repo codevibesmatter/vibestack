@@ -1,7 +1,8 @@
-import { db, DbTask, DbUser, DbProject, DbComment } from './db';
-import { TaskStatus, TaskPriority } from '@repo/dataforge/client-entities';
 import { v4 as uuidv4 } from 'uuid';
-import { SyncChangeManager } from '../sync/SyncChangeManager.typeorm';
+import { OutgoingChangeProcessor } from '../sync/OutgoingChangeProcessor';
+import { DeepPartial } from 'typeorm';
+import { User, Project, Task, Comment, TaskStatus, TaskPriority } from '@repo/dataforge/client-entities';
+import { UserRepository, ProjectRepository, TaskRepository, CommentRepository } from './repositories';
 
 /**
  * Data service error class
@@ -14,543 +15,367 @@ export class DatabaseServiceError extends Error {
 }
 
 /**
- * User service for user-related operations
+ * Base service with common CRUD operations
  */
-export const UserService = {
-  /**
-   * Get a user by ID
-   */
-  async getById(id: string) {
-    try {
-      return await db.users.get(id);
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to get user with ID ${id}`,
-        'getById',
-        error
-      );
-    }
-  },
+abstract class BaseService<T extends object> {
+  constructor(
+    protected repository: any,
+    protected tableName: string,
+    protected syncChangeManager: OutgoingChangeProcessor
+  ) {}
 
-  /**
-   * Get all users
-   */
-  async getAll() {
+  // UI-initiated operations (track changes)
+  
+  async getAll(): Promise<T[]> {
     try {
-      return await db.users.toArray();
+      return await this.repository.findAll();
     } catch (error) {
       throw new DatabaseServiceError(
-        'Failed to get all users',
+        `Failed to get all ${this.tableName}`,
         'getAll',
         error
       );
     }
-  },
-
-  /**
-   * Create a new user
-   */
-  async create(user: Partial<DbUser> & { name: string; email: string }) {
+  }
+  
+  // Sync-initiated operations (don't track changes)
+  
+  async createFromSync(data: DeepPartial<T>): Promise<T> {
     try {
-      const now = new Date();
-      const userId = user.id || uuidv4();
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
-
-      const newUser = {
-        id: userId,
-        name: user.name,
-        email: user.email,
-        // Add other default fields if necessary for DbUser
-        createdAt: now,
-        updatedAt: now
-      } as DbUser;
-
-      await db.transaction('rw', [db.users, db.localChanges], async () => {
-        await db.users.add(newUser);
-        await changeManager.trackChange(
-          'users',
-          'insert',
-          newUser as unknown as Record<string, unknown>
-        );
-      });
-
-      console.log(`User created: ${userId}`, newUser);
-      return newUser;
+      return await this.repository.create(data);
     } catch (error) {
       throw new DatabaseServiceError(
-        `Failed to create user "${user.name}"`,
-        'create',
+        `Failed to create ${this.tableName} from sync`,
+        'createFromSync',
         error
       );
     }
-  },
+  }
 
-  /**
-   * Update an existing user
-   */
-  async update(id: string, changes: Partial<DbUser>) {
+  async updateFromSync(id: string, data: DeepPartial<T>): Promise<T> {
+    try {
+      console.log(`[${this.tableName.toUpperCase()}_SERVICE] Attempting to update from sync. ID: ${id}, Data:`,
+        JSON.stringify(data, null, 2));
+      return await this.repository.update(id, data);
+    } catch (error) {
+      console.error(`[${this.tableName.toUpperCase()}_SERVICE] Failed to update ${this.tableName} from sync. ID: ${id}`);
+      console.error(`[${this.tableName.toUpperCase()}_SERVICE] Error details:`,
+        error instanceof Error ? { message: error.message, stack: error.stack } : String(error));
+      console.error(`[${this.tableName.toUpperCase()}_SERVICE] Data that failed:`, JSON.stringify(data, null, 2));
+      
+      // If it's a TypeORM error, try to extract more details
+      if (error && typeof error === 'object' && 'name' in error && error.name === 'QueryFailedError') {
+        const queryError = error as any; // TypeORM QueryFailedError
+        console.error(`[${this.tableName.toUpperCase()}_SERVICE] SQL Error:`, {
+          query: queryError.query,
+          parameters: queryError.parameters,
+          driverError: queryError.driverError
+        });
+      }
+      
+      throw new DatabaseServiceError(
+        `Failed to update ${this.tableName} from sync`,
+        'updateFromSync',
+        error
+      );
+    }
+  }
+
+  async deleteFromSync(id: string): Promise<boolean> {
+    try {
+      return await this.repository.delete(id);
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to delete ${this.tableName} from sync`,
+        'deleteFromSync',
+        error
+      );
+    }
+  }
+public getRepo(): any { // Or a more specific Repository base type
+    return this.repository;
+  }
+}
+
+/**
+ * User service
+ */
+export class UserService extends BaseService<User> {
+  constructor(
+    protected userRepository: UserRepository,
+    protected syncChangeManager: OutgoingChangeProcessor
+  ) {
+    super(userRepository, 'users', syncChangeManager);
+  }
+
+  async get(id: string): Promise<User | null> {
+    try {
+      return await this.repository.findById(id);
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to get user with ID ${id}`,
+        'get',
+        error
+      );
+    }
+  }
+
+  async createUser(userData: { name: string; email: string }): Promise<User> {
     try {
       const now = new Date();
-      let updatedUser: DbUser | null = null;
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
+      const userId = uuidv4();
+      
+      const newUser = {
+        id: userId,
+        name: userData.name,
+        email: userData.email,
+        createdAt: now,
+        updatedAt: now
+      } as User;
 
-      await db.transaction('rw', [db.users, db.localChanges], async () => {
-        const user = await db.users.get(id);
-        if (!user) {
-          throw new Error(`User with ID ${id} not found`);
-        }
+      const createdUser = await this.repository.create(newUser);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'insert',
+        createdUser as unknown as Record<string, unknown>
+      );
+      
+      return createdUser;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        'Failed to create user',
+        'createUser',
+        error
+      );
+    }
+  }
 
-        // Create updated user object
-        updatedUser = {
-          ...user,
-          ...changes,
-          updatedAt: now
-        };
-
-        // Update the user in the database
-        await db.users.update(id, { ...changes, updatedAt: now });
-
-        await changeManager.trackChange(
-          'users',
-          'update',
-          updatedUser as unknown as Record<string, unknown>
-        );
-      });
-
-      if (!updatedUser) {
-        throw new Error(`Failed to update user with ID ${id}`);
+  async updateUser(id: string, changes: Partial<User>): Promise<User> {
+    try {
+      const user = await this.repository.findById(id);
+      if (!user) {
+        throw new Error(`User with ID ${id} not found`);
       }
-
-      console.log(`User updated: ${id}`, updatedUser);
+      
+      const updatedData = {
+        ...changes,
+        updatedAt: new Date()
+      } as DeepPartial<User>;
+      
+      const updatedUser = await this.repository.update(id, updatedData);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'update',
+        updatedUser as unknown as Record<string, unknown>
+      );
+      
       return updatedUser;
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to update user with ID ${id}`,
-        'update',
-        error
-      );
-    }
-  },
-
-  /**
-   * Delete a user
-   */
-  async delete(id: string) {
-    try {
-      const changeManager = SyncChangeManager.getInstance();
-      let userId: string = id;
-
-      await db.transaction('rw', [db.users, db.localChanges], async () => {
-        const deletedUser = await db.users.get(id);
-        if (!deletedUser) {
-          console.log(`User with ID ${id} not found for deletion, likely already deleted.`);
-          return;
-        }
-        userId = deletedUser.id;
-
-        await db.users.delete(id);
-        await changeManager.trackChange(
-          'users',
-          'delete',
-          { id: userId } as unknown as Record<string, unknown>
-        );
-      });
-
-      console.log(`User deleted: ${userId}`);
-      return { id: userId, deleted: true };
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to delete user with ID ${id}`,
-        'delete',
+        'updateUser',
         error
       );
     }
   }
-};
+
+  async deleteUser(id: string): Promise<boolean> {
+    try {
+      const user = await this.repository.findById(id);
+      if (!user) {
+        throw new Error(`User with ID ${id} not found`);
+      }
+      
+      const success = await this.repository.delete(id);
+      
+      // Track change for sync
+      if (success) {
+        await this.syncChangeManager.trackChange(
+          this.tableName,
+          'delete',
+          { id } as unknown as Record<string, unknown>
+        );
+      }
+      
+      return success;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to delete user with ID ${id}`,
+        'deleteUser',
+        error
+      );
+    }
+  }
+}
 
 /**
- * Project service for project-related operations
+ * Project service
  */
-export const ProjectService = {
-  /**
-   * Get a project by ID
-   */
-  async getById(id: string) {
+export class ProjectService extends BaseService<Project> {
+  constructor(
+    protected projectRepository: ProjectRepository,
+    protected syncChangeManager: OutgoingChangeProcessor
+  ) {
+    super(projectRepository, 'projects', syncChangeManager);
+  }
+
+  async get(id: string): Promise<Project | null> {
     try {
-      return await db.projects.get(id);
+      return await this.repository.findById(id);
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to get project with ID ${id}`,
-        'getById',
+        'get',
         error
       );
     }
-  },
+  }
 
-  /**
-   * Get all projects
-   */
-  async getAll() {
-    try {
-      return await db.projects.toArray();
-    } catch (error) {
-      throw new DatabaseServiceError(
-        'Failed to get all projects',
-        'getAll',
-        error
-      );
-    }
-  },
-
-  /**
-   * Create a new project
-   */
-  async create(project: Partial<DbProject> & { name: string }) {
+  async createProject(projectData: { name: string; description?: string; ownerId?: string }): Promise<Project> {
     try {
       const now = new Date();
-      const projectId = project.id || uuidv4();
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
-
+      const projectId = uuidv4();
+      
       const newProject = {
         id: projectId,
-        name: project.name,
-        description: project.description || '',
-        ownerId: project.ownerId || null, // Allow owner to be optional for now
-        status: project.status || 'active', // Assuming a default status
+        name: projectData.name,
+        description: projectData.description || '',
+        ownerId: projectData.ownerId || null,
+        status: 'active', // Default status
         createdAt: now,
         updatedAt: now
-      } as DbProject;
+      } as Project;
 
-      await db.transaction('rw', [db.projects, db.localChanges], async () => {
-        await db.projects.add(newProject);
-        await changeManager.trackChange(
-          'projects',
-          'insert',
-          newProject as unknown as Record<string, unknown>
-        );
+      const createdProject = await this.repository.create(newProject);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'insert',
+        createdProject as unknown as Record<string, unknown>
+      );
+      
+      // Dispatch custom event to notify UI of project creation
+      const event = new CustomEvent('project-created', { 
+        detail: { project: createdProject } 
       });
-
-      console.log(`Project created: ${projectId}`, newProject);
-      return newProject;
+      window.dispatchEvent(event);
+      console.log('[ProjectService] Dispatched project-created event');
+      
+      return createdProject;
     } catch (error) {
       throw new DatabaseServiceError(
-        `Failed to create project "${project.name}"`,
-        'create',
+        `Failed to create project "${projectData.name}"`,
+        'createProject',
         error
       );
     }
-  },
+  }
 
-  /**
-   * Update an existing project
-   */
-  async update(id: string, changes: Partial<DbProject>) {
+  async updateProject(id: string, changes: Partial<Project>): Promise<Project> {
     try {
-      const now = new Date();
-      let updatedProject: DbProject | null = null;
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
-
-      await db.transaction('rw', [db.projects, db.localChanges], async () => {
-        const project = await db.projects.get(id);
-        if (!project) {
-          throw new Error(`Project with ID ${id} not found`);
-        }
-
-        // Create updated project object
-        updatedProject = {
-          ...project,
-          ...changes,
-          updatedAt: now
-        };
-
-        // Update the project in the database
-        await db.projects.update(id, { ...changes, updatedAt: now });
-
-        await changeManager.trackChange(
-          'projects',
-          'update',
-          updatedProject as unknown as Record<string, unknown>
-        );
-      });
-
-      if (!updatedProject) {
-        throw new Error(`Failed to update project with ID ${id}`);
+      const project = await this.repository.findById(id);
+      if (!project) {
+        throw new Error(`Project with ID ${id} not found`);
       }
-
-      console.log(`Project updated: ${id}`, updatedProject);
+      
+      const updatedData = {
+        ...changes,
+        updatedAt: new Date()
+      } as DeepPartial<Project>;
+      
+      const updatedProject = await this.repository.update(id, updatedData);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'update',
+        updatedProject as unknown as Record<string, unknown>
+      );
+      
+      // Dispatch custom event to notify UI of project update
+      const event = new CustomEvent('project-updated', { 
+        detail: { project: updatedProject } 
+      });
+      window.dispatchEvent(event);
+      console.log('[ProjectService] Dispatched project-updated event');
+      
       return updatedProject;
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to update project with ID ${id}`,
-        'update',
-        error
-      );
-    }
-  },
-
-  /**
-   * Delete a project
-   */
-  async delete(id: string) {
-    try {
-      const changeManager = SyncChangeManager.getInstance();
-      let projectId: string = id;
-
-      await db.transaction('rw', [db.projects, db.localChanges], async () => {
-        const deletedProject = await db.projects.get(id);
-        if (!deletedProject) {
-          // If already deleted, maybe just log and exit gracefully in a debug context?
-          console.log(`Project with ID ${id} not found for deletion, likely already deleted.`);
-          return; 
-          // Or throw: throw new Error(`Project with ID ${id} not found`);
-        }
-        projectId = deletedProject.id;
-
-        await db.projects.delete(id);
-        await changeManager.trackChange(
-          'projects',
-          'delete',
-          { id: projectId } as unknown as Record<string, unknown>
-        );
-      });
-
-      console.log(`Project deleted: ${projectId}`);
-      return { id: projectId, deleted: true };
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to delete project with ID ${id}`,
-        'delete',
+        'updateProject',
         error
       );
     }
   }
-};
 
-/**
- * Task service for task-related operations
- * Now with integrated sync change tracking
- */
-export const TaskService = {
-  /**
-   * Create a new task
-   */
-  async create(task: Partial<DbTask> & { title: string; projectId: string }) {
+  async deleteProject(id: string): Promise<boolean> {
     try {
-      const now = new Date();
-      const taskId = task.id || uuidv4();
-      
-      // Get instance of SyncChangeManager
-      const changeManager = SyncChangeManager.getInstance();
-      
-      // Get current client ID for change tracking
-      const clientId = changeManager.getClientId();
-      
-      // Create task object with defaults
-      const newTask = {
-        id: taskId,
-        title: task.title,
-        description: task.description || '',
-        status: task.status || TaskStatus.OPEN,
-        priority: task.priority || TaskPriority.MEDIUM,
-        projectId: task.projectId,
-        assigneeId: task.assigneeId || null,
-        dueDate: task.dueDate || null,
-        timeRange: task.timeRange || null,
-        estimatedDuration: task.estimatedDuration || null,
-        completedAt: undefined,
-        tags: task.tags || [],
-        createdAt: now,
-        updatedAt: now
-      } as DbTask;
-
-      // Create transaction for atomicity
-      await db.transaction('rw', [db.tasks, db.localChanges], async () => {
-        // Add the task to the database
-        await db.tasks.add(newTask);
-        
-        // Track the change using the SyncChangeManager
-        await changeManager.trackChange(
-          'tasks',
-          'insert', 
-          newTask as unknown as Record<string, unknown>
-        );
-      });
-      
-      console.log(`Task created: ${taskId}`, newTask);
-      return newTask;
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to create task "${task.title}"`,
-        'create',
-        error
-      );
-    }
-  },
-
-  /**
-   * Update an existing task
-   */
-  async update(id: string, changes: Partial<DbTask>) {
-    try {
-      const now = new Date();
-      let updatedTask: DbTask | null = null;
-      
-      // Get instance of SyncChangeManager
-      const changeManager = SyncChangeManager.getInstance();
-      
-      // Get current client ID for change tracking
-      const clientId = changeManager.getClientId();
-      
-      // Create transaction for atomicity
-      await db.transaction('rw', [db.tasks, db.localChanges], async () => {
-        // Ensure the task exists
-        const task = await db.tasks.get(id);
-        if (!task) {
-          throw new Error(`Task with ID ${id} not found`);
-        }
-
-        // Create updated task object - set client_id to mark our ownership
-        updatedTask = {
-          ...task,
-          ...changes,
-          updatedAt: now
-        };
-
-        // Update the task in the database - use changes object directly
-        await db.tasks.update(id, changes);
-        
-        // Track the change using the SyncChangeManager
-        await changeManager.trackChange(
-          'tasks',
-          'update',
-          updatedTask as unknown as Record<string, unknown>
-        );
-      });
-      
-      if (!updatedTask) {
-        throw new Error(`Failed to update task with ID ${id}`);
+      const project = await this.repository.findById(id);
+      if (!project) {
+        throw new Error(`Project with ID ${id} not found`);
       }
       
-      console.log(`Task updated: ${id}`, updatedTask);
-      return updatedTask;
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to update task with ID ${id}`,
-        'update',
-        error
-      );
-    }
-  },
-
-  /**
-   * Delete a task
-   */
-  async delete(id: string) {
-    try {
-      const now = new Date();
-      let taskId: string = id;
+      const success = await this.repository.delete(id);
       
-      // Get instance of SyncChangeManager
-      const changeManager = SyncChangeManager.getInstance();
-      
-      // Create transaction for atomicity
-      await db.transaction('rw', [db.tasks, db.localChanges], async () => {
-        // Ensure the task exists and get its data for the change record
-        const deletedTask = await db.tasks.get(id);
-        if (!deletedTask) {
-          throw new Error(`Task with ID ${id} not found`);
-        }
-        
-        // Save the task ID
-        taskId = deletedTask.id;
-
-        // Delete the task from the database
-        await db.tasks.delete(id);
-        
-        // Track the change using the SyncChangeManager
-        await changeManager.trackChange(
-          'tasks',
+      // Track change for sync
+      if (success) {
+        await this.syncChangeManager.trackChange(
+          this.tableName,
           'delete',
-          { id: taskId } as unknown as Record<string, unknown>
+          { id } as unknown as Record<string, unknown>
         );
-      });
+        
+        // Dispatch custom event to notify UI of project deletion
+        const event = new CustomEvent('project-deleted', { 
+          detail: { projectId: id } 
+        });
+        window.dispatchEvent(event);
+        console.log('[ProjectService] Dispatched project-deleted event');
+      }
       
-      console.log(`Task deleted: ${taskId}`);
-      return { id: taskId, deleted: true };
+      return success;
     } catch (error) {
       throw new DatabaseServiceError(
-        `Failed to delete task with ID ${id}`,
-        'delete',
+        `Failed to delete project with ID ${id}`,
+        'deleteProject',
         error
       );
     }
-  },
+  }
+}
 
-  /**
-   * Update a task's status
-   */
-  async updateStatus(id: string, status: TaskStatus) {
-    // This is a specific type of update that only changes the status
-    // and optionally the completedAt date for completed tasks
-    const changes: Partial<DbTask> = {
-      status
-    };
-    
-    // Add completedAt date if marking as completed
-    if (status === TaskStatus.COMPLETED) {
-      changes.completedAt = new Date();
-    } else {
-      // Clear completedAt if moving out of completed status
-      changes.completedAt = undefined;
-    }
-    
-    // Use the regular update method
-    return this.update(id, changes);
-  },
+/**
+ * Task service
+ */
+export class TaskService extends BaseService<Task> {
+  constructor(
+    protected taskRepository: TaskRepository,
+    protected syncChangeManager: OutgoingChangeProcessor
+  ) {
+    super(taskRepository, 'tasks', syncChangeManager);
+  }
 
-  /**
-   * Get a task by ID
-   */
-  async getById(id: string) {
+  async get(id: string): Promise<Task | null> {
     try {
-      return await db.tasks.get(id);
+      return await this.repository.findById(id);
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to get task with ID ${id}`,
-        'getById',
+        'get',
         error
       );
     }
-  },
+  }
 
-  /**
-   * Get all tasks
-   */
-  async getAll() {
+  async getByProject(projectId: string): Promise<Task[]> {
     try {
-      return await db.tasks.toArray();
-    } catch (error) {
-      throw new DatabaseServiceError(
-        'Failed to get all tasks',
-        'getAll',
-        error
-      );
-    }
-  },
-
-  /**
-   * Get tasks by project
-   */
-  async getByProject(projectId: string) {
-    try {
-      return await db.tasks
-        .where('projectId')
-        .equals(projectId)
-        .toArray();
+      return await this.repository.findByProject(projectId);
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to get tasks for project with ID ${projectId}`,
@@ -558,17 +383,11 @@ export const TaskService = {
         error
       );
     }
-  },
+  }
 
-  /**
-   * Get tasks by assignee
-   */
-  async getByAssignee(assigneeId: string) {
+  async getByAssignee(assigneeId: string): Promise<Task[]> {
     try {
-      return await db.tasks
-        .where('assigneeId')
-        .equals(assigneeId)
-        .toArray();
+      return await this.repository.findByAssignee(assigneeId);
     } catch (error) {
       throw new DatabaseServiceError(
         `Failed to get tasks for assignee with ID ${assigneeId}`,
@@ -577,155 +396,326 @@ export const TaskService = {
       );
     }
   }
-};
 
-/**
- * Comment service for comment-related operations
- */
-export const CommentService = {
-  /**
-   * Add a comment to a task
-   */
-  async addToTask(taskId: string, authorId: string, content: string) {
+  async createTask(taskData: {
+    title: string;
+    projectId: string;
+    description?: string;
+    status?: TaskStatus;
+    priority?: TaskPriority;
+    assigneeId?: string;
+    dueDate?: Date;
+    timeRange?: [Date, Date];
+    estimatedDuration?: number;
+    tags?: string[];
+  }): Promise<Task> {
     try {
       const now = new Date();
-      const commentId = uuidv4();
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
+      const taskId = uuidv4();
       
-      const newComment = {
-        id: commentId,
-        content: content,
-        entityId: taskId, // Link to task
-        entityType: 'task', // Specify entity type
-        authorId: authorId,
-        parentId: undefined, // Use undefined instead of null for optional string
+      const newTask = {
+        id: taskId,
+        title: taskData.title,
+        projectId: taskData.projectId,
+        description: taskData.description || '',
+        status: taskData.status || TaskStatus.OPEN,
+        priority: taskData.priority || TaskPriority.MEDIUM,
+        assigneeId: taskData.assigneeId || null,
+        dueDate: taskData.dueDate || null,
+        startDate: taskData.timeRange?.[0] || null,
+        endDate: taskData.timeRange?.[1] || null,
+        estimatedDuration: taskData.estimatedDuration || null,
+        tags: Array.isArray(taskData.tags) ? taskData.tags : [],
         createdAt: now,
         updatedAt: now
-      } as DbComment;
+      } as unknown as Task;
 
-      await db.transaction('rw', [db.comments, db.localChanges], async () => {
-        await db.comments.add(newComment);
-        await changeManager.trackChange(
-          'comments',
-          'insert',
-          newComment as unknown as Record<string, unknown>
-        );
-      });
-
-      console.log(`Comment added to task ${taskId}: ${commentId}`, newComment);
-      return newComment;
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to add comment to task ${taskId}`,
-        'addToTask',
-        error
+      const createdTask = await this.repository.create(newTask);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'insert',
+        createdTask as unknown as Record<string, unknown>
       );
-    }
-  },
-
-  /**
-   * Get comments for a task
-   */
-  async getForTask(taskId: string) {
-    try {
-      // Use the compound index for efficiency
-      return await db.comments
-        .where('[entityType+entityId]')
-        .equals(['task', taskId])
-        .sortBy('createdAt');
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to get comments for task ${taskId}`,
-        'getForTask',
-        error
-      );
-    }
-  },
-  
-  /**
-   * Update an existing comment
-   */
-  async update(id: string, changes: Partial<DbComment>) {
-    try {
-      const now = new Date();
-      let updatedComment: DbComment | null = null;
-      const changeManager = SyncChangeManager.getInstance();
-      const clientId = changeManager.getClientId();
-
-      await db.transaction('rw', [db.comments, db.localChanges], async () => {
-        const comment = await db.comments.get(id);
-        if (!comment) {
-          throw new Error(`Comment with ID ${id} not found`);
-        }
-
-        // Create updated comment object
-        updatedComment = {
-          ...comment,
-          ...changes,
-          updatedAt: now
-        };
-        
-        // Prepare changes for Dexie update (only send actual changes + tracking fields)
-        const updateData = { ...changes, updatedAt: now };
-
-        // Update the comment in the database
-        await db.comments.update(id, updateData);
-
-        await changeManager.trackChange(
-          'comments',
-          'update',
-          updatedComment as unknown as Record<string, unknown>
-        );
+      
+      // Dispatch custom event to notify UI of task creation
+      const event = new CustomEvent('task-created', { 
+        detail: { task: createdTask } 
       });
-
-      if (!updatedComment) {
-        throw new Error(`Failed to update comment with ID ${id}`);
-      }
-
-      console.log(`Comment updated: ${id}`, updatedComment);
-      return updatedComment;
+      window.dispatchEvent(event);
+      console.log('[TaskService] Dispatched task-created event');
+      
+      return createdTask;
     } catch (error) {
       throw new DatabaseServiceError(
-        `Failed to update comment with ID ${id}`,
-        'update',
-        error
-      );
-    }
-  },
-
-  /**
-   * Delete a comment
-   */
-  async delete(id: string) {
-    try {
-      const changeManager = SyncChangeManager.getInstance();
-      let commentId: string = id;
-
-      await db.transaction('rw', [db.comments, db.localChanges], async () => {
-        const deletedComment = await db.comments.get(id);
-        if (!deletedComment) {
-          console.log(`Comment with ID ${id} not found for deletion, likely already deleted.`);
-          return; 
-        }
-        commentId = deletedComment.id;
-
-        await db.comments.delete(id);
-        await changeManager.trackChange(
-          'comments',
-          'delete',
-          { id: commentId } as unknown as Record<string, unknown>
-        );
-      });
-
-      console.log(`Comment deleted: ${commentId}`);
-      return { id: commentId, deleted: true };
-    } catch (error) {
-      throw new DatabaseServiceError(
-        `Failed to delete comment with ID ${id}`,
-        'delete',
+        `Failed to create task "${taskData.title}"`,
+        'createTask',
         error
       );
     }
   }
-}; 
+
+  async updateTask(id: string, changes: Partial<Task>): Promise<Task> {
+    try {
+      const task = await this.repository.findById(id);
+      if (!task) {
+        throw new Error(`Task with ID ${id} not found`);
+      }
+      
+      const updatedData = {
+        ...changes,
+        updatedAt: new Date()
+      } as DeepPartial<Task>;
+      
+      const updatedTask = await this.repository.update(id, updatedData);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'update',
+        updatedTask as unknown as Record<string, unknown>
+      );
+      
+      // Dispatch custom event to notify UI of task update
+      const event = new CustomEvent('task-updated', { 
+        detail: { task: updatedTask } 
+      });
+      window.dispatchEvent(event);
+      console.log('[TaskService] Dispatched task-updated event');
+      
+      return updatedTask;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to update task with ID ${id}`,
+        'updateTask',
+        error
+      );
+    }
+  }
+
+  async deleteTask(id: string): Promise<boolean> {
+    try {
+      const task = await this.repository.findById(id);
+      if (!task) {
+        throw new Error(`Task with ID ${id} not found`);
+      }
+      
+      const success = await this.repository.delete(id);
+      
+      // Track change for sync
+      if (success) {
+        await this.syncChangeManager.trackChange(
+          this.tableName,
+          'delete',
+          { id } as unknown as Record<string, unknown>
+        );
+        
+        // Dispatch custom event to notify UI of task deletion
+        const event = new CustomEvent('task-deleted', { 
+          detail: { taskId: id } 
+        });
+        window.dispatchEvent(event);
+        console.log('[TaskService] Dispatched task-deleted event');
+      }
+      
+      return success;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to delete task with ID ${id}`,
+        'deleteTask',
+        error
+      );
+    }
+  }
+
+  async updateTaskStatus(id: string, status: TaskStatus): Promise<Task> {
+    try {
+      const task = await this.repository.findById(id);
+      if (!task) {
+        throw new Error(`Task with ID ${id} not found`);
+      }
+      
+      const updatedTask = await this.repository.update(id, { 
+        status,
+        updatedAt: new Date()
+      } as DeepPartial<Task>);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'update',
+        updatedTask as unknown as Record<string, unknown>
+      );
+      
+      // Dispatch custom event to notify UI of task status update
+      const event = new CustomEvent('task-updated', { 
+        detail: { task: updatedTask, statusChanged: true } 
+      });
+      window.dispatchEvent(event);
+      console.log('[TaskService] Dispatched task-updated event (status change)');
+      
+      return updatedTask;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to update status for task with ID ${id}`,
+        'updateTaskStatus',
+        error
+      );
+    }
+  }
+}
+
+/**
+ * Comment service
+ */
+export class CommentService extends BaseService<Comment> {
+  constructor(
+    protected commentRepository: CommentRepository,
+    protected syncChangeManager: OutgoingChangeProcessor
+  ) {
+    super(commentRepository, 'comments', syncChangeManager);
+  }
+
+  async get(id: string): Promise<Comment | null> {
+    try {
+      return await this.repository.findById(id);
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to get comment with ID ${id}`,
+        'get',
+        error
+      );
+    }
+  }
+
+  async getByTask(taskId: string): Promise<Comment[]> {
+    try {
+      return await this.repository.findByTask(taskId);
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to get comments for task with ID ${taskId}`,
+        'getByTask',
+        error
+      );
+    }
+  }
+
+  async createComment(commentData: {
+    content: string;
+    taskId: string;
+    authorId: string;
+    parentId?: string;
+  }): Promise<Comment> {
+    try {
+      const now = new Date();
+      const commentId = uuidv4();
+      
+      const newComment = {
+        id: commentId,
+        content: commentData.content,
+        taskId: commentData.taskId,
+        authorId: commentData.authorId,
+        parentId: commentData.parentId || null,
+        createdAt: now,
+        updatedAt: now
+      } as Comment;
+
+      const createdComment = await this.repository.create(newComment);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'insert',
+        createdComment as unknown as Record<string, unknown>
+      );
+      
+      return createdComment;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to create comment for task ${commentData.taskId}`,
+        'createComment',
+        error
+      );
+    }
+  }
+
+  async updateComment(id: string, changes: Partial<Comment>): Promise<Comment> {
+    try {
+      const comment = await this.repository.findById(id);
+      if (!comment) {
+        throw new Error(`Comment with ID ${id} not found`);
+      }
+      
+      const updatedData = {
+        ...changes,
+        updatedAt: new Date()
+      } as DeepPartial<Comment>;
+      
+      const updatedComment = await this.repository.update(id, updatedData);
+      
+      // Track change for sync
+      await this.syncChangeManager.trackChange(
+        this.tableName,
+        'update',
+        updatedComment as unknown as Record<string, unknown>
+      );
+      
+      return updatedComment;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to update comment with ID ${id}`,
+        'updateComment',
+        error
+      );
+    }
+  }
+
+  async deleteComment(id: string): Promise<boolean> {
+    try {
+      const comment = await this.repository.findById(id);
+      if (!comment) {
+        throw new Error(`Comment with ID ${id} not found`);
+      }
+      
+      const success = await this.repository.delete(id);
+      
+      // Track change for sync
+      if (success) {
+        await this.syncChangeManager.trackChange(
+          this.tableName,
+          'delete',
+          { id } as unknown as Record<string, unknown>
+        );
+      }
+      
+      return success;
+    } catch (error) {
+      throw new DatabaseServiceError(
+        `Failed to delete comment with ID ${id}`,
+        'deleteComment',
+        error
+      );
+    }
+  }
+}
+
+/**
+ * Factory function to create all services
+ */
+export function createServices(
+  repositories: {
+    users: UserRepository;
+    projects: ProjectRepository;
+    tasks: TaskRepository;
+    comments: CommentRepository;
+  },
+  syncChangeManager: OutgoingChangeProcessor
+) {
+  return {
+    users: new UserService(repositories.users, syncChangeManager),
+    projects: new ProjectService(repositories.projects, syncChangeManager),
+    tasks: new TaskService(repositories.tasks, syncChangeManager),
+    comments: new CommentService(repositories.comments, syncChangeManager)
+  };
+} 

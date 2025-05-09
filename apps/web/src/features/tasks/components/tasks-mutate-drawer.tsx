@@ -21,11 +21,12 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { SelectDropdown } from '@/components/select-dropdown'
-import { Task, TaskStatus, TaskPriority } from '@repo/dataforge/client-entities'
-import { getNewPGliteDataSource } from '@/db/newtypeorm/NewDataSource'
-import { useState } from 'react'
+import { Task, TaskStatus, TaskPriority, Project } from '@repo/dataforge/client-entities'
+import { useState, useEffect } from 'react'
+import { useTasks } from '../context/tasks-context'
 import { zodResolver } from "@hookform/resolvers/zod"
 import * as z from "zod"
+import { useProjects } from '@/db/hooks'
 
 interface Props {
   open: boolean
@@ -33,55 +34,70 @@ interface Props {
   currentRow?: Task
 }
 
-type TasksForm = Pick<Task, 'title' | 'status' | 'priority'> & { description?: string }
+const taskFormSchema = z.object({
+  title: z.string().min(1, "Title cannot be empty").max(100, "Title cannot exceed 100 characters"),
+  description: z.string().max(5000, "Description cannot exceed 5000 characters").optional(),
+  status: z.nativeEnum(TaskStatus),
+  priority: z.nativeEnum(TaskPriority),
+  projectId: z.string().uuid("Please select a valid project"),
+});
+
+type TasksFormValues = z.infer<typeof taskFormSchema>;
 
 export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
   const isUpdate = !!currentRow
   const [isSaving, setIsSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  
+  const { createTask, updateTask } = useTasks()
+  
+  const { projects: availableProjects, isLoading: isLoadingProjects } = useProjects();
 
-  const form = useForm<TasksForm>({
+  const form = useForm<TasksFormValues>({
+    resolver: zodResolver(taskFormSchema),
     defaultValues: {
       title: currentRow?.title || '',
       status: currentRow?.status || TaskStatus.OPEN,
       priority: currentRow?.priority || TaskPriority.MEDIUM,
-      description: currentRow?.description || ''
+      description: currentRow?.description || '',
+      projectId: currentRow?.projectId || ''
     },
   })
 
-  const onSubmit = async (data: TasksForm) => {
+  useEffect(() => {
+    form.reset({
+      title: currentRow?.title || '',
+      status: currentRow?.status || TaskStatus.OPEN,
+      priority: currentRow?.priority || TaskPriority.MEDIUM,
+      description: currentRow?.description || '',
+      projectId: currentRow?.projectId || ''
+    });
+  }, [currentRow, form]);
+
+  const onSubmit = async (data: TasksFormValues) => {
     setIsSaving(true)
     setSaveError(null)
     console.log("Saving task data:", data)
     
     try {
-      const dataSource = await getNewPGliteDataSource()
-      const taskRepo = dataSource.getRepository(Task)
-      
       if (isUpdate && currentRow) {
-        // --- Load existing entity first ---
-        const existingTask = await taskRepo.findOneBy({ id: currentRow.id });
-        if (!existingTask) {
-          throw new Error("Task not found for update");
-        }
-        // Apply form changes to the loaded entity
-        existingTask.title = data.title;
-        existingTask.status = data.status;
-        existingTask.priority = data.priority;
-        existingTask.description = data.description;
-        // Do NOT manually set existingTask.updatedAt here
-
-        console.log(">>> [Before Save] Loaded entity being passed to taskRepo.save:", JSON.stringify(existingTask, null, 2));
-        const savedTask = await taskRepo.save(existingTask); // Save the full loaded entity
-        console.log(">>> [After Save] Result returned by taskRepo.save (full entity):", JSON.stringify(savedTask, null, 2));
-        // The savedTask already contains the updated_at value, no need for manual check
+        const updatedTask = await updateTask(currentRow.id, {
+          title: data.title,
+          status: data.status,
+          priority: data.priority,
+          description: data.description,
+          projectId: data.projectId
+        });
+        console.log("Task updated:", updatedTask);
       } else {
-        // --- Original creation logic ---
-        const dataToSave: Partial<Task> = { ...data }; // Keep original dataToSave for creation
-        console.log(">>> [Before Save] New data being passed to taskRepo.save:", JSON.stringify(dataToSave, null, 2));
-        const savedTask = await taskRepo.save(dataToSave as any); // Capture result
-        console.log(">>> [After Save] Result returned by taskRepo.save (new entity):", JSON.stringify(savedTask, null, 2));
-        // --- End original creation logic ---
+        const newTask = await createTask({
+          title: data.title,
+          status: data.status,
+          priority: data.priority,
+          description: data.description,
+          projectId: data.projectId,
+        });
+        console.log("Task created:", newTask);
       }
 
       console.log("Save successful")
@@ -98,12 +114,20 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
     }
   }
 
+  const projectOptions = availableProjects?.map(project => ({ 
+    label: project.name,
+    value: project.id 
+  })) || [];
+
   return (
     <Sheet
       open={open}
       onOpenChange={(v) => {
+        if (!v) {
+          form.reset();
+          setSaveError(null);
+        }
         onOpenChange(v)
-        form.reset()
       }}
     >
       <SheetContent className='flex flex-col'>
@@ -120,7 +144,7 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
           <form
             id='tasks-form'
             onSubmit={form.handleSubmit(onSubmit)}
-            className='flex-1 space-y-5 px-4'
+            className='flex-1 space-y-5 overflow-y-auto px-1 py-2'
           >
             <FormField
               control={form.control}
@@ -131,6 +155,23 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
                   <FormControl>
                     <Input {...field} placeholder='Enter a title' />
                   </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="projectId"
+              render={({ field }) => (
+                <FormItem className='space-y-1'>
+                  <FormLabel>Project</FormLabel>
+                  <SelectDropdown
+                    defaultValue={field.value}
+                    onValueChange={field.onChange}
+                    placeholder='Select project'
+                    items={projectOptions}
+                    disabled={isLoadingProjects}
+                  />
                   <FormMessage />
                 </FormItem>
               )}
@@ -187,7 +228,7 @@ export function TasksMutateDrawer({ open, onOpenChange, currentRow }: Props) {
             )}
           </form>
         </Form>
-        <SheetFooter className='gap-2'>
+        <SheetFooter className='mt-auto gap-2'>
           <SheetClose asChild>
             <Button variant='outline' disabled={isSaving}>Close</Button>
           </SheetClose>

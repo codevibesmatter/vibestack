@@ -9,31 +9,38 @@ import { VitePWA } from 'vite-plugin-pwa'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [
-    // VitePWA({
-    //   registerType: 'autoUpdate', // Automatically update the service worker when new content is available
-    //   includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'mask-icon.svg'], // Cache these static assets
-    //   manifest: { // Basic PWA manifest generation
-    //     name: 'ShadAdmin',
-    //     short_name: 'ShadAdmin',
-    //     description: 'Admin Dashboard',
-    //     theme_color: '#ffffff',
-    //     icons: [
-    //       {
-    //         src: 'pwa-192x192.png',
-    //         sizes: '192x192',
-    //         type: 'image/png'
-    //       },
-    //       {
-    //         src: 'pwa-512x512.png',
-    //         sizes: '512x512',
-    //         type: 'image/png'
-    //       }
-    //     ]
-    //   },
-    //   workbox: {
-    //     globPatterns: ['**/*.{js,css,html,ico,png,svg}'] // Cache JS, CSS, HTML, and image assets
-    //   }
-    // }),
+    VitePWA({
+      registerType: 'autoUpdate', // Automatically update the service worker when new content is available
+      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'mask-icon.svg'], // Cache these static assets
+      manifest: { // Basic PWA manifest generation
+        name: 'ShadAdmin',
+        short_name: 'ShadAdmin',
+        description: 'Admin Dashboard',
+        theme_color: '#ffffff',
+        icons: [
+          {
+            src: 'pwa-192x192.png',
+            sizes: '192x192',
+            type: 'image/png'
+          },
+          {
+            src: 'pwa-512x512.png',
+            sizes: '512x512',
+            type: 'image/png'
+          }
+        ]
+      },
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg}'] // Cache JS, CSS, HTML, and image assets
+      },
+      // To enable service worker in development for testing:
+      devOptions: {
+        enabled: true,
+        type: 'module', // Or 'classic',
+        // Consider using a different cache name for dev to avoid conflicts
+        // workboxOptions: { cacheId: 'my-app-dev' }, 
+      }
+    }),
     // cloudflare(),
     TanStackRouterVite({
       target: 'react',
@@ -48,7 +55,7 @@ export default defineConfig({
   },
   esbuild: {
     supported: {
-      'decorator': true
+      'decorators': true
     }
   },
   worker: {

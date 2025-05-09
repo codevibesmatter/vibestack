@@ -3,7 +3,7 @@ import { getDataSource } from '../data-source';
 import { NeonDataSource } from './NeonDataSource';
 import type { Context } from 'hono'; // Import Hono context
 import type { Env } from '../../types/env'; // Import Env type
-// Removed: import type { Env } from '../../types/env'; // Assuming Env is not needed just for NeonService
+import type { AppBindings } from '../../types/hono'; // Import AppBindings
 
 // Import the global DataSource getter
 // let dataSource: DataSource | null = null;
@@ -54,11 +54,11 @@ export async function find<T extends ObjectLiteral>(entityClass: EntityTarget<T>
 
 // KEEP NeonService class
 export class NeonService {
-  private context: Context<{ Bindings: Env }> ;
+  private context: Context<AppBindings> ; // Update context type
   // Cache the data source instance per service instance to avoid repeated calls to getDataSource
-  private dataSourceInstance: NeonDataSource | null = null; 
+  private dataSourceInstance: NeonDataSource | null = null;
 
-  constructor(c: Context<{ Bindings: Env }>) {
+  constructor(c: Context<AppBindings>) { // Update constructor parameter type
     this.context = c;
   }
 
@@ -66,16 +66,16 @@ export class NeonService {
   private async getManager(): Promise<EntityManager> {
     // Get the instance or initialize it if not already cached
     if (!this.dataSourceInstance) {
-      this.dataSourceInstance = await getDataSource(this.context); 
+      this.dataSourceInstance = await getDataSource(this.context);
     }
-    
+
     // Ensure the dataSource and its manager are initialized
     if (!this.dataSourceInstance || !this.dataSourceInstance.isInitialized || !this.dataSourceInstance.manager) {
       // This should ideally not happen if getDataSource handles initialization correctly
       console.error("NeonService Error: DataSource or EntityManager not available after getDataSource call.");
       throw new Error("DataSource is not properly initialized.");
     }
-    
+
     // Return the manager from the cached instance
     return this.dataSourceInstance.manager;
   }
@@ -138,4 +138,9 @@ export class NeonService {
     const manager = await this.getManager();
     return manager.delete(entityTarget, criteria);
   }
-} 
+
+  async query(sql: string, parameters?: any[]): Promise<any> {
+    const manager = await this.getManager();
+    return manager.query(sql, parameters);
+  }
+}

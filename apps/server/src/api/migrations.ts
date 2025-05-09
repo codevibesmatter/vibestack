@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import {
   type ApiEnv,
   ServiceErrorType,
@@ -13,6 +14,7 @@ const migrations = new Hono<ApiEnv>();
 
 // List all migrations
 migrations.get('/', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   const client = getDBClient(c);
   try {
     await client.connect();
@@ -31,6 +33,7 @@ migrations.get('/', async (c) => {
 
 // Get migration by name
 migrations.get('/:name', async (c) => {
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   const client = getDBClient(c);
   try {
     const name = c.req.param('name');

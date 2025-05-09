@@ -107,16 +107,18 @@ export class NeonQueryRunner implements QueryRunner {
         if (!neonOptions.url) {
             throw new Error("Database connection URL is missing in DataSource options.");
         }
-        const client = new Client(neonOptions.url); // Use asserted options
+        const client = new Client(neonOptions.url);
         let raw: any;
 
         try {
-            console.log(`[${queryId}] NeonQueryRunner.query: Connecting new client...`);
             await client.connect();
-            console.log(`[${queryId}] NeonQueryRunner.query: Client connected. Executing query...`);
+            console.log(`[${queryId}] NeonQueryRunner.query: Client connected, executing query...`);
             
+            // Simply pass query and parameters directly, just like PostgresQueryRunner does
+            // PostgreSQL natively handles the same positional parameter being used multiple times
             raw = await client.query(query, parameters);
-            console.log(`[${queryId}] NeonQueryRunner.query: Query executed. Raw result command: ${raw?.command}`);
+            
+            console.log(`[${queryId}] NeonQueryRunner.query: Query executed. Command: ${raw?.command}, Rows: ${raw?.rows?.length}`);
             
             const queryEndTime = +new Date();
             const queryExecutionTime = queryEndTime - queryStartTime;
@@ -129,15 +131,7 @@ export class NeonQueryRunner implements QueryRunner {
             const result = new QueryResult();
             
             if (raw) {
-                const safeRaw = {
-                    command: raw.command,
-                    rowCount: raw.rowCount,
-                    rows: raw.rows
-                };
-                result.raw = safeRaw;
-                
                 if (raw.hasOwnProperty("rows")) {
-                    // Store raw rows directly; TypeORM hydrator should handle mapping
                     result.records = raw.rows;
                 }
                 
@@ -148,22 +142,21 @@ export class NeonQueryRunner implements QueryRunner {
                 switch (raw.command) {
                     case "DELETE":
                     case "UPDATE":
-                        result.raw = [safeRaw.rows, safeRaw.rowCount];
+                        // for UPDATE and DELETE query additionally return number of affected rows
+                        result.raw = [raw.rows, raw.rowCount];
                         break;
                     default:
-                        result.raw = safeRaw.rows;
+                        result.raw = raw.rows;
                 }
                 
                 if (!useStructuredResult) {
-                     console.log(`[${queryId}] NeonQueryRunner.query: END (returning raw result)`);
-                    // Return only the raw rows/data when not using structured result
+                    console.log(`[${queryId}] NeonQueryRunner.query: END (returning raw result)`);
                     return result.raw;
                 }
             }
             
-            // When useStructuredResult is true, return the full QueryResult object
             console.log(`[${queryId}] NeonQueryRunner.query: END (returning structured QueryResult)`);
-            return result; // Return the standard QueryResult object
+            return result;
             
         } catch (err: any) {
             console.error(`[${queryId}] NeonQueryRunner.query: CATCH block. Error:`, err);
@@ -171,9 +164,8 @@ export class NeonQueryRunner implements QueryRunner {
             const error = err instanceof Error ? err : new Error(String(err));
             throw new QueryFailedError(query, parameters, error);
         } finally {
-            console.log(`[${queryId}] NeonQueryRunner.query: FINALLY block. Ending client connection...`);
+            console.log(`[${queryId}] NeonQueryRunner.query: Closing client connection...`);
             await client.end();
-            console.log(`[${queryId}] NeonQueryRunner.query: Client connection ended.`);
         }
     }
 

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { showSubmittedData } from '@/utils/show-submitted-data'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { useTasks } from '../context/tasks-context'
@@ -5,7 +6,39 @@ import { TasksImportDialog } from './tasks-import-dialog'
 import { TasksMutateDrawer } from './tasks-mutate-drawer'
 
 export function TasksDialogs() {
-  const { open, setOpen, currentRow, setCurrentRow } = useTasks()
+  const { open, setOpen, currentRow, setCurrentRow, deleteTask } = useTasks()
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+
+  const handleDeleteTask = async () => {
+    if (!currentRow) return;
+    
+    setIsDeleting(true);
+    setDeleteError(null);
+    
+    try {
+      const success = await deleteTask(currentRow.id);
+      
+      if (success) {
+        setOpen(null);
+        setTimeout(() => {
+          setCurrentRow(null);
+        }, 500);
+        showSubmittedData(
+          currentRow,
+          'The following task has been deleted:'
+        );
+      } else {
+        setDeleteError("Failed to delete task");
+      }
+    } catch (error) {
+      console.error("Error deleting task:", error);
+      setDeleteError(error instanceof Error ? error.message : "An unknown error occurred");
+    } finally {
+      setIsDeleting(false);
+    }
+  }
+
   return (
     <>
       <TasksMutateDrawer
@@ -44,26 +77,23 @@ export function TasksDialogs() {
                 setCurrentRow(null)
               }, 500)
             }}
-            handleConfirm={() => {
-              setOpen(null)
-              setTimeout(() => {
-                setCurrentRow(null)
-              }, 500)
-              showSubmittedData(
-                currentRow,
-                'The following task has been deleted:'
-              )
-            }}
+            handleConfirm={handleDeleteTask}
             className='max-w-md'
-            title={`Delete this task: ${currentRow.id} ?`}
+            title={`Delete this task: ${currentRow.title} ?`}
             desc={
               <>
-                You are about to delete a task with the ID{' '}
-                <strong>{currentRow.id}</strong>. <br />
+                You are about to delete a task with the title{' '}
+                <strong>{currentRow.title}</strong>. <br />
                 This action cannot be undone.
+                {deleteError && (
+                  <p className="mt-2 text-sm font-medium text-destructive">
+                    Error: {deleteError}
+                  </p>
+                )}
               </>
             }
-            confirmText='Delete'
+            confirmText={isDeleting ? 'Deleting...' : 'Delete'}
+            disabled={isDeleting}
           />
         </>
       )}

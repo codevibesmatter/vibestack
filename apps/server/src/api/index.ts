@@ -6,6 +6,7 @@ import type { ApiEnv } from '../types/api'
 import { projects } from './projects'
 import { tasks } from './tasks'
 import { users } from './users'
+import { comments } from './comments'
 import { sync } from './sync'
 import replication from './replication'
 import { migrations } from './migrations'
@@ -28,6 +29,7 @@ api.use('*', logger())
 api.route('/projects', projects)
 api.route('/tasks', tasks)
 api.route('/users', users)
+api.route('/comments', comments)
 api.route('/sync', sync)
 api.route('/replication', replication)
 api.route('/migrations', migrations)

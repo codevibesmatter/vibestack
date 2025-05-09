@@ -11,7 +11,8 @@ import { live } from '@electric-sql/pglite/live';
 import { IdbFs } from '@electric-sql/pglite';
 
 // Database name for storage
-const DB_NAME = 'vibestack-admin-db';
+// IMPORTANT: Must be kept in sync with DB_NAME in db.ts
+const DB_NAME = 'vibestack-db';
 
 // Configure the database with IndexedDB filesystem
 // We're using IndexedDB for persistence across sessions
@@ -22,8 +23,8 @@ const config = {
     // Register the live extension
     live
   },
-  // Use relaxed durability for better performance
-  // This returns query results immediately and flushes to IndexedDB asynchronously
+  // Disable relaxed durability to ensure writes are flushed to IndexedDB synchronously
+  // This guarantees persistence across sessions/refreshes for critical updates like processedSync
   relaxedDurability: true,
   // Set a larger cache size to reduce disk I/O
   cacheSize: 5000

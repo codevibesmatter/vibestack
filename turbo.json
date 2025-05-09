@@ -18,6 +18,10 @@
       "persistent": true,
       "cache": false
     },
+    "_start_servers_for_pwa_test": {
+      "persistent": true,
+      "cache": false
+    },
     "lint": {
       "outputs": []
     },

@@ -41,6 +41,10 @@ class_name = "ReplicationDO"
 tag = "v1"
 new_classes = ["SyncDO", "ReplicationDO"]
 
+# Cron triggers
+[triggers]
+crons = ["* * * * *"]  # Run every minute to keep replication DO alive
+
 # KV namespace configuration
 [[kv_namespaces]]
 binding = "CLIENT_REGISTRY"

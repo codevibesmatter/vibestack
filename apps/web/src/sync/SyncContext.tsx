@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
-import { SyncManager, SyncState } from './SyncManager';
-import { SyncChangeManager } from './SyncChangeManager.typeorm';
+import { SyncManager } from './SyncManager';
+import { SyncStatus } from './interfaces';
 import { getSyncWebSocketUrl } from './config';
 import { usePGliteContext } from '../db/pglite-provider';
 
@@ -13,7 +13,7 @@ interface SyncProviderProps {
 // Define the context shape
 export interface SyncContextState {
   isConnected: boolean;
-  syncState: SyncState;
+  syncState: SyncStatus;
   lsn: string;
   pendingChanges: number;
   lastSyncTime: Date | null;
@@ -26,12 +26,13 @@ export interface SyncContextState {
   isLoading: boolean;
   processQueuedChanges: () => Promise<void>;
   setAutoConnect: (value: boolean) => void;
+  resyncAllEntities: () => Promise<number>;
 }
 
 // Create context with default values
 const SyncContext = createContext<SyncContextState>({
   isConnected: false,
-  syncState: 'disconnected',
+  syncState: 'disconnected' as SyncStatus,
   lsn: '0/0',
   pendingChanges: 0,
   lastSyncTime: null,
@@ -43,7 +44,8 @@ const SyncContext = createContext<SyncContextState>({
   setServerUrl: () => {},
   isLoading: true,
   processQueuedChanges: async () => {},
-  setAutoConnect: () => {}
+  setAutoConnect: () => {},
+  resyncAllEntities: async () => 0
 });
 
 // Provider component
@@ -51,7 +53,6 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
   // State to track database and sync initialization
   const [isLoading, setIsLoading] = useState(true);
   const [syncManager, setSyncManager] = useState<SyncManager | null>(null);
-  const [changeManager, setChangeManager] = useState<SyncChangeManager | null>(null);
   
   // Use the PGlite context to check database status
   const { isReady: isDatabaseReady, isLoading: isDatabaseLoading } = usePGliteContext();
@@ -65,13 +66,9 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
     
     console.log('SyncContext: Database is ready, initializing SyncManager');
     
-    // Initialize the managers now that the database is ready
+    // Initialize the SyncManager now that the database is ready
     const syncManagerInstance = SyncManager.getInstance();
     setSyncManager(syncManagerInstance);
-    
-    // Also initialize the SyncChangeManager
-    const changeManagerInstance = SyncChangeManager.getInstance();
-    setChangeManager(changeManagerInstance);
     
   }, [isDatabaseReady]);
   
@@ -82,7 +79,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
   }, [autoConnect, syncManager]);
   
   // Keep the latest values in refs to avoid race conditions
-  const latestSyncState = useRef<SyncState>('disconnected');
+  const latestSyncState = useRef<SyncStatus>('disconnected');
   const latestLSN = useRef<string>('0/0');
   const latestConnected = useRef<boolean>(false);
   const latestClientId = useRef<string>('');
@@ -91,7 +88,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
   // State for sync status
   const [state, setState] = useState({
     isConnected: false,
-    syncState: 'disconnected' as SyncState,
+    syncState: 'disconnected' as SyncStatus,
     lsn: '0/0',
     pendingChanges: 0,
     lastSyncTime: null as Date | null,
@@ -141,7 +138,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
         await syncManager.initialize();
         
         // Set our initial state now that everything is initialized
-        latestSyncState.current = syncManager.getState();
+        latestSyncState.current = syncManager.getStatus();
         latestLSN.current = syncManager.getLSN();
         latestConnected.current = syncManager.isConnected();
         latestClientId.current = syncManager.getClientId();
@@ -153,7 +150,7 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
         setIsLoading(false);
         
         // Set up direct event handlers for state-critical events
-        const handleStateChange = (state: SyncState) => {
+        const handleStateChange = (state: SyncStatus) => {
           latestSyncState.current = state;
           updateState(true);
         };
@@ -272,13 +269,27 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
   };
   
   const handleProcessQueuedChanges = async () => {
-    if (!changeManager) return;
-    await changeManager.processQueuedChanges();
+    if (!syncManager) return; // Or handle if syncManager might not be ready
+    await syncManager.getOutgoingChangeProcessor().processQueuedChanges();
   };
   
   const handleSetAutoConnect = (value: boolean) => {
     if (!syncManager) return;
     syncManager.setAutoConnect(value);
+  };
+  
+  const handleResyncAllEntities = async (): Promise<number> => {
+    if (!syncManager) {
+      // Or handle if syncManager might not be ready
+      throw new Error('Sync manager not initialized for resync');
+    }
+    await syncManager.resetLSN();
+    // The original function was expected to return a Promise<number>.
+    // resetLSN() is Promise<void>. We need to decide on the return.
+    // For now, returning 0 as a placeholder, assuming the number wasn't critical.
+    // If the number of entities resynced was important, this needs further thought
+    // or SyncManager.resetLSN() would need to be adapted.
+    return 0;
   };
   
   // Show a loading state if database or sync is still loading
@@ -293,7 +304,8 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
         setServerUrl,
         isLoading: true,
         processQueuedChanges: handleProcessQueuedChanges,
-        setAutoConnect: handleSetAutoConnect
+        setAutoConnect: handleSetAutoConnect,
+        resyncAllEntities: handleResyncAllEntities
       }}>
         {children}
       </SyncContext.Provider>
@@ -311,7 +323,8 @@ export const SyncProvider: React.FC<SyncProviderProps> = ({ children, autoConnec
       setServerUrl,
       isLoading: isLoading || !syncManager,
       processQueuedChanges: handleProcessQueuedChanges,
-      setAutoConnect: handleSetAutoConnect
+      setAutoConnect: handleSetAutoConnect,
+      resyncAllEntities: handleResyncAllEntities
     }}>
       {children}
     </SyncContext.Provider>

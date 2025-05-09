@@ -6,18 +6,26 @@
 
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { initializeDatabase, getDatabase, dbMessageBus } from './db.ts';
+import { getNewPGliteDataSource } from './newtypeorm/NewDataSource';
+import { createRepositories } from './repositories';
+import { createServices } from './services';
+import { SyncManager } from '../sync/SyncManager';
 
-// Create context
+// Create context with repositories and services
 interface PGliteContextValue {
   isLoading: boolean;
   isReady: boolean;
   error: Error | null;
+  repositories?: any;
+  services?: any;
 }
 
 const PGliteContext = createContext<PGliteContextValue>({
   isLoading: true,
   isReady: false,
-  error: null
+  error: null,
+  repositories: null,
+  services: null
 });
 
 // Hook to access PGlite context
@@ -32,13 +40,16 @@ interface PGliteProviderProps {
 /**
  * Vibestack PGlite Provider Component
  * 
- * This provider initializes the PGlite database and provides context
+ * This provider initializes both legacy PGlite and TypeORM and provides context
  * about its status to the application.
  */
 export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [repositories, setRepositories] = useState<any>(null);
+  const [services, setServices] = useState<any>(null);
+  const [typeormInitialized, setTypeormInitialized] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -48,6 +59,13 @@ export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
       if (isMounted) {
         setIsReady(true);
         setIsLoading(false);
+        
+        // Initialize TypeORM after PGlite is ready
+        if (!typeormInitialized) {
+          initializeTypeorm().catch(err => {
+            console.error('Error initializing TypeORM:', err);
+          });
+        }
       }
     });
     
@@ -58,7 +76,7 @@ export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
       }
     });
     
-    // Initialize the database
+    // Initialize the database (legacy PGlite)
     async function init() {
       try {
         console.log('PGlite Provider initializing database...');
@@ -67,6 +85,11 @@ export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
         if (isMounted) {
           setIsReady(true);
           setIsLoading(false);
+          
+          // Initialize TypeORM after PGlite is ready
+          if (!typeormInitialized) {
+            await initializeTypeorm();
+          }
         }
       } catch (err) {
         console.error('Error initializing database in provider:', err);
@@ -78,12 +101,50 @@ export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
       }
     }
     
+    // Initialize TypeORM repositories and services
+    async function initializeTypeorm() {
+      try {
+        console.log('Initializing TypeORM repositories and services...');
+        
+        // Get DataSource
+        const dataSource = await getNewPGliteDataSource();
+        
+        // Create repositories
+        const repos = await createRepositories();
+        
+        // Get SyncChangeManager
+        const syncManager = SyncManager.getInstance();
+        // Ensure SyncManager's own initialization is complete before accessing OutgoingChangeProcessor
+        await syncManager.initialize();
+        const outgoingChangeProcessor = syncManager.getOutgoingChangeProcessor();
+        
+        // Create services
+        const svcs = createServices(repos, outgoingChangeProcessor);
+        
+        if (isMounted) {
+          setRepositories(repos);
+          setServices(svcs);
+          setTypeormInitialized(true);
+          console.log('TypeORM repositories and services initialized');
+        }
+      } catch (err) {
+        console.error('Error initializing TypeORM in provider:', err);
+      }
+    }
+    
     // Check if database is already initialized
     getDatabase()
       .then(() => {
         if (isMounted) {
           setIsReady(true);
           setIsLoading(false);
+          
+          // Initialize TypeORM after PGlite is ready
+          if (!typeormInitialized) {
+            initializeTypeorm().catch(err => {
+              console.error('Error initializing TypeORM:', err);
+            });
+          }
         }
       })
       .catch(() => {
@@ -98,9 +159,15 @@ export function VibestackPGliteProvider({ children }: PGliteProviderProps) {
     };
   }, []);
 
-  // Provide context to children
+  // Provide context to children with repositories and services
   return (
-    <PGliteContext.Provider value={{ isLoading, isReady, error }}>
+    <PGliteContext.Provider value={{ 
+      isLoading, 
+      isReady, 
+      error,
+      repositories,
+      services 
+    }}>
       {children}
     </PGliteContext.Provider>
   );

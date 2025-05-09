@@ -14,6 +14,7 @@
   "scripts": {
     "build": "tsc --noEmit && wrangler deploy --outdir=dist",
     "dev": "wrangler dev --var LOG_LEVEL:info --inspector-port=9229",
+    "_start_servers_for_pwa_test": "wrangler dev --var LOG_LEVEL:info --inspector-port=9229",
     "dev:debug": "wrangler dev --var LOG_LEVEL:debug --inspector-port=9229",
     "dev:info": "wrangler dev --var LOG_LEVEL:info --inspector-port=9229",
     "deploy": "wrangler deploy",

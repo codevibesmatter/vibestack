@@ -16,7 +16,7 @@ export function addConnectTimeout(url: string): string {
 }
 
 // Initialize database client
-export const getDBClient = (c: Context<{ Bindings: Env }> | MinimalContext | { env: { DATABASE_URL: string } }) => {
+export const getDBClient = (c: AppContext | MinimalContext | { env: { DATABASE_URL: string } }) => {
   try {
     const url = 'env' in c && typeof c.env === 'object' && c.env !== null ? c.env.DATABASE_URL : undefined;
     if (!url) {
@@ -36,7 +36,7 @@ export const getDBClient = (c: Context<{ Bindings: Env }> | MinimalContext | { e
 
 // Direct query execution with proper connection management
 export async function sql<T extends QueryResultRow = QueryResultRow>(
-  c: Context<{ Bindings: Env }> | MinimalContext,
+  c: AppContext | MinimalContext,
   query: string,
   params: any[] = []
 ): Promise<T[]> {
@@ -124,7 +124,7 @@ export interface TableData {
   rows: Record<string, any>[];
 }
 
-export async function fetchAllTableData(c: Context<{ Bindings: Env }>): Promise<TableData[]> {
+export async function fetchAllTableData(c: AppContext): Promise<TableData[]> {
   // Get list of tables in public schema (excluding system tables)
   interface TableRow {
     tablename: string;
@@ -166,7 +166,7 @@ export const DOMAIN_TABLES = [
 ] as const;
 
 // Fetch data from all domain tables
-export async function fetchDomainTableData(c: Context<{ Bindings: Env }> | MinimalContext): Promise<TableData[]> {
+export async function fetchDomainTableData(c: AppContext | MinimalContext): Promise<TableData[]> {
   const client = getDBClient(c);
   try {
     await client.connect();
@@ -191,7 +191,7 @@ export async function fetchDomainTableData(c: Context<{ Bindings: Env }> | Minim
 }
 
 // Health check
-export async function checkDatabaseHealth(c: Context<{ Bindings: Env }> | MinimalContext): Promise<{
+export async function checkDatabaseHealth(c: AppContext | MinimalContext): Promise<{
   healthy: boolean;
   latency: number;
   tables?: Array<{ name: string; rowCount: number }>;

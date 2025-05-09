@@ -99,6 +99,18 @@ export async function loadServerData(endpoint: string): Promise<any> {
 export async function clearAllData(): Promise<boolean> {
   try {
     console.log('Clearing all data...');
+    
+    // Option 1: Full database storage reset (more reliable, prevents stale data issues)
+    // This is a more thorough approach that will prevent sleep-related issues
+    const success = await clearDatabaseStorage();
+    
+    // After clearing storage, the database will be reinitialized on next access
+    // This ensures we have a clean slate
+    
+    console.log('All data cleared successfully through complete storage reset');
+    return success;
+    
+    /* Option 2: Keep table structures but delete all rows (moved to clearAllDataKeepSchema)
     const db = await getDatabase();
     
     // Delete all data from tables in reverse order of relationships
@@ -109,6 +121,40 @@ export async function clearAllData(): Promise<boolean> {
     await db.query('DELETE FROM sync_metadata');
     
     console.log('All data cleared successfully');
+    return true;
+    */
+  } catch (error) {
+    console.error('Error clearing data:', error);
+    return false;
+  }
+}
+
+/**
+ * Alternative method that only clears table data but keeps schema
+ * This is less reliable after system sleep but preserves table structure
+ */
+export async function clearAllDataKeepSchema(): Promise<boolean> {
+  try {
+    console.log('Clearing all data but keeping schema...');
+    const db = await getDatabase();
+    
+    // Delete all data from tables in reverse order of relationships
+    await db.query('DELETE FROM comments');
+    await db.query('DELETE FROM tasks');
+    await db.query('DELETE FROM projects');
+    await db.query('DELETE FROM users');
+    await db.query('DELETE FROM sync_metadata');
+    
+    // Force commit changes to IndexedDB to avoid sleep-related issues
+    try {
+      // This is an attempt to ensure changes are persisted, may not be
+      // fully effective but worth trying
+      await db.query('COMMIT;');
+    } catch (commitError) {
+      console.warn('Explicit commit failed (this may be normal):', commitError);
+    }
+    
+    console.log('All data cleared successfully while preserving schema');
     return true;
   } catch (error) {
     console.error('Error clearing data:', error);

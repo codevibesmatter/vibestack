@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { getDatabase, dbMessageBus } from '@/db/db';
-import { getDatabaseStats, clearAllData, dropAllTables } from '@/db/storage';
+import { 
+  getDatabaseStats, 
+  clearAllData, 
+  clearAllDataKeepSchema, 
+  dropAllTables 
+} from '@/db/storage';
 import { Skeleton } from "@/components/ui/skeleton";
 
 // shadcn UI components
@@ -595,9 +600,35 @@ export function DbDebugPanel() {
     resetOperation();
     setIsClearingData(true);
     try {
+      // This now uses the complete reset approach (more reliable after sleep)
       const success = await clearAllData();
       if (success) {
-        setOperationResult('All data cleared successfully');
+        setOperationResult('All data cleared successfully using complete reset');
+        // Fetch schema and stats after a short delay to allow for database reinitialization
+        setTimeout(async () => {
+          await fetchSchema();
+          const stats = await getDatabaseStats();
+          setDbStatistics(stats);
+        }, 500);
+      } else {
+        setOperationError('Failed to clear data');
+      }
+    } catch (error) {
+      setOperationError(`Error clearing data: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsClearingData(false);
+    }
+  };
+
+  // Alternative clear data method that keeps schema intact
+  const handleClearAllDataKeepSchema = async () => {
+    resetOperation();
+    setIsClearingData(true);
+    try {
+      // Uses the alternative approach that only deletes rows
+      const success = await clearAllDataKeepSchema();
+      if (success) {
+        setOperationResult('All data cleared successfully (schema preserved)');
         // Refresh schema and stats
         await fetchSchema();
         const stats = await getDatabaseStats();
@@ -636,98 +667,118 @@ export function DbDebugPanel() {
 
   // Render operations panel
   const renderOperations = () => (
-    <Card>
+    <Card className="mt-4">
       <CardHeader>
         <CardTitle>Database Operations</CardTitle>
-        <CardDescription>Debug utilities</CardDescription>
+        <CardDescription>
+          Manage database schema and data - be careful with these operations
+        </CardDescription>
       </CardHeader>
       <CardContent>
-        <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-2">
-            <Button variant="outline" onClick={handleReloadSchema}>
-              Reload Schema
-            </Button>
-            <Button variant="outline" onClick={() => window.location.reload()}>
-              Refresh Page
-            </Button>
-          </div>
-          
-          <div className="border-t pt-4">
-            <h3 className="text-sm font-medium mb-2 text-muted-foreground">Data Management</h3>
-            <div className="grid grid-cols-2 gap-2">
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button 
-                    variant="outline" 
-                    className="border-yellow-500 text-yellow-500 hover:bg-yellow-500/10"
-                    disabled={isClearingData}
-                  >
-                    {isClearingData ? 'Clearing...' : 'Clear All Data'}
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Clear all data?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This will delete all data from all tables but preserve the database structure.
-                      This action cannot be undone.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction onClick={handleClearAllData}>
-                      Clear All Data
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button 
-                    variant="outline" 
-                    className="border-red-500 text-red-500 hover:bg-red-500/10"
-                    disabled={isDroppingTables}
-                  >
-                    {isDroppingTables ? 'Dropping...' : 'Drop All Tables'}
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Drop all tables?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This will completely drop all tables and enum types from the database.
-                      The database will need to be re-initialized afterward.
-                      This action cannot be undone.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction 
-                      className="bg-red-500 hover:bg-red-600"
-                      onClick={handleDropAllTables}
-                    >
-                      Drop All Tables
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            </div>
-          </div>
-          
+        <div className="flex flex-col space-y-4">
+          {/* Operation result display */}
           {operationResult && (
-            <Alert className="bg-green-50 dark:bg-green-950">
-              <AlertTitle>Success</AlertTitle>
-              <AlertDescription>{operationResult}</AlertDescription>
+            <Alert className="bg-green-50">
+              <AlertTitle>Operation Successful</AlertTitle>
+              <AlertDescription>
+                {operationResult}
+              </AlertDescription>
             </Alert>
           )}
-          
           {operationError && (
             <Alert variant="destructive">
-              <AlertTitle>Error</AlertTitle>
-              <AlertDescription>{operationError}</AlertDescription>
+              <AlertTitle>Operation Failed</AlertTitle>
+              <AlertDescription>
+                {operationError}
+              </AlertDescription>
             </Alert>
           )}
+          
+          {/* Schema reload button */}
+          <div className="flex flex-row justify-end">
+            <Button 
+              onClick={handleReloadSchema} 
+              variant="outline" 
+              disabled={schemaLoading}
+              className="text-xs"
+            >
+              {schemaLoading ? "Loading..." : "Reload Schema"}
+            </Button>
+          </div>
+          
+          {/* Clear All Data Operation */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" className="w-full">
+                Clear All Data (Complete Reset)
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Clear All Data</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will completely reset the database by deleting the entire IndexedDB storage and reconnecting.
+                  This is the most reliable method that prevents stale data issues after PC sleep.
+                  All data will be permanently deleted. This is not reversible.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleClearAllData}>
+                  Clear All Data
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+          
+          {/* Clear All Data (Keep Schema) Operation */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" className="w-full opacity-80">
+                Clear All Data (Keep Schema)
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Clear Data (Preserve Schema)</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will delete all rows from all tables but keep the database structure intact.
+                  This is faster but may have issues with stale data after PC sleep.
+                  All data will be permanently deleted. This is not reversible.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleClearAllDataKeepSchema}>
+                  Clear Data Only
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+          
+          {/* Drop All Tables Operation */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" className="w-full">
+                Drop All Tables & Types
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Drop All Tables</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will drop all tables and custom types in the database.
+                  All data and schema will be permanently deleted. This is not reversible.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleDropAllTables}>
+                  Drop Everything
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </CardContent>
     </Card>

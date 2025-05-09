@@ -1,4 +1,4 @@
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link } from '@tanstack/react-router'
 import {
   BadgeCheck,
   Bell,
@@ -24,11 +24,11 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar'
-import { useAuthStore } from '@/stores/authStore'
-import { authClient } from '@/lib/auth'
+import { useCurrentUser } from '@/hooks/use-current-user'
+import { useSignOut } from '@/hooks/use-sign-out'
 
 export function NavUser({
-  user,
+  user: propUser, // Keep the original prop for backward compatibility
 }: {
   user: {
     name: string
@@ -37,21 +37,15 @@ export function NavUser({
   }
 }) {
   const { isMobile } = useSidebar()
-  const { setUnauthenticated } = useAuthStore()
-  const navigate = useNavigate()
-
-  const handleSignOut = async () => {
-    try {
-      console.log('[AUTH] Attempting to sign out via authClient.signOut()...');
-      await authClient.signOut();
-      console.log('[AUTH] authClient.signOut() successful.');
-    } catch (error) {
-      console.error('[AUTH] authClient.signOut() failed:', error);
-    }
-    console.log('[AUTH] Clearing frontend auth state and redirecting to sign-in.');
-    setUnauthenticated();
-    navigate({ to: '/sign-in', replace: true });
-  };
+  const { data: userProfile, loading } = useCurrentUser()
+  const { signOut } = useSignOut()
+  
+  // Use the database profile if available, otherwise fall back to props/auth store
+  const user = {
+    name: userProfile?.name || propUser.name || 'User',
+    email: userProfile?.email || propUser.email || '',
+    avatar: userProfile?.image || propUser.avatar,
+  }
 
   return (
     <SidebarMenu>
@@ -63,14 +57,17 @@ export function NavUser({
               className='data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground'
             >
               <Avatar className='h-8 w-8 rounded-lg'>
-                {/* <AvatarImage src={user.avatar} alt={user.name} /> */}
-                <AvatarFallback className='rounded-lg'>
-                  <User className="h-4 w-4" />
-                </AvatarFallback>
+                {user.avatar ? (
+                  <AvatarImage src={user.avatar} alt={user.name} />
+                ) : (
+                  <AvatarFallback className='rounded-lg'>
+                    <User className="h-4 w-4" />
+                  </AvatarFallback>
+                )}
               </Avatar>
               <div className='grid flex-1 text-left text-sm leading-tight'>
-                <span className='truncate font-semibold'>{user.name}</span>
-                <span className='truncate text-xs'>{user.email}</span>
+                <span className='truncate font-semibold'>{loading ? '...' : user.name}</span>
+                <span className='truncate text-xs'>{loading ? '...' : user.email}</span>
               </div>
               <ChevronsUpDown className='ml-auto size-4' />
             </SidebarMenuButton>
@@ -84,14 +81,17 @@ export function NavUser({
             <DropdownMenuLabel className='p-0 font-normal'>
               <div className='flex items-center gap-2 px-1 py-1.5 text-left text-sm'>
                 <Avatar className='h-8 w-8 rounded-lg'>
-                  {/* <AvatarImage src={user.avatar} alt={user.name} /> */}
-                  <AvatarFallback className='rounded-lg'>
-                    <User className="h-4 w-4" />
-                  </AvatarFallback>
+                  {user.avatar ? (
+                    <AvatarImage src={user.avatar} alt={user.name} />
+                  ) : (
+                    <AvatarFallback className='rounded-lg'>
+                      <User className="h-4 w-4" />
+                    </AvatarFallback>
+                  )}
                 </Avatar>
                 <div className='grid flex-1 text-left text-sm leading-tight'>
-                  <span className='truncate font-semibold'>{user.name}</span>
-                  <span className='truncate text-xs'>{user.email}</span>
+                  <span className='truncate font-semibold'>{loading ? '...' : user.name}</span>
+                  <span className='truncate text-xs'>{loading ? '...' : user.email}</span>
                 </div>
               </div>
             </DropdownMenuLabel>
@@ -124,7 +124,7 @@ export function NavUser({
               </DropdownMenuItem>
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={handleSignOut}>
+            <DropdownMenuItem onSelect={signOut}>
               <LogOut />
               Log out
             </DropdownMenuItem>

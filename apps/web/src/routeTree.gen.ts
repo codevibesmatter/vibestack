@@ -28,6 +28,7 @@ import { Route as AuthenticatedDebugRouteImport } from './routes/_authenticated/
 import { Route as AuthenticatedUsersIndexImport } from './routes/_authenticated/users/index'
 import { Route as AuthenticatedTasksIndexImport } from './routes/_authenticated/tasks/index'
 import { Route as AuthenticatedSettingsIndexImport } from './routes/_authenticated/settings/index'
+import { Route as AuthenticatedProjectsIndexImport } from './routes/_authenticated/projects/index'
 import { Route as AuthenticatedHelpCenterIndexImport } from './routes/_authenticated/help-center/index'
 import { Route as AuthenticatedChatsIndexImport } from './routes/_authenticated/chats/index'
 import { Route as AuthenticatedAppsIndexImport } from './routes/_authenticated/apps/index'
@@ -35,8 +36,11 @@ import { Route as AuthenticatedSettingsNotificationsImport } from './routes/_aut
 import { Route as AuthenticatedSettingsDisplayImport } from './routes/_authenticated/settings/display'
 import { Route as AuthenticatedSettingsAppearanceImport } from './routes/_authenticated/settings/appearance'
 import { Route as AuthenticatedSettingsAccountImport } from './routes/_authenticated/settings/account'
+import { Route as AuthenticatedDebugSyncChangesImport } from './routes/_authenticated/debug/sync-changes'
 import { Route as AuthenticatedDebugSyncImport } from './routes/_authenticated/debug/sync'
+import { Route as AuthenticatedDebugLiveQueryImport } from './routes/_authenticated/debug/live-query'
 import { Route as AuthenticatedDebugDatabaseImport } from './routes/_authenticated/debug/database'
+import { Route as AuthenticatedDebugDataTableImport } from './routes/_authenticated/debug/data-table'
 import { Route as AuthenticatedDebugAuthImport } from './routes/_authenticated/debug/auth'
 
 // Create/Update Routes
@@ -146,6 +150,14 @@ const AuthenticatedSettingsIndexRoute = AuthenticatedSettingsIndexImport.update(
   } as any,
 )
 
+const AuthenticatedProjectsIndexRoute = AuthenticatedProjectsIndexImport.update(
+  {
+    id: '/projects/',
+    path: '/projects/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any,
+)
+
 const AuthenticatedHelpCenterIndexRoute =
   AuthenticatedHelpCenterIndexImport.update({
     id: '/help-center/',
@@ -193,11 +205,25 @@ const AuthenticatedSettingsAccountRoute =
     getParentRoute: () => AuthenticatedSettingsRouteRoute,
   } as any)
 
+const AuthenticatedDebugSyncChangesRoute =
+  AuthenticatedDebugSyncChangesImport.update({
+    id: '/sync-changes',
+    path: '/sync-changes',
+    getParentRoute: () => AuthenticatedDebugRouteRoute,
+  } as any)
+
 const AuthenticatedDebugSyncRoute = AuthenticatedDebugSyncImport.update({
   id: '/sync',
   path: '/sync',
   getParentRoute: () => AuthenticatedDebugRouteRoute,
 } as any)
+
+const AuthenticatedDebugLiveQueryRoute =
+  AuthenticatedDebugLiveQueryImport.update({
+    id: '/live-query',
+    path: '/live-query',
+    getParentRoute: () => AuthenticatedDebugRouteRoute,
+  } as any)
 
 const AuthenticatedDebugDatabaseRoute = AuthenticatedDebugDatabaseImport.update(
   {
@@ -206,6 +232,13 @@ const AuthenticatedDebugDatabaseRoute = AuthenticatedDebugDatabaseImport.update(
     getParentRoute: () => AuthenticatedDebugRouteRoute,
   } as any,
 )
+
+const AuthenticatedDebugDataTableRoute =
+  AuthenticatedDebugDataTableImport.update({
+    id: '/data-table',
+    path: '/data-table',
+    getParentRoute: () => AuthenticatedDebugRouteRoute,
+  } as any)
 
 const AuthenticatedDebugAuthRoute = AuthenticatedDebugAuthImport.update({
   id: '/auth',
@@ -322,6 +355,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedDebugAuthImport
       parentRoute: typeof AuthenticatedDebugRouteImport
     }
+    '/_authenticated/debug/data-table': {
+      id: '/_authenticated/debug/data-table'
+      path: '/data-table'
+      fullPath: '/debug/data-table'
+      preLoaderRoute: typeof AuthenticatedDebugDataTableImport
+      parentRoute: typeof AuthenticatedDebugRouteImport
+    }
     '/_authenticated/debug/database': {
       id: '/_authenticated/debug/database'
       path: '/database'
@@ -329,11 +369,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedDebugDatabaseImport
       parentRoute: typeof AuthenticatedDebugRouteImport
     }
+    '/_authenticated/debug/live-query': {
+      id: '/_authenticated/debug/live-query'
+      path: '/live-query'
+      fullPath: '/debug/live-query'
+      preLoaderRoute: typeof AuthenticatedDebugLiveQueryImport
+      parentRoute: typeof AuthenticatedDebugRouteImport
+    }
     '/_authenticated/debug/sync': {
       id: '/_authenticated/debug/sync'
       path: '/sync'
       fullPath: '/debug/sync'
       preLoaderRoute: typeof AuthenticatedDebugSyncImport
+      parentRoute: typeof AuthenticatedDebugRouteImport
+    }
+    '/_authenticated/debug/sync-changes': {
+      id: '/_authenticated/debug/sync-changes'
+      path: '/sync-changes'
+      fullPath: '/debug/sync-changes'
+      preLoaderRoute: typeof AuthenticatedDebugSyncChangesImport
       parentRoute: typeof AuthenticatedDebugRouteImport
     }
     '/_authenticated/settings/account': {
@@ -385,6 +439,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedHelpCenterIndexImport
       parentRoute: typeof AuthenticatedRouteImport
     }
+    '/_authenticated/projects/': {
+      id: '/_authenticated/projects/'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof AuthenticatedProjectsIndexImport
+      parentRoute: typeof AuthenticatedRouteImport
+    }
     '/_authenticated/settings/': {
       id: '/_authenticated/settings/'
       path: '/'
@@ -413,15 +474,21 @@ declare module '@tanstack/react-router' {
 
 interface AuthenticatedDebugRouteRouteChildren {
   AuthenticatedDebugAuthRoute: typeof AuthenticatedDebugAuthRoute
+  AuthenticatedDebugDataTableRoute: typeof AuthenticatedDebugDataTableRoute
   AuthenticatedDebugDatabaseRoute: typeof AuthenticatedDebugDatabaseRoute
+  AuthenticatedDebugLiveQueryRoute: typeof AuthenticatedDebugLiveQueryRoute
   AuthenticatedDebugSyncRoute: typeof AuthenticatedDebugSyncRoute
+  AuthenticatedDebugSyncChangesRoute: typeof AuthenticatedDebugSyncChangesRoute
 }
 
 const AuthenticatedDebugRouteRouteChildren: AuthenticatedDebugRouteRouteChildren =
   {
     AuthenticatedDebugAuthRoute: AuthenticatedDebugAuthRoute,
+    AuthenticatedDebugDataTableRoute: AuthenticatedDebugDataTableRoute,
     AuthenticatedDebugDatabaseRoute: AuthenticatedDebugDatabaseRoute,
+    AuthenticatedDebugLiveQueryRoute: AuthenticatedDebugLiveQueryRoute,
     AuthenticatedDebugSyncRoute: AuthenticatedDebugSyncRoute,
+    AuthenticatedDebugSyncChangesRoute: AuthenticatedDebugSyncChangesRoute,
   }
 
 const AuthenticatedDebugRouteRouteWithChildren =
@@ -459,6 +526,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedAppsIndexRoute: typeof AuthenticatedAppsIndexRoute
   AuthenticatedChatsIndexRoute: typeof AuthenticatedChatsIndexRoute
   AuthenticatedHelpCenterIndexRoute: typeof AuthenticatedHelpCenterIndexRoute
+  AuthenticatedProjectsIndexRoute: typeof AuthenticatedProjectsIndexRoute
   AuthenticatedTasksIndexRoute: typeof AuthenticatedTasksIndexRoute
   AuthenticatedUsersIndexRoute: typeof AuthenticatedUsersIndexRoute
 }
@@ -470,6 +538,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedAppsIndexRoute: AuthenticatedAppsIndexRoute,
   AuthenticatedChatsIndexRoute: AuthenticatedChatsIndexRoute,
   AuthenticatedHelpCenterIndexRoute: AuthenticatedHelpCenterIndexRoute,
+  AuthenticatedProjectsIndexRoute: AuthenticatedProjectsIndexRoute,
   AuthenticatedTasksIndexRoute: AuthenticatedTasksIndexRoute,
   AuthenticatedUsersIndexRoute: AuthenticatedUsersIndexRoute,
 }
@@ -493,8 +562,11 @@ export interface FileRoutesByFullPath {
   '/503': typeof errors503Route
   '/': typeof AuthenticatedIndexRoute
   '/debug/auth': typeof AuthenticatedDebugAuthRoute
+  '/debug/data-table': typeof AuthenticatedDebugDataTableRoute
   '/debug/database': typeof AuthenticatedDebugDatabaseRoute
+  '/debug/live-query': typeof AuthenticatedDebugLiveQueryRoute
   '/debug/sync': typeof AuthenticatedDebugSyncRoute
+  '/debug/sync-changes': typeof AuthenticatedDebugSyncChangesRoute
   '/settings/account': typeof AuthenticatedSettingsAccountRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/settings/display': typeof AuthenticatedSettingsDisplayRoute
@@ -502,6 +574,7 @@ export interface FileRoutesByFullPath {
   '/apps': typeof AuthenticatedAppsIndexRoute
   '/chats': typeof AuthenticatedChatsIndexRoute
   '/help-center': typeof AuthenticatedHelpCenterIndexRoute
+  '/projects': typeof AuthenticatedProjectsIndexRoute
   '/settings/': typeof AuthenticatedSettingsIndexRoute
   '/tasks': typeof AuthenticatedTasksIndexRoute
   '/users': typeof AuthenticatedUsersIndexRoute
@@ -521,8 +594,11 @@ export interface FileRoutesByTo {
   '/503': typeof errors503Route
   '/': typeof AuthenticatedIndexRoute
   '/debug/auth': typeof AuthenticatedDebugAuthRoute
+  '/debug/data-table': typeof AuthenticatedDebugDataTableRoute
   '/debug/database': typeof AuthenticatedDebugDatabaseRoute
+  '/debug/live-query': typeof AuthenticatedDebugLiveQueryRoute
   '/debug/sync': typeof AuthenticatedDebugSyncRoute
+  '/debug/sync-changes': typeof AuthenticatedDebugSyncChangesRoute
   '/settings/account': typeof AuthenticatedSettingsAccountRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/settings/display': typeof AuthenticatedSettingsDisplayRoute
@@ -530,6 +606,7 @@ export interface FileRoutesByTo {
   '/apps': typeof AuthenticatedAppsIndexRoute
   '/chats': typeof AuthenticatedChatsIndexRoute
   '/help-center': typeof AuthenticatedHelpCenterIndexRoute
+  '/projects': typeof AuthenticatedProjectsIndexRoute
   '/settings': typeof AuthenticatedSettingsIndexRoute
   '/tasks': typeof AuthenticatedTasksIndexRoute
   '/users': typeof AuthenticatedUsersIndexRoute
@@ -552,8 +629,11 @@ export interface FileRoutesById {
   '/(errors)/503': typeof errors503Route
   '/_authenticated/': typeof AuthenticatedIndexRoute
   '/_authenticated/debug/auth': typeof AuthenticatedDebugAuthRoute
+  '/_authenticated/debug/data-table': typeof AuthenticatedDebugDataTableRoute
   '/_authenticated/debug/database': typeof AuthenticatedDebugDatabaseRoute
+  '/_authenticated/debug/live-query': typeof AuthenticatedDebugLiveQueryRoute
   '/_authenticated/debug/sync': typeof AuthenticatedDebugSyncRoute
+  '/_authenticated/debug/sync-changes': typeof AuthenticatedDebugSyncChangesRoute
   '/_authenticated/settings/account': typeof AuthenticatedSettingsAccountRoute
   '/_authenticated/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
   '/_authenticated/settings/display': typeof AuthenticatedSettingsDisplayRoute
@@ -561,6 +641,7 @@ export interface FileRoutesById {
   '/_authenticated/apps/': typeof AuthenticatedAppsIndexRoute
   '/_authenticated/chats/': typeof AuthenticatedChatsIndexRoute
   '/_authenticated/help-center/': typeof AuthenticatedHelpCenterIndexRoute
+  '/_authenticated/projects/': typeof AuthenticatedProjectsIndexRoute
   '/_authenticated/settings/': typeof AuthenticatedSettingsIndexRoute
   '/_authenticated/tasks/': typeof AuthenticatedTasksIndexRoute
   '/_authenticated/users/': typeof AuthenticatedUsersIndexRoute
@@ -584,8 +665,11 @@ export interface FileRouteTypes {
     | '/503'
     | '/'
     | '/debug/auth'
+    | '/debug/data-table'
     | '/debug/database'
+    | '/debug/live-query'
     | '/debug/sync'
+    | '/debug/sync-changes'
     | '/settings/account'
     | '/settings/appearance'
     | '/settings/display'
@@ -593,6 +677,7 @@ export interface FileRouteTypes {
     | '/apps'
     | '/chats'
     | '/help-center'
+    | '/projects'
     | '/settings/'
     | '/tasks'
     | '/users'
@@ -611,8 +696,11 @@ export interface FileRouteTypes {
     | '/503'
     | '/'
     | '/debug/auth'
+    | '/debug/data-table'
     | '/debug/database'
+    | '/debug/live-query'
     | '/debug/sync'
+    | '/debug/sync-changes'
     | '/settings/account'
     | '/settings/appearance'
     | '/settings/display'
@@ -620,6 +708,7 @@ export interface FileRouteTypes {
     | '/apps'
     | '/chats'
     | '/help-center'
+    | '/projects'
     | '/settings'
     | '/tasks'
     | '/users'
@@ -640,8 +729,11 @@ export interface FileRouteTypes {
     | '/(errors)/503'
     | '/_authenticated/'
     | '/_authenticated/debug/auth'
+    | '/_authenticated/debug/data-table'
     | '/_authenticated/debug/database'
+    | '/_authenticated/debug/live-query'
     | '/_authenticated/debug/sync'
+    | '/_authenticated/debug/sync-changes'
     | '/_authenticated/settings/account'
     | '/_authenticated/settings/appearance'
     | '/_authenticated/settings/display'
@@ -649,6 +741,7 @@ export interface FileRouteTypes {
     | '/_authenticated/apps/'
     | '/_authenticated/chats/'
     | '/_authenticated/help-center/'
+    | '/_authenticated/projects/'
     | '/_authenticated/settings/'
     | '/_authenticated/tasks/'
     | '/_authenticated/users/'
@@ -715,6 +808,7 @@ export const routeTree = rootRoute
         "/_authenticated/apps/",
         "/_authenticated/chats/",
         "/_authenticated/help-center/",
+        "/_authenticated/projects/",
         "/_authenticated/tasks/",
         "/_authenticated/users/"
       ]
@@ -724,8 +818,11 @@ export const routeTree = rootRoute
       "parent": "/_authenticated",
       "children": [
         "/_authenticated/debug/auth",
+        "/_authenticated/debug/data-table",
         "/_authenticated/debug/database",
-        "/_authenticated/debug/sync"
+        "/_authenticated/debug/live-query",
+        "/_authenticated/debug/sync",
+        "/_authenticated/debug/sync-changes"
       ]
     },
     "/_authenticated/settings": {
@@ -777,12 +874,24 @@ export const routeTree = rootRoute
       "filePath": "_authenticated/debug/auth.tsx",
       "parent": "/_authenticated/debug"
     },
+    "/_authenticated/debug/data-table": {
+      "filePath": "_authenticated/debug/data-table.tsx",
+      "parent": "/_authenticated/debug"
+    },
     "/_authenticated/debug/database": {
       "filePath": "_authenticated/debug/database.tsx",
       "parent": "/_authenticated/debug"
     },
+    "/_authenticated/debug/live-query": {
+      "filePath": "_authenticated/debug/live-query.tsx",
+      "parent": "/_authenticated/debug"
+    },
     "/_authenticated/debug/sync": {
       "filePath": "_authenticated/debug/sync.tsx",
+      "parent": "/_authenticated/debug"
+    },
+    "/_authenticated/debug/sync-changes": {
+      "filePath": "_authenticated/debug/sync-changes.tsx",
       "parent": "/_authenticated/debug"
     },
     "/_authenticated/settings/account": {
@@ -811,6 +920,10 @@ export const routeTree = rootRoute
     },
     "/_authenticated/help-center/": {
       "filePath": "_authenticated/help-center/index.tsx",
+      "parent": "/_authenticated"
+    },
+    "/_authenticated/projects/": {
+      "filePath": "_authenticated/projects/index.tsx",
       "parent": "/_authenticated"
     },
     "/_authenticated/settings/": {

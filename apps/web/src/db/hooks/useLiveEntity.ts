@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { getDatabase, Results } from '@/db/db';
 // import { PGliteQueryBuilder } from '../typeorm/PGliteQueryBuilder'; // REMOVED - Use standard TypeORM QB
 import { SelectQueryBuilder, ObjectLiteral } from 'typeorm'; // Import standard SelectQueryBuilder & ObjectLiteral
@@ -11,17 +11,48 @@ interface QueryState<T> {
 }
 
 /**
+ * Helper function to transform snake_case database fields to camelCase TypeScript objects.
+ * This handles both direct fields and prefixed fields (like task_id -> id).
+ */
+function transformDatabaseResultToEntity<T extends ObjectLiteral>(
+  row: Record<string, any>,
+  entityName: string
+): T {
+  const result: Record<string, any> = {};
+  const entityPrefix = entityName.toLowerCase() + '_';
+  
+  // Process each field in the row
+  for (const key in row) {
+    if (Object.prototype.hasOwnProperty.call(row, key)) {
+      const value = row[key];
+      
+      // Handle prefixed fields (e.g., task_id -> id)
+      if (key.startsWith(entityPrefix)) {
+        // Convert snake_case to camelCase and remove prefix
+        const unprefixedKey = key.substring(entityPrefix.length);
+        const camelCaseKey = unprefixedKey.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+        result[camelCaseKey] = value;
+      } else {
+        // Handle non-prefixed fields (direct snake_case to camelCase)
+        const camelCaseKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+        result[camelCaseKey] = value;
+      }
+    }
+  }
+  
+  return result as T;
+}
+
+/**
  * React hook for executing a query using TypeORM's query builder and automatically
  * updating when underlying data changes.
- * Uses PGlite's `live.incrementalQuery` if a `keyColumn` is provided for efficiency,
- * otherwise falls back to `live.query` which triggers a full refetch.
+ * Uses PGlite's live query functionality to handle real-time updates.
  */
-export function useLiveEntity<T extends ObjectLiteral & { id: string; updated_at?: Date | string; created_at?: Date | string }>(
+export function useLiveEntity<T extends ObjectLiteral & { id: string; updatedAt?: Date | string; createdAt?: Date | string }>(
   queryBuilder: SelectQueryBuilder<T> | null,
   options?: {
     enabled?: boolean;
-    /** If provided, uses efficient `live.incrementalQuery` with this column as the key. */
-    keyColumn?: string;
+    transform?: boolean; // Add option to control transformation
   }
 ): QueryState<T> {
   const [state, setState] = useState<QueryState<T>>({
@@ -29,133 +60,151 @@ export function useLiveEntity<T extends ObjectLiteral & { id: string; updated_at
     loading: options?.enabled !== false && !!queryBuilder,
     error: null
   });
-  // State to trigger refetches (only used for non-incremental fallback)
-  const [refetchCounter, setRefetchCounter] = useState(0);
 
+  const unsubscribeRef = useRef<(() => Promise<void>) | null>(null);
   const enabled = !!queryBuilder && options?.enabled !== false;
-  const keyColumn = options?.keyColumn;
+  const shouldTransform = options?.transform !== false; // Default to true if not specified
 
-  // --- Effect for Fetching Data with TypeORM --- 
+  // Extract entity name from query builder for transformation
+  const entityName = queryBuilder?.expressionMap.mainAlias?.name || '';
+
+  // Effect to set up the live query
   useEffect(() => {
-    const fetchData = async () => {
-      if (!enabled || !queryBuilder) {
-        setState({ data: null, loading: false, error: null });
-        return;
-      }
+    if (!enabled || !queryBuilder) {
+      setState({ data: null, loading: false, error: null });
+      return;
+    }
 
-      console.log('[useLiveEntity Fetching] Running queryBuilder.getMany()...');
-      // Ensure state type matches QueryState<T>
-      setState((prev: QueryState<T>) => ({ ...prev, loading: true, error: null }));
+    let isMounted = true;
+    console.log('[useLiveEntity] Setting up live query with PGlite...');
 
+    const setupLiveQuery = async () => {
       try {
-        const entities = await queryBuilder.getMany();
-        console.log(`[useLiveEntity Fetching] Success, fetched ${entities?.length ?? 0} entities.`);
+        // First set loading state
+        if (isMounted) {
+          setState(prev => ({ ...prev, loading: true, error: null }));
+        }
 
-        // Ensure state type matches QueryState<T>
-        setState((prevState) => {
-          // Memoization check still useful for initial load
-          if (JSON.stringify(prevState.data) !== JSON.stringify(entities)) {
-            return { data: entities, loading: false, error: null };
-          }
-          return { ...prevState, loading: false, error: null };
-        });
-      } catch (error) {
-        console.error('[useLiveEntity Fetching] Error executing queryBuilder:', error);
-        // Ensure state type matches QueryState<T>
-        setState({ data: null, loading: false, error: error instanceof Error ? error : new Error(String(error)) });
-      }
-    };
-
-    fetchData();
-    // Dependencies: include refetchCounter to trigger refetch ONLY IF not using keyColumn
-  }, [enabled, queryBuilder?.getSql(), JSON.stringify(queryBuilder?.getParameters()), keyColumn ? null : refetchCounter]); // Add keyColumn check
-
-  // --- Effect for Setting up PGlite Live Query Listener --- 
-  useEffect(() => {
-    let unsubscribe: (() => Promise<void>) | undefined;
-    let isInitialUpdate = true;
-
-    const setupLiveQueryListener = async () => {
-      if (!enabled || !queryBuilder) return;
-
-      const listenerType = keyColumn ? 'incrementalQuery' : 'query';
-      console.log(`[useLiveEntity Listener] Setting up PGlite ${listenerType} listener...`);
-      
-      try {
         const db = await getDatabase();
-        const [sql, params] = queryBuilder.getQueryAndParameters();
+        
+        // Check if the live extension is available
+        if (!db.live || !db.live.query) {
+          throw new Error('PGlite live query extension is not available');
+        }
 
-        if (keyColumn && !db.live?.incrementalQuery) {
-          throw new Error(`Live query function (incrementalQuery) not available on database instance.`);
-        } else if (!keyColumn && !db.live?.query) {
-          throw new Error(`Live query function (query) not available on database instance.`);
+        console.log('[useLiveEntity] Database instance obtained with live query support');
+        
+        // Get the SQL and parameters from the query builder
+        const [sql, params] = queryBuilder.getQueryAndParameters();
+        console.log('[useLiveEntity] Watching SQL:', sql, 'with params:', params);
+
+        // Set up the live query
+        const liveQueryResult = await db.live.query(sql, params, (results: Results<any>) => {
+          console.log('[useLiveEntity] Live query update received:', results);
+          
+          if (isMounted) {
+            // Format and transform the results
+            let formattedResults = results.rows || [];
+            
+            // Apply transformation if enabled
+            if (shouldTransform && entityName) {
+              console.log('[useLiveEntity] Transforming snake_case to camelCase entities');
+              formattedResults = formattedResults.map((row: Record<string, any>) => 
+                transformDatabaseResultToEntity<T>(row, entityName)
+              );
+            }
+            
+            console.log('[useLiveEntity] Processed results:', formattedResults.length, 'rows');
+            
+            setState(prev => {
+              // Only update if the data has actually changed
+              const stringifiedNew = JSON.stringify(formattedResults);
+              const stringifiedOld = JSON.stringify(prev.data);
+              
+              if (stringifiedNew !== stringifiedOld) {
+                console.log('[useLiveEntity] Data changed, updating state');
+                return { data: formattedResults, loading: false, error: null };
+              }
+              console.log('[useLiveEntity] No changes in data');
+              return { ...prev, loading: false };
+            });
+          }
+        });
+
+        // Store the unsubscribe function
+        unsubscribeRef.current = liveQueryResult.unsubscribe;
+        
+        // Set the initial results if we have them
+        if (isMounted && liveQueryResult.initialResults?.rows) {
+          console.log('[useLiveEntity] Setting initial results:', liveQueryResult.initialResults.rows.length, 'rows');
+          
+          // Apply transformation to initial results if enabled
+          let initialResults = liveQueryResult.initialResults.rows;
+          
+          if (shouldTransform && entityName) {
+            console.log('[useLiveEntity] Transforming initial results from snake_case to camelCase');
+            initialResults = initialResults.map((row: Record<string, any>) => 
+              transformDatabaseResultToEntity<T>(row, entityName)
+            );
+          }
+          
+          setState({ 
+            data: initialResults, 
+            loading: false, 
+            error: null 
+          });
         }
         
-        console.log(`[useLiveEntity Listener] Watching SQL:`, { sql, params, keyColumn });
-
-        // Handler for incremental updates (updates state directly)
-        const handleIncrementalUpdate = (res: Results<T>) => {
-          console.log(`[useLiveEntity Listener (${listenerType})] Received update.`, res);
-          if (isInitialUpdate) {
-            console.log(`[useLiveEntity Listener (${listenerType})] Skipping initial update notification.`);
-            isInitialUpdate = false;
-            return;
-          }
-          // Directly update state with incremental results
-          console.log(`[useLiveEntity Listener (${listenerType})] Updating state directly with ${res?.rows?.length ?? 0} rows.`);
-          setState((prevState) => {
-            // Simple replacement, assumes incremental query returns the desired state
-            if (JSON.stringify(prevState.data) !== JSON.stringify(res.rows)) {
-               return { data: res.rows, loading: false, error: null };
-            }
-            return prevState; // No change detected
-          });
-        };
-
-        // Handler for basic updates (triggers refetch)
-        const handleBasicUpdate = (res: Results<T>) => {
-          console.log(`[useLiveEntity Listener (${listenerType})] Received update notification.`, res);
-          if (isInitialUpdate) {
-            console.log(`[useLiveEntity Listener (${listenerType})] Skipping initial update notification.`);
-            isInitialUpdate = false;
-            return;
-          }
-          // Trigger refetch by incrementing the counter
-          console.log(`[useLiveEntity Listener (${listenerType})] Triggering refetch via counter increment...`);
-          setRefetchCounter(count => count + 1);
-        };
-
-        let liveQueryReturn;
-        if (keyColumn && db.live?.incrementalQuery) {
-           liveQueryReturn = await db.live.incrementalQuery(sql, params, keyColumn, handleIncrementalUpdate);
-        } else if (db.live?.query) {
-           liveQueryReturn = await db.live.query(sql, params, handleBasicUpdate);
-        } else {
-           // Should be caught by checks above, but safety net
-           throw new Error("Suitable live query function not found.");
-        }
-
-        unsubscribe = liveQueryReturn.unsubscribe;
-        console.log(`[useLiveEntity Listener (${listenerType})] Listener setup complete.`);
-
+        console.log('[useLiveEntity] Live query setup complete');
       } catch (error) {
-        console.error('[useLiveEntity Listener] Error setting up listener:', error);
-        // Set error state if listener fails
-        setState((prev) => ({ ...prev, loading: false, error: error instanceof Error ? error : new Error(String(error)) }));
+        console.error('[useLiveEntity] Error setting up live query:', error);
+        
+        if (isMounted) {
+          setState({ 
+            data: null, 
+            loading: false, 
+            error: error instanceof Error ? error : new Error(String(error)) 
+          });
+          
+          // Fall back to a regular query if live query fails
+          try {
+            console.log('[useLiveEntity] Falling back to regular query');
+            const entities = await queryBuilder.getMany();
+            
+            if (isMounted) {
+              setState({ data: entities, loading: false, error: null });
+            }
+          } catch (fallbackError) {
+            console.error('[useLiveEntity] Fallback query failed:', fallbackError);
+            if (isMounted) {
+              setState({ 
+                data: null, 
+                loading: false, 
+                error: fallbackError instanceof Error 
+                  ? fallbackError 
+                  : new Error(String(fallbackError)) 
+              });
+            }
+          }
+        }
       }
     };
 
-    setupLiveQueryListener();
-    
+    setupLiveQuery();
+
+    // Cleanup: unsubscribe from live query
     return () => {
-      if (unsubscribe) {
-        console.log(`[useLiveEntity Listener] Unsubscribing (${keyColumn ? 'incrementalQuery' : 'query'})...`);
-        unsubscribe().catch(err => console.error('[useLiveEntity Listener] Error unsubscribing:', err));
+      isMounted = false;
+      
+      if (unsubscribeRef.current) {
+        console.log('[useLiveEntity] Unsubscribing from live query');
+        unsubscribeRef.current().catch(err => {
+          console.error('[useLiveEntity] Error unsubscribing from live query:', err);
+        });
+        unsubscribeRef.current = null;
       }
     };
-    // Dependencies: include keyColumn
-  }, [enabled, queryBuilder?.getSql(), JSON.stringify(queryBuilder?.getParameters()), keyColumn]);
+  }, [enabled, shouldTransform, entityName, queryBuilder && queryBuilder.getSql(), JSON.stringify(queryBuilder?.getParameters())]);
   
-  // Ensure return state type matches QueryState<T>
   return state;
 } 

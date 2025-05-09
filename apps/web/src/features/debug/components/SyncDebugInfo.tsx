@@ -10,6 +10,15 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Progress } from "@/components/ui/progress"; // Import progress bar component
 
 // Properties for the SyncDebugInfo component
 interface SyncDebugInfoProps {
@@ -34,11 +43,18 @@ export function SyncDebugInfo({ showDetailedStats = false }: SyncDebugInfoProps)
     processQueuedChanges,
     serverUrl,
     setServerUrl,
-    isLoading
+    isLoading,
+    resyncAllEntities
   } = useSyncContext();
   
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
+  const [isResyncing, setIsResyncing] = useState<boolean>(false);
+  const [resyncDialogOpen, setResyncDialogOpen] = useState<boolean>(false);
+  const [resyncProgress, setResyncProgress] = useState<{current: number, total: number | null}>({
+    current: 0,
+    total: null
+  });
   
   // Get direct state for comparison (debugging only)
   const syncManager = SyncManager.getInstance();
@@ -79,41 +95,50 @@ export function SyncDebugInfo({ showDetailedStats = false }: SyncDebugInfoProps)
   // Handle clearing the change queue
   const handleClearChangeQueue = async () => {
     try {
-      // Clear all unprocessed changes from the database
-      const { db } = await import('../../../db/db');
-      await db.transaction('rw', db.localChanges, async () => {
-        const count = await db.localChanges
-          .where('processedSync')
-          .equals(0) // Use 0 instead of false for IndexedDB compatibility
-          .delete();
-        console.log(`Deleted ${count} unprocessed changes from the database`);
-        
-        // Update the pending changes count through SyncManager
-        syncManager.updatePendingChangesCount(0);
-      });
+      // Get the SyncManager instance
+      const syncManagerInstance = SyncManager.getInstance();
+      
+      // Get the OutgoingChangeProcessor
+      const outgoingProcessor = syncManagerInstance.getOutgoingChangeProcessor();
+      
+      // Call the method to clear changes on the processor
+      if (outgoingProcessor) {
+        await outgoingProcessor.clearUnprocessedChanges();
+        console.log('Successfully cleared the change queue via OutgoingChangeProcessor.');
+      } else {
+        console.error('OutgoingChangeProcessor is not available.');
+      }
       
       // Force a re-render to update the queue size display
       setLastUpdate(new Date());
     } catch (error) {
-      console.error('Error clearing change queue:', error);
+      console.error('Error clearing change queue via OutgoingChangeProcessor:', error);
+      // Optionally, display an error message to the user here
     }
   };
   
-  // Force state consistency based on connection status
-  const handleFixState = () => {
-    const isCurrentlyConnected = syncManager.isConnected();
-    
-    // Force state consistency
-    if (isCurrentlyConnected && syncState !== 'live') {
-      console.log('SyncDebugInfo: Connection is established but not in live state - requesting state update');
-      syncManager.setState('live');
-    } else if (!isConnected && syncState !== 'disconnected') {
-      console.log('SyncDebugInfo: Not connected but state is not disconnected - forcing state update');
-      syncManager.setState('disconnected');
+  // Handle initiating a full entity resync
+  const handleOpenResyncDialog = () => {
+    setResyncDialogOpen(true);
+  };
+  
+  // Handle confirming the resync
+  const handleConfirmResync = async () => {
+    try {
+      setIsResyncing(true);
+      setResyncDialogOpen(false);
+      setResyncProgress({ current: 0, total: null });
+      
+      // Call the resync function
+      const totalProcessed = await resyncAllEntities();
+      
+      console.log(`Successfully resynced ${totalProcessed} entities`);
+      setResyncProgress({ current: totalProcessed, total: totalProcessed });
+    } catch (error) {
+      console.error('Error during full entity resync:', error);
+    } finally {
+      setIsResyncing(false);
     }
-    
-    // Update the last sync time
-    setLastUpdate(new Date());
   };
   
   // refresh this component more frequently to ensure debug display is accurate
@@ -275,15 +300,58 @@ export function SyncDebugInfo({ showDetailedStats = false }: SyncDebugInfoProps)
               Clear Queue
             </Button>
             
-            <Button 
-              onClick={handleFixState}
-              variant="secondary"
-              title="Fix sync state inconsistencies"
+            <Button
+              onClick={handleOpenResyncDialog}
+              variant="destructive"
+              title="Emergency: Resync all entities from scratch"
+              disabled={!isConnected || syncState !== 'live' || isResyncing}
               size="sm"
             >
-              Fix State
+              Resync All Entities
             </Button>
           </div>
+          
+          {/* Resync progress */}
+          {isResyncing && (
+            <div className="mt-4">
+              <div className="flex justify-between mb-2">
+                <span className="text-sm font-medium">Resyncing entities...</span>
+                {resyncProgress.current > 0 && (
+                  <span className="text-sm text-muted-foreground">
+                    {resyncProgress.current} {resyncProgress.total ? `/ ${resyncProgress.total}` : ''} entities
+                  </span>
+                )}
+              </div>
+              <Progress value={resyncProgress.total ? (resyncProgress.current / resyncProgress.total) * 100 : undefined} />
+            </div>
+          )}
+          
+          {/* Confirmation Dialog */}
+          <Dialog open={resyncDialogOpen} onOpenChange={setResyncDialogOpen}>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>Confirm Full Entity Resync</DialogTitle>
+                <DialogDescription>
+                  This will resend all local entities to the server as new inserts, regardless of whether they've been synced before. 
+                  The server will handle conflict resolution. This operation may take some time and increase server load.
+                </DialogDescription>
+              </DialogHeader>
+              <DialogFooter className="flex gap-2 justify-end">
+                <Button
+                  variant="outline"
+                  onClick={() => setResyncDialogOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="destructive"
+                  onClick={handleConfirmResync}
+                >
+                  Resync All Entities
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           
           {/* Debug information */}
           {showDetailedStats && (

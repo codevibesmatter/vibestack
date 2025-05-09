@@ -1,22 +1,42 @@
 import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import {
   type ApiEnv,
   ServiceErrorType,
   createSuccessResponse,
   createErrorResponse,
 } from '../types/api';
-import { getDBClient } from '../lib/db';
-import { userQueries } from '../domains/users';
+import { NeonService } from '../lib/neon-orm/neon-service';
+import { User, UserRole } from "@repo/dataforge/server-entities";
+import { UserRepository } from '../domains/users';
+
+// Re-export enums for convenience
+export { UserRole };
+
+// Input types for API
+export type UserCreateInput = Partial<Omit<User, 'id' | 'createdAt' | 'updatedAt'>>;
+export type UserUpdateInput = Partial<UserCreateInput>;
 
 // Create users router
 const users = new Hono<ApiEnv>();
 
 // List users
 users.get('/', async (c) => {
-  const client = getDBClient(c);
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
-    await client.connect();
-    const result = await userQueries.findAll(client);
+    const neonService = new NeonService(c);
+    const userRepo = new UserRepository(neonService);
+    const { role } = c.req.query();
+    
+    let result: User[];
+    if (role && Object.values(UserRole).includes(role as UserRole)) {
+      // Use repository for role filtering
+      result = await userRepo.findByRole(role as UserRole);
+    } else {
+      // Use repository for all users
+      result = await userRepo.findAll();
+    }
+    
     return c.json(createSuccessResponse(result));
   } catch (err) {
     console.error('Error listing users:', err);
@@ -24,22 +44,24 @@ users.get('/', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Create user
 users.post('/', async (c) => {
-  const client = getDBClient(c);
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const body = await c.req.json();
-    await client.connect();
-    const result = await userQueries.create(client, body);
+    const neonService = new NeonService(c);
+    const userRepo = new UserRepository(neonService);
+    
+    // The repository will handle validation and defaults
+    const result = await userRepo.create(body);
+    
     return c.json(createSuccessResponse(result), 201);
   } catch (err) {
     console.error('Error creating user:', err);
-    if (err instanceof Error && err.message.includes('Validation failed')) {
+    if (err instanceof Error && err.message.includes('validation')) {
       return c.json(
         createErrorResponse(ServiceErrorType.VALIDATION, err.message),
         400
@@ -49,18 +71,19 @@ users.post('/', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Get user by ID
 users.get('/:id', async (c) => {
-  const client = getDBClient(c);
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const id = c.req.param('id');
-    await client.connect();
-    const user = await userQueries.findById(client, id);
+    const neonService = new NeonService(c);
+    const userRepo = new UserRepository(neonService);
+    
+    const user = await userRepo.findById(id);
+    
     if (!user) {
       return c.json(
         createErrorResponse(
@@ -70,6 +93,7 @@ users.get('/:id', async (c) => {
         404
       );
     }
+    
     return c.json(createSuccessResponse(user));
   } catch (err) {
     console.error('Error getting user:', err);
@@ -77,20 +101,21 @@ users.get('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Update user
 users.patch('/:id', async (c) => {
-  const client = getDBClient(c);
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const id = c.req.param('id');
     const body = await c.req.json();
-    await client.connect();
-    const result = await userQueries.update(client, id, body);
-    if (!result) {
+    const neonService = new NeonService(c);
+    const userRepo = new UserRepository(neonService);
+    
+    // Find the user first to ensure it exists
+    const existingUser = await userRepo.findById(id);
+    if (!existingUser) {
       return c.json(
         createErrorResponse(
           ServiceErrorType.NOT_FOUND,
@@ -99,10 +124,26 @@ users.patch('/:id', async (c) => {
         404
       );
     }
-    return c.json(createSuccessResponse(result));
+    
+    // Update the user
+    await userRepo.update(id, body);
+    
+    // Always fetch the updated user to return the most recent state
+    const updatedUser = await userRepo.findById(id);
+    if (!updatedUser) {
+      return c.json(
+        createErrorResponse(
+          ServiceErrorType.NOT_FOUND,
+          `User with id ${id} not found after update`
+        ),
+        404
+      );
+    }
+    
+    return c.json(createSuccessResponse(updatedUser));
   } catch (err) {
     console.error('Error updating user:', err);
-    if (err instanceof Error && err.message.includes('Validation failed')) {
+    if (err instanceof Error && err.message.includes('validation')) {
       return c.json(
         createErrorResponse(ServiceErrorType.VALIDATION, err.message),
         400
@@ -112,19 +153,20 @@ users.patch('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 
 // Delete user
 users.delete('/:id', async (c) => {
-  const client = getDBClient(c);
+  if (!c.get('user')) throw new HTTPException(401, { message: 'Unauthorized' });
   try {
     const id = c.req.param('id');
-    await client.connect();
-    const success = await userQueries.delete(client, id);
-    if (!success) {
+    const neonService = new NeonService(c);
+    const userRepo = new UserRepository(neonService);
+    
+    // Find the user first to ensure it exists
+    const existingUser = await userRepo.findById(id);
+    if (!existingUser) {
       return c.json(
         createErrorResponse(
           ServiceErrorType.NOT_FOUND,
@@ -133,6 +175,20 @@ users.delete('/:id', async (c) => {
         404
       );
     }
+    
+    // Delete the user
+    const deleted = await userRepo.delete(id);
+    
+    if (!deleted) {
+      return c.json(
+        createErrorResponse(
+          ServiceErrorType.INTERNAL,
+          `User with id ${id} could not be deleted`
+        ),
+        500
+      );
+    }
+    
     return c.json(createSuccessResponse({ id }));
   } catch (err) {
     console.error('Error deleting user:', err);
@@ -140,8 +196,6 @@ users.delete('/:id', async (c) => {
       createErrorResponse(ServiceErrorType.INTERNAL, String(err)),
       500
     );
-  } finally {
-    await client.end();
   }
 });
 

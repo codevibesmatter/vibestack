@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSyncContext } from '@/sync/SyncContext';
 import { SyncManager, SyncState } from '@/sync/SyncManager';
-import { SyncChangeManager } from '@/sync/SyncChangeManager.typeorm';
 
 export type FlowStatus = 'idle' | 'sending' | 'receiving' | 'acknowledged' | 'processed' | 'error' | 'timeout';
 
@@ -30,9 +29,12 @@ export function useSyncVisualizationState(): SyncVisualizationState {
   // --- useEffect for listeners ---
   useEffect(() => {
     const manager = SyncManager.getInstance();
-    const changeManager = SyncChangeManager.getInstance();
 
     // --- Define Handlers INSIDE useEffect ---
+    const handleInitialized = ({ lsn }: { lsn: string }) => {
+      setCurrentLsn(lsn);
+    };
+
     const handleStateChange = ({ newState }: { newState: SyncState }) => {
       setErrorInfo(null);
     };
@@ -62,13 +64,6 @@ export function useSyncVisualizationState(): SyncVisualizationState {
       setOutgoingStatus('error');
       resetStatus(setOutgoingStatus);
       console.error("Sync Change Error:", error);
-    };
-
-    const handleChangeTimeout = ({ changeId }: { changeId: string }) => {
-      setErrorInfo(`Change Timeout: ${changeId}`);
-      setOutgoingStatus('timeout');
-      resetStatus(setOutgoingStatus);
-      console.warn("Sync Change Timeout:", changeId);
     };
 
     const handleAck = () => {
@@ -111,19 +106,23 @@ export function useSyncVisualizationState(): SyncVisualizationState {
     manager.on('error', handleError);
     manager.on('disconnected', handleDisconnect);
     manager.on('sync:message-sent', handleMessageSent);
-    manager.on('changesReceived', handleChangesReceived); 
+    manager.on('changesReceived', handleChangesReceived);
+    manager.events.on('sync:initialized', handleInitialized); // Listen for initialization
 
-    changeManager.on('changes_acknowledged', handleAck);
-    changeManager.on('change_error', handleChangeError);
-    changeManager.on('change_timeout', handleChangeTimeout);
-    changeManager.on('incoming_changes_processed', handleIncomingProcessed);
+    manager.events.on('srv_changes_applied', handleAck);
+    manager.events.on('outgoing_change_failed_on_server', handleChangeError);
+    manager.events.on('incoming_changes_processed', handleIncomingProcessed);
 
-    // Initial state fetch
-    try {
-      setCurrentLsn(manager.getLSN());
-    } catch (e) {
-      console.error("Error getting initial LSN:", e); 
+    // Attempt to get initial LSN if SyncManager is already initialized
+    // This handles cases where the hook mounts after SyncManager has initialized
+    if (manager['isInitialized']) { // Accessing private member for check, consider public getter
+        try {
+            setCurrentLsn(manager.getLSN());
+        } catch (e) {
+            console.error("Error getting initial LSN (manager already initialized):", e);
+        }
     }
+
 
     // --- Cleanup --- (Using handlers defined above)
     return () => {
@@ -133,11 +132,11 @@ export function useSyncVisualizationState(): SyncVisualizationState {
       manager.off('disconnected', handleDisconnect);
       manager.off('sync:message-sent', handleMessageSent);
       manager.off('changesReceived', handleChangesReceived);
+      manager.events.off('sync:initialized', handleInitialized); // Unsubscribe
 
-      changeManager.off('changes_acknowledged', handleAck);
-      changeManager.off('change_error', handleChangeError);
-      changeManager.off('change_timeout', handleChangeTimeout);
-      changeManager.off('incoming_changes_processed', handleIncomingProcessed);
+      manager.events.off('srv_changes_applied', handleAck);
+      manager.events.off('outgoing_change_failed_on_server', handleChangeError);
+      manager.events.off('incoming_changes_processed', handleIncomingProcessed);
     };
   }, []); // Empty dependency array: Ensures effect runs only once on mount
 

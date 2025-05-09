@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .container {
+            background-color: #f9f9f9;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <h1>Browser Test Page</h1>
+    <div class="container">
+        <p>This is a simple test page to verify that the browser is working correctly.</p>
+        <p>If you can see this page, it means the browser has successfully loaded the HTML file.</p>
+        <p>Current time: <span id="current-time"></span></p>
+    </div>
+
+    <script>
+        // Display the current time
+        function updateTime() {
+            const now = new Date();
+            document.getElementById('current-time').textContent = now.toLocaleTimeString();
+        }
+        
+        // Update the time every second
+        updateTime();
+        setInterval(updateTime, 1000);
+    </script>
+</body>
+</html>
